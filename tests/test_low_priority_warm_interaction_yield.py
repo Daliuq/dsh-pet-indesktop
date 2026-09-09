@@ -200,92 +200,6 @@ def test_low_warm_defers_while_interaction_active(tmp_path, monkeypatch, app):
     app.processEvents()  # 排干让路期遗留的重试 timer
 
 
-def test_no_busy_loop_while_waiting_gate(tmp_path, monkeypatch):
-    """P1：交互期间等待必须是真正的阻塞，不能对已 set 的 Event 高频 wait 空转。
-
-    用实例属性覆盖 _interaction_active.wait 计数：正确实现用 Condition 阻塞
-    （观测窗口内 0 次调用），忙循环实现会高频调用（数千次）。
-    """
-    lib = _make_lib(tmp_path, monkeypatch, BlockableClip)
-    lib._warm_low_priority_background()  # 非交互状态启动批次
-    _wait_until(lambda: lib._movies["写代码"].meta_entered.is_set())
-
-    lib.begin_interaction()
-    real_wait = lib._interaction_active.wait
-    wait_calls: list[int] = []
-
-    def counting_wait(*args, **kwargs):
-        wait_calls.append(1)
-        return real_wait(*args, **kwargs)
-
-    lib._interaction_active.wait = counting_wait  # 记录旧实现的忙循环调用
-
-    lib._movies["写代码"].meta_release.set()  # 放行第一个 clip → worker 进入第二个 clip 闸门
-    # 固定观测窗口（负向断言：等待线程应睡眠，而非空转；不是阶段猜测）
-    time.sleep(0.25)
-    assert len(wait_calls) == 0, "交互期间低优先级预热必须阻塞等待，不得忙循环"
-
-    lib._movies["吃白饭"].meta_release.set()
-    lib.end_interaction()
-    _wait_until(lambda: lib._low_first_frames_done)
-    assert lib._movies["吃白饭"].warmed_meta is True
-    assert lib._movies["吃白饭"].warmed_frame is True
-    assert lib._movies["写代码"].warmed_frame is True
-
-
-def test_low_warm_waits_while_interaction_active_then_resumes(tmp_path, monkeypatch):
-    lib = _make_lib(tmp_path, monkeypatch, BlockableClip)
-    # CI 顺序无关：低优池顺序来自目录枚举，Linux/Windows 不同（ubuntu CI 上
-    # 「吃白饭」可能排在「写代码」前）——按真实池顺序取前两个，编舞语义不变。
-    _, low = lib._priority_names()
-    first, second = low[0], low[1]
-    lib._warm_low_priority_background()  # 非交互状态启动批次
-    _wait_until(lambda: lib._movies[first].meta_entered.is_set())
-
-    lib.begin_interaction()
-    # 观测第二个 clip 前的让路闸门：worker 放行第一个 clip 后应阻塞在此
-    gate_entered = threading.Event()
-    orig_gate = lib._await_interaction_clear
-
-    def gated(generation):
-        gate_entered.set()
-        return orig_gate(generation)
-
-    lib._await_interaction_clear = gated
-    lib._movies[first].meta_release.set()  # 放行第一个 clip
-    _wait_until(gate_entered.is_set)  # 事件同步确定 worker 已进入闸门（不猜时序）
-    assert lib._movies[second].warmed_meta is False, "交互中低优先级预热必须让路"
-
-    # 放行第二个 clip 的阻塞再结束交互：worker 立即完成，不留在飞线程
-    lib._movies[second].meta_release.set()
-    lib.end_interaction()
-    _wait_until(lambda: lib._low_first_frames_done)
-    assert lib._movies[second].warmed_meta is True
-    assert lib._movies[second].warmed_frame is True
-    assert lib._movies[first].warmed_frame is True
-
-
-def test_low_warm_batch_dedup_in_flight(tmp_path, monkeypatch):
-    """P1：批次去重——timer 到点/重试/resume 重排的并发触发不得重复起批。"""
-    lib = _make_lib(tmp_path, monkeypatch, BlockableClip)
-    lib._warm_low_priority_background()
-    _wait_until(lambda: lib._movies["写代码"].meta_entered.is_set())
-    assert lib._low_warm_in_flight is True
-
-    lib._warm_low_priority_background()  # 模拟 timer 重入：不得再起一批
-    assert lib._low_warm_in_flight is True, "已有批次在飞时必须去重"
-
-    lib._movies["写代码"].meta_release.set()
-    lib._movies["吃白饭"].meta_release.set()
-    _wait_until(lambda: lib._low_first_frames_done)
-    assert lib._low_warm_in_flight is False
-    # 同一批 clip 只被预热一次：没有重复批次重复启动 ffmpeg
-    assert lib._movies["写代码"].meta_calls == 1
-    assert lib._movies["吃白饭"].meta_calls == 1
-    assert lib._movies["写代码"].frame_calls == 1
-    assert lib._movies["吃白饭"].frame_calls == 1
-
-
 def test_pause_cancels_queued_interaction_retry(tmp_path, monkeypatch, app):
     """P1：pause_warm 必须取消交互期间排队的 50ms 重排期，不能遗留触发。"""
     lib = _make_lib(tmp_path, monkeypatch)
@@ -317,55 +231,6 @@ def test_completed_flag_stable_after_completion(tmp_path, monkeypatch):
     assert lib._low_first_frames_done is True
     assert lib._movies["写代码"].meta_calls == 1
     assert lib._movies["吃白饭"].meta_calls == 1
-
-
-def test_pause_warm_aborts_stale_batch_no_revival(tmp_path, monkeypatch):
-    lib = _make_lib(tmp_path, monkeypatch, BlockableClip)
-    # CI 顺序无关：低优池顺序来自目录枚举（平台相关），按真实池顺序取前两个
-    _, low = lib._priority_names()
-    first, second = low[0], low[1]
-    lib._warm_low_priority_background()
-    _wait_until(lambda: lib._movies[first].meta_entered.is_set())
-
-    lib.begin_interaction()  # 拖拽中
-    lib._movies[first].meta_release.set()
-    lib.pause_warm()  # 隐藏/切角色：代次作废旧批次
-    lib.end_interaction()  # 旧窗口迟到的松手事件：不得复活旧预热
-
-    _wait_until(lambda: not lib._low_warm_in_flight)  # 旧 worker 真正收尾（不猜时序）
-    assert lib._movies[second].warmed_meta is False, "旧代次批次必须放弃，不得复活"
-    assert lib._low_first_frames_done is False
-
-    # 恢复显示后重新排期：新代次批次完整跑完
-    lib.resume_warm()
-    lib._movies[second].meta_release.set()  # 新批次遇到阻塞 clip 时直接放行
-    lib._warm_low_priority_background()
-    _wait_until(lambda: lib._low_first_frames_done)
-    assert lib._movies[second].warmed_meta is True
-    assert lib._movies[second].warmed_frame is True
-
-
-def test_fast_pause_resume_aborts_batch_via_captured_generation(tmp_path, monkeypatch):
-    """P2：代次只在批次启动时捕获一次——线程启动后、进入预热前的快速
-    pause/resume 必须作废旧批次，不能把新代次误认成自己的批次继续预热。"""
-    lib = _make_lib(tmp_path, monkeypatch, FakeClip, lib_cls=_GateObjectsLib)
-    lib._warm_low_priority_background()
-    _wait_until(lib.objects_entered.is_set)  # worker 已进入 _warm_objects 前屏障
-
-    lib.pause_warm()
-    lib.resume_warm()
-    lib.objects_release.set()  # 放行：旧批次拿的是 pause 前的代次，应整体放弃
-
-    _wait_until(lambda: not lib._low_warm_in_flight)
-    assert lib._movies["写代码"].warmed_meta is False, "旧代次批次不得在新代次下继续预热"
-    assert lib._movies["吃白饭"].warmed_meta is False
-    assert lib._low_first_frames_done is False
-
-    # 恢复后的新代次批次可完整跑完
-    lib._warm_low_priority_background()
-    _wait_until(lambda: lib._low_first_frames_done)
-    assert lib._movies["写代码"].warmed_meta is True
-    assert lib._movies["写代码"].warmed_frame is True
 
 
 def test_fast_pause_resume_after_claim_before_worker_start_aborts(tmp_path, monkeypatch):
@@ -480,105 +345,6 @@ def test_high_priority_warm_aborts_when_paused_during_sleep(tmp_path, monkeypatc
     assert lib._movies[catalog.CLICKS[0]].warmed_meta is True
     assert lib._movies[catalog.CLICKS[0]].warmed_frame is True
     assert lib._movies[catalog.TURN].warmed_meta is True
-
-
-def test_high_priority_warm_aborts_mid_batch_when_paused(tmp_path, monkeypatch):
-    """P2：高优先级预热中途（metadata 解码期间）被 pause_warm——尚未开始的
-    clip 不得再拉起 ffmpeg（非阻塞中途作废），首帧阶段整段跳过。"""
-    lib = _make_lib(tmp_path, monkeypatch, clip_cls=BlockableClip)
-    # 批10-A3 后高优池 = clicks+turns+drag 共 3 素材 → workers=min(3,3)=3，
-    # 「排队中的 clip」场景结构性消失，使下方 skipped 断言沦为空洞通过。
-    # 本测要验证「pause 作废排队中的 clip」，故给高优池补 2 个假 clip：
-    # 高优至 5、workers 仍为 3，留下 2 个真实排队项。
-    queued_names = ["排队夹甲", "排队夹乙"]
-    for name in queued_names:
-        lib._movies[name] = BlockableClip(tmp_path / "videos" / f"{name}.webm")
-    real_priority_names = lib._priority_names
-
-    def five_high_priority_names():
-        high, low = real_priority_names()
-        return high + queued_names, low
-
-    monkeypatch.setattr(lib, "_priority_names", five_high_priority_names)
-
-    results: dict = {}
-    t = threading.Thread(
-        target=lambda: (lib._warm_all_meta_background(), results.setdefault("done", True)),
-        name="test-high-warm",
-    )
-    t.start()
-    # 第一批（并发 3）已进入 warm_meta 阻塞：事件同步，不猜时序
-    _wait_until(lambda: lib._movies[catalog.CLICKS[0]].meta_entered.is_set())
-    lib.pause_warm()  # 隐藏/切角色：排队中的 clip 必须作废
-    # 放行所有已进入 warm_meta 的 clip：循环重查 entered 直到线程退出，
-    # 避免「快照后才进入」的 clip 阻塞在无人放行的 meta_release.wait(5.0)。
-    while t.is_alive():
-        for clip in list(lib._movies.values()):
-            if clip.meta_entered.is_set():
-                clip.meta_release.set()
-        t.join(timeout=0.05)
-    assert not t.is_alive()
-    assert results.get("done") is True
-    # 首帧阶段整段跳过（暂停中，不得再拉起 ffmpeg）
-    assert all(c.frame_calls == 0 for c in lib._movies.values())
-    # 已进入 meta 的 clip 完成探测；暂停后排队未开始的 clip 被中途作废
-    entered = [c for c in lib._movies.values() if c.meta_entered.is_set()]
-    skipped = [c for c in lib._movies.values() if not c.meta_entered.is_set()]
-    assert entered, "第一批高优先级 clip 必须已进入 warm_meta"
-    assert all(c.meta_calls == 1 for c in entered)
-    assert all(c.meta_calls == 0 for c in skipped), "暂停后排队中的 clip 不得再拉起 ffmpeg"
-    assert len(skipped) >= 2, "高优池必须留有真实排队项（否则 skipped 断言空洞）"
-
-    # 恢复后新代次批次可完整跑完（门控不误伤）
-    lib.resume_warm()
-    lib._warm_all_meta_background()
-    assert lib._movies[catalog.CLICKS[0]].warmed_frame is True
-    assert lib._movies[catalog.DRAG].warmed_frame is True
-
-
-# ---------------------------------------------------------------- 窗口侧钩子
-class RecordingLibrary(FakeLibrary):
-    """记录 begin/end_interaction 调用的假素材库（token 兼容签名）。
-
-    不实现 pause_warm()：窗口隐藏/关闭路径必须用对称的 end_interaction()
-    释放持有（而不是依赖 pause_warm 隐式清零），否则此桩能测出库侧泄漏。
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.begins = 0
-        self.ends = 0
-
-    def begin_interaction(self):
-        self.begins += 1
-        return 0  # 简化 token：窗口原样传回 end 时被忽略
-
-    def end_interaction(self, token=None):
-        self.ends += 1
-
-
-def _press(pos=QPointF(10, 10), global_pos=QPointF(100, 100)) -> QMouseEvent:
-    return QMouseEvent(
-        QEvent.Type.MouseButtonPress, pos, global_pos,
-        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
-        Qt.KeyboardModifier.NoModifier,
-    )
-
-
-def _move(pos=QPointF(60, 60), global_pos=QPointF(400, 300)) -> QMouseEvent:
-    return QMouseEvent(
-        QEvent.Type.MouseMove, pos, global_pos,
-        Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
-        Qt.KeyboardModifier.NoModifier,
-    )
-
-
-def _release(pos=QPointF(60, 60), global_pos=QPointF(400, 300)) -> QMouseEvent:
-    return QMouseEvent(
-        QEvent.Type.MouseButtonRelease, pos, global_pos,
-        Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
-        Qt.KeyboardModifier.NoModifier,
-    )
 
 
 def test_drag_press_release_toggles_interaction_hold(app, tmp_path):
@@ -812,3 +578,237 @@ def test_hidden_window_late_anim_events_do_not_rehold(app, tmp_path):
 
     win.close()
     app.processEvents()
+def test_no_busy_loop_while_waiting_gate(tmp_path, monkeypatch):
+    """P1：交互期间等待必须是真正的阻塞，不能对已 set 的 Event 高频 wait 空转。
+
+    用实例属性覆盖 _interaction_active.wait 计数：正确实现用 Condition 阻塞
+    （观测窗口内 0 次调用），忙循环实现会高频调用（数千次）。
+    """
+    lib = _make_lib(tmp_path, monkeypatch, BlockableClip)
+    lib._warm_low_priority_background()  # 非交互状态启动批次
+    _wait_until(lambda: lib._movies["写代码"].meta_entered.is_set())
+
+    lib.begin_interaction()
+    real_wait = lib._interaction_active.wait
+    wait_calls: list[int] = []
+
+    def counting_wait(*args, **kwargs):
+        wait_calls.append(1)
+        return real_wait(*args, **kwargs)
+
+    lib._interaction_active.wait = counting_wait  # 记录旧实现的忙循环调用
+
+    lib._movies["写代码"].meta_release.set()  # 放行第一个 clip → worker 进入第二个 clip 闸门
+    # 固定观测窗口（负向断言：等待线程应睡眠，而非空转；不是阶段猜测）
+    time.sleep(0.25)
+    assert len(wait_calls) == 0, "交互期间低优先级预热必须阻塞等待，不得忙循环"
+
+    lib._movies["吃白饭"].meta_release.set()
+    lib.end_interaction()
+    _wait_until(lambda: lib._low_first_frames_done)
+    assert lib._movies["吃白饭"].warmed_meta is True
+    assert lib._movies["吃白饭"].warmed_frame is True
+    assert lib._movies["写代码"].warmed_frame is True
+
+
+def test_low_warm_waits_while_interaction_active_then_resumes(tmp_path, monkeypatch):
+    lib = _make_lib(tmp_path, monkeypatch, BlockableClip)
+    # CI 顺序无关：低优池顺序来自目录枚举，Linux/Windows 不同（ubuntu CI 上
+    # 「吃白饭」可能排在「写代码」前）——按真实池顺序取前两个，编舞语义不变。
+    _, low = lib._priority_names()
+    first, second = low[0], low[1]
+    lib._warm_low_priority_background()  # 非交互状态启动批次
+    _wait_until(lambda: lib._movies[first].meta_entered.is_set())
+
+    lib.begin_interaction()
+    # 观测第二个 clip 前的让路闸门：worker 放行第一个 clip 后应阻塞在此
+    gate_entered = threading.Event()
+    orig_gate = lib._await_interaction_clear
+
+    def gated(generation):
+        gate_entered.set()
+        return orig_gate(generation)
+
+    lib._await_interaction_clear = gated
+    lib._movies[first].meta_release.set()  # 放行第一个 clip
+    _wait_until(gate_entered.is_set)  # 事件同步确定 worker 已进入闸门（不猜时序）
+    assert lib._movies[second].warmed_meta is False, "交互中低优先级预热必须让路"
+
+    # 放行第二个 clip 的阻塞再结束交互：worker 立即完成，不留在飞线程
+    lib._movies[second].meta_release.set()
+    lib.end_interaction()
+    _wait_until(lambda: lib._low_first_frames_done)
+    assert lib._movies[second].warmed_meta is True
+    assert lib._movies[second].warmed_frame is True
+    assert lib._movies[first].warmed_frame is True
+
+
+def test_low_warm_batch_dedup_in_flight(tmp_path, monkeypatch):
+    """P1：批次去重——timer 到点/重试/resume 重排的并发触发不得重复起批。"""
+    lib = _make_lib(tmp_path, monkeypatch, BlockableClip)
+    lib._warm_low_priority_background()
+    _wait_until(lambda: lib._movies["写代码"].meta_entered.is_set())
+    assert lib._low_warm_in_flight is True
+
+    lib._warm_low_priority_background()  # 模拟 timer 重入：不得再起一批
+    assert lib._low_warm_in_flight is True, "已有批次在飞时必须去重"
+
+    lib._movies["写代码"].meta_release.set()
+    lib._movies["吃白饭"].meta_release.set()
+    _wait_until(lambda: lib._low_first_frames_done)
+    assert lib._low_warm_in_flight is False
+    # 同一批 clip 只被预热一次：没有重复批次重复启动 ffmpeg
+    assert lib._movies["写代码"].meta_calls == 1
+    assert lib._movies["吃白饭"].meta_calls == 1
+    assert lib._movies["写代码"].frame_calls == 1
+    assert lib._movies["吃白饭"].frame_calls == 1
+
+
+def test_pause_warm_aborts_stale_batch_no_revival(tmp_path, monkeypatch):
+    lib = _make_lib(tmp_path, monkeypatch, BlockableClip)
+    # CI 顺序无关：低优池顺序来自目录枚举（平台相关），按真实池顺序取前两个
+    _, low = lib._priority_names()
+    first, second = low[0], low[1]
+    lib._warm_low_priority_background()
+    _wait_until(lambda: lib._movies[first].meta_entered.is_set())
+
+    lib.begin_interaction()  # 拖拽中
+    lib._movies[first].meta_release.set()
+    lib.pause_warm()  # 隐藏/切角色：代次作废旧批次
+    lib.end_interaction()  # 旧窗口迟到的松手事件：不得复活旧预热
+
+    _wait_until(lambda: not lib._low_warm_in_flight)  # 旧 worker 真正收尾（不猜时序）
+    assert lib._movies[second].warmed_meta is False, "旧代次批次必须放弃，不得复活"
+    assert lib._low_first_frames_done is False
+
+    # 恢复显示后重新排期：新代次批次完整跑完
+    lib.resume_warm()
+    lib._movies[second].meta_release.set()  # 新批次遇到阻塞 clip 时直接放行
+    lib._warm_low_priority_background()
+    _wait_until(lambda: lib._low_first_frames_done)
+    assert lib._movies[second].warmed_meta is True
+    assert lib._movies[second].warmed_frame is True
+
+
+def test_fast_pause_resume_aborts_batch_via_captured_generation(tmp_path, monkeypatch):
+    """P2：代次只在批次启动时捕获一次——线程启动后、进入预热前的快速
+    pause/resume 必须作废旧批次，不能把新代次误认成自己的批次继续预热。"""
+    lib = _make_lib(tmp_path, monkeypatch, FakeClip, lib_cls=_GateObjectsLib)
+    lib._warm_low_priority_background()
+    _wait_until(lib.objects_entered.is_set)  # worker 已进入 _warm_objects 前屏障
+
+    lib.pause_warm()
+    lib.resume_warm()
+    lib.objects_release.set()  # 放行：旧批次拿的是 pause 前的代次，应整体放弃
+
+    _wait_until(lambda: not lib._low_warm_in_flight)
+    assert lib._movies["写代码"].warmed_meta is False, "旧代次批次不得在新代次下继续预热"
+    assert lib._movies["吃白饭"].warmed_meta is False
+    assert lib._low_first_frames_done is False
+
+    # 恢复后的新代次批次可完整跑完
+    lib._warm_low_priority_background()
+    _wait_until(lambda: lib._low_first_frames_done)
+    assert lib._movies["写代码"].warmed_meta is True
+    assert lib._movies["写代码"].warmed_frame is True
+
+
+def test_high_priority_warm_aborts_mid_batch_when_paused(tmp_path, monkeypatch):
+    """P2：高优先级预热中途（metadata 解码期间）被 pause_warm——尚未开始的
+    clip 不得再拉起 ffmpeg（非阻塞中途作废），首帧阶段整段跳过。"""
+    lib = _make_lib(tmp_path, monkeypatch, clip_cls=BlockableClip)
+    # 批10-A3 后高优池 = clicks+turns+drag 共 3 素材 → workers=min(3,3)=3，
+    # 「排队中的 clip」场景结构性消失，使下方 skipped 断言沦为空洞通过。
+    # 本测要验证「pause 作废排队中的 clip」，故给高优池补 2 个假 clip：
+    # 高优至 5、workers 仍为 3，留下 2 个真实排队项。
+    queued_names = ["排队夹甲", "排队夹乙"]
+    for name in queued_names:
+        lib._movies[name] = BlockableClip(tmp_path / "videos" / f"{name}.webm")
+    real_priority_names = lib._priority_names
+
+    def five_high_priority_names():
+        high, low = real_priority_names()
+        return high + queued_names, low
+
+    monkeypatch.setattr(lib, "_priority_names", five_high_priority_names)
+
+    results: dict = {}
+    t = threading.Thread(
+        target=lambda: (lib._warm_all_meta_background(), results.setdefault("done", True)),
+        name="test-high-warm",
+    )
+    t.start()
+    # 第一批（并发 3）已进入 warm_meta 阻塞：事件同步，不猜时序
+    _wait_until(lambda: lib._movies[catalog.CLICKS[0]].meta_entered.is_set())
+    lib.pause_warm()  # 隐藏/切角色：排队中的 clip 必须作废
+    # 放行所有已进入 warm_meta 的 clip：循环重查 entered 直到线程退出，
+    # 避免「快照后才进入」的 clip 阻塞在无人放行的 meta_release.wait(5.0)。
+    while t.is_alive():
+        for clip in list(lib._movies.values()):
+            if clip.meta_entered.is_set():
+                clip.meta_release.set()
+        t.join(timeout=0.05)
+    assert not t.is_alive()
+    assert results.get("done") is True
+    # 首帧阶段整段跳过（暂停中，不得再拉起 ffmpeg）
+    assert all(c.frame_calls == 0 for c in lib._movies.values())
+    # 已进入 meta 的 clip 完成探测；暂停后排队未开始的 clip 被中途作废
+    entered = [c for c in lib._movies.values() if c.meta_entered.is_set()]
+    skipped = [c for c in lib._movies.values() if not c.meta_entered.is_set()]
+    assert entered, "第一批高优先级 clip 必须已进入 warm_meta"
+    assert all(c.meta_calls == 1 for c in entered)
+    assert all(c.meta_calls == 0 for c in skipped), "暂停后排队中的 clip 不得再拉起 ffmpeg"
+    assert len(skipped) >= 2, "高优池必须留有真实排队项（否则 skipped 断言空洞）"
+
+    # 恢复后新代次批次可完整跑完（门控不误伤）
+    lib.resume_warm()
+    lib._warm_all_meta_background()
+    assert lib._movies[catalog.CLICKS[0]].warmed_frame is True
+    assert lib._movies[catalog.DRAG].warmed_frame is True
+
+
+# ---------------------------------------------------------------- 窗口侧钩子
+class RecordingLibrary(FakeLibrary):
+    """记录 begin/end_interaction 调用的假素材库（token 兼容签名）。
+
+    不实现 pause_warm()：窗口隐藏/关闭路径必须用对称的 end_interaction()
+    释放持有（而不是依赖 pause_warm 隐式清零），否则此桩能测出库侧泄漏。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.begins = 0
+        self.ends = 0
+
+    def begin_interaction(self):
+        self.begins += 1
+        return 0  # 简化 token：窗口原样传回 end 时被忽略
+
+    def end_interaction(self, token=None):
+        self.ends += 1
+
+
+def _press(pos=QPointF(10, 10), global_pos=QPointF(100, 100)) -> QMouseEvent:
+    return QMouseEvent(
+        QEvent.Type.MouseButtonPress, pos, global_pos,
+        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+
+
+def _move(pos=QPointF(60, 60), global_pos=QPointF(400, 300)) -> QMouseEvent:
+    return QMouseEvent(
+        QEvent.Type.MouseMove, pos, global_pos,
+        Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+
+
+def _release(pos=QPointF(60, 60), global_pos=QPointF(400, 300)) -> QMouseEvent:
+    return QMouseEvent(
+        QEvent.Type.MouseButtonRelease, pos, global_pos,
+        Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+
+
