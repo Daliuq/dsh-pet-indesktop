@@ -207,8 +207,6 @@ def test_no_busy_loop_while_waiting_gate(tmp_path, monkeypatch):
     （观测窗口内 0 次调用），忙循环实现会高频调用（数千次）。
     """
     lib = _make_lib(tmp_path, monkeypatch, BlockableClip)
-    # 临时实验（远程验证后回滚）：强制低优池首位 = 吃白饭，模拟 macOS 枚举序
-    lib.folder_files["random"].reverse()
     lib._warm_low_priority_background()  # 非交互状态启动批次
     _wait_until(lambda: lib._movies["写代码"].meta_entered.is_set())
 
@@ -270,8 +268,6 @@ def test_low_warm_waits_while_interaction_active_then_resumes(tmp_path, monkeypa
 def test_low_warm_batch_dedup_in_flight(tmp_path, monkeypatch):
     """P1：批次去重——timer 到点/重试/resume 重排的并发触发不得重复起批。"""
     lib = _make_lib(tmp_path, monkeypatch, BlockableClip)
-    # 临时实验（远程验证后回滚）：强制低优池首位 = 吃白饭，模拟 macOS 枚举序
-    lib.folder_files["random"].reverse()
     lib._warm_low_priority_background()
     _wait_until(lambda: lib._movies["写代码"].meta_entered.is_set())
     assert lib._low_warm_in_flight is True
