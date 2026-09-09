@@ -64,6 +64,43 @@ def test_picker_unknown_mode_or_missing_key_returns_fallback():
     assert picker.get("legacy", "no_such_event", "回退") == "回退"
 
 
+def test_custom_reads_unified_global_layer_and_fills_text():
+    """自定义模式：双层统一预设 {global:…} 下 balance.result 的 {text} 必须被替换。
+
+    回归：PhrasePicker.custom 原先只查顶层 key，双层存档把文案放在
+    global 层导致应用级事件（余额气泡 余额情况：{text}）误落未格式化 fallback。
+    """
+    picker = PhrasePicker()
+    unified = {"global": {"balance.result": ["余额 {text}"]}, "agents": {}}
+    assert picker.custom(unified, "balance.result", "余额情况：{text}", text="12.34") == "余额 12.34"
+
+    # 扁平旧结构仍兼容
+    flat = {"balance.result": ["余额 {text}"]}
+    assert picker.custom(flat, "balance.result", "余额情况：{text}", text="12.34") == "余额 12.34"
+
+    # 未命中（双层但该 key 无 global 文案）→ 返回 fallback 原文，由调用方格式化
+    assert picker.custom({"global": {}}, "balance.result", "余额情况：{text}", text="0") == "余额情况：{text}"
+
+
+def test_persona_text_custom_missing_key_formats_fallback():
+    """应用级 _persona_text：custom 模式未命中自定义文案时 fallback 占位符必须填充。
+
+    回归：余额气泡 余额情况：{text} 在自定义模板下露出字面量 {text}——custom 分支
+    之前直接 return picker.custom(...)（未格式化 fallback），与内置模式不一致。
+    """
+    import types
+
+    from pet import app as app_mod
+
+    cfg = {"dialogue_mode": "custom", "dialogue_phrases": {}}
+    win = types.SimpleNamespace(cfg=types.SimpleNamespace(get=lambda k, d=None: cfg.get(k, d)))
+    assert app_mod._persona_text(win, "balance.result", "余额情况：{text}", text="99.99") == "余额情况：99.99"
+
+    # 命中自定义 global 文案：同样填充 {text}
+    cfg["dialogue_phrases"] = {"global": {"balance.result": ["自定义余额 {text}"]}, "agents": {}}
+    assert app_mod._persona_text(win, "balance.result", "余额情况：{text}", text="1.25") == "自定义余额 1.25"
+
+
 def test_default_phrases_prefer_legacy_first_variant():
     from pet.persona_phrases import default_phrases
 

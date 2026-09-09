@@ -259,10 +259,16 @@ class PhrasePicker:
             return fallback
 
     def custom(self, custom_phrases: dict, key: str, fallback: str, autohide=None, **values) -> str:
-        """Render a custom phrase, rotating through all configured variants."""
-        if not isinstance(custom_phrases, dict):
+        """Render a custom phrase, rotating through all configured variants.
+
+        统一走 ``phrase_for_agent`` 解析（route="" 只读 global 层）：兼容
+        旧扁平 ``{key: [...]}`` 与统一预设双层 ``{global: {key: [...]},
+        agents: …}`` 两种存档结构——后者若只按顶层 ``custom_phrases.get(key)``
+        查会漏掉 global 层文案，让余额气泡等应用级事件误落 fallback。
+        """
+        raw = phrase_for_agent(custom_phrases, "", key)
+        if raw is None:
             return fallback
-        raw = custom_phrases.get(key)
         if isinstance(raw, list):
             variants = [str(item).strip() for item in raw if isinstance(item, str) and item.strip()]
         else:

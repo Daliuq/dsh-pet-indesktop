@@ -106,7 +106,10 @@ def _persona_text(win, key: str, fallback: str, **values) -> str:
     mode = str(cfg.get("dialogue_mode", "legacy") or "legacy")
     picker = _persona_picker(win)
     if mode == "custom":
-        return picker.custom(cfg.get("dialogue_phrases", {}), key, fallback, **values)
+        text = picker.custom(cfg.get("dialogue_phrases", {}), key, fallback, **values)
+        # 与内置模式同语义：未命中自定义文案时回退并填充占位符（含 {text} 等）。
+        # 此前直接 return 会把未格式化的 fallback 露出字面量 {…}。
+        return fallback.format(**values) if text is fallback else text
     # legacy / whale_maid：命中内置 JSON 预设即渲染，未命中回退调用方原文案
     text = picker.get(mode, key, fallback, **values)
     return fallback.format(**values) if text is fallback else text
