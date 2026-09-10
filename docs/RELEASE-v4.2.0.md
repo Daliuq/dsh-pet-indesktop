@@ -51,7 +51,7 @@
 - **点击触发黄金回旋** `golden_spin_on_click` + 子开关 **点击回旋跳过动画** `golden_spin_direct`（设置 → 桌宠行为 → 点击反馈）：点击动画播完自动接回旋；开启直连后点击直接回旋、跳过 Q 弹/点击素材，再点 130ms 内收尾当前圈并立即开下一圈。
 - **省电模式**（原「闲置降帧」升级，设置 → 桌宠行为 → 动画与移动）：闲置 30s+ 动画按半帧率呈现（24fps 素材 → 12fps 观感、时长不变）并停止后台动画预热，任何交互/Agent 忙碌立即回满。
 - **音乐自动唱歌** `music_sing_enabled`：检测到后台播放音乐时自动播唱歌动画，检测 timer 按需启停。
-- **拖拽合帧**：`mouseMoveEvent` 只记录最新目标、8ms 定时器消费（~120Hz），碰撞提交维持 20Hz；拖拽/点击/菜单期间低优先级预热让路挂起。
+- **拖拽合帧**：`mouseMoveEvent` 只记录最新目标、8ms 定时器消费（约 120Hz），碰撞提交维持 20Hz；拖拽/点击/菜单期间低优先级预热让路挂起。
 
 ### 💬 台词、气泡与提醒
 - **气泡配图大小可调** `self_talk_image_scale`（50–300%，默认 100，设置 → 桌宠行为 → 自言自语）：标准气泡 220×140 目标框随缩放、呼吸气泡按 base_size；自言自语关闭时该行随从属行隐藏。
@@ -99,10 +99,10 @@
 
 ### ⚡ 流畅度与性能（实测口径）
 - **高刷屏流畅度（PR #70）**：物理/弹跳/拖拽节拍跟随主屏刷新率（165Hz→6ms、120Hz→8ms，≤90Hz 保持 16ms）；QTimer 改 PreciseTimer（Windows 粗定时器 16ms 在 15.6/31.2ms 抖动）；`moveEvent` DPR 兜底轮询限频 10Hz；新增 `PET_PERF_STATS` 观测模式（默认零开销）。
-- **内存**：三开热机 361–402MB/只 → 多进程 ~270MB/3只；**单进程多窗 3 窗 181–197MB 且 3.5h 无单调上涨**（双窗 340MB vs 双进程 460MB）。
+- **内存**：三开热机 361–402MB/只 → 多进程约 270MB/3 只；**单进程多窗 3 窗 181–197MB 且 3.5h 无单调上涨**（双窗 340MB vs 双进程 460MB）。
 - **主进程慢涨根因修复**：每个播过的 clip 会永久持帧 ≈1.76MB/段（97 段 ≈170MB），改为切走/弃播/硬停即清空显示槽——15min 显示槽恒定 3.5MB（修前同口径 26MB 线性涨）。
 - **解码**：ffmpeg 常驻循环解码（`-stream_loop -1 -readrate`）消灭“每 10s 杀进程重启”的 churn；`-threads 1`（实测每进程 −13MB）；圈边界定期回收 `ffmpeg_recycle_minutes`（默认 10min，0=关）。
-- **帧转换链**：移除帧缓存改直接重建（无缓存重建 1.13ms/帧 @1x、2.37ms @2x，24fps 代价可忽略），改为首帧 8MB 字节预算 + pinned 交互核（~5MB）；**预测式首帧预热** `predict_prewarm_lead_ms`（默认 350ms，高级键）：当前动画剩余 ≤350ms 提前后台解码下一段首帧进 LRU，首帧 LRU 不逐出高频交互链（点击定格 8→1~2 次/局）。
+- **帧转换链**：移除帧缓存改直接重建（无缓存重建实测每帧 1.13ms（1 倍缩放）、2.37ms（2 倍缩放），24fps 下代价可忽略），改为首帧 8MB 字节预算 + pinned 交互核（约 5MB）；**预测式首帧预热** `predict_prewarm_lead_ms`（默认 350ms，高级键）：当前动画剩余 ≤350ms 提前后台解码下一段首帧进 LRU，首帧 LRU 不逐出高频交互链（点击定格次数 8 → 1–2 次/局）。
 - **省电模式**：解码 CPU −54.6%（台架 5.2% vs 11.5%）。
 - **碰撞预测限频**：反弹预测每 tick 圆链扫描限 33Hz、状态上报先限流再建状态——多实例碰撞活跃期 CPU **61%→43%**。
 - **其它**：窗口隐藏即停（暂停解码/定时器）；关闭全部音效时不再加载 QtMultimedia（约 38MB）；PIL 延后导入；Windows mask bounds 走 Qt C++ 路径（0.32ms/帧，与绘制逐像素一致）。
@@ -112,6 +112,7 @@
 - **API Key 明文自动迁移 keyring（PR #68）**：升级加载时把磁盘明文 API Key（含视觉 Key）迁入系统 keyring；keyring 不可用时回退内存明文，不覆盖已有 keyring 值。
 - **Linux Fcitx 中文输入（PR #71）**：构建时按 PySide6 Qt 精确版本编译 Fcitx5 Qt6 输入法插件随包分发（内置 Qt 与系统插件 ABI 不兼容导致中文输入法失效），真实 Fcitx/Rime 探针验证；Linux 设置页不再创建 Windows 专属「光标隐藏穿透」开关。
 - **macOS**：Dock 隐藏彻底生效并加恢复提示（issue #74，设置关闭「显示 Dock 图标」后真正隐藏 + 恢复路径提示气泡）；原生 Dock 快捷菜单；Finder 启动的 Node/Homebrew 解析（issue #67）。
+- **直播捕获（OBS / 直播姬）兼容（#79）**：快速对话气泡并入主窗子内容、可点击、保持向上生成（自动申请透明头顶空间）；不再冒出空白小气泡。
 - **Windows**：穿透切换改原生 `WS_EX_TRANSPARENT`，根治打字时桌宠频闪（见下方修复清单）。
 - **DLC / 换角色场景加固（PR #94）**：为后续同路径替换素材换角色做准备——`PetWindow._switch` 增加中央存在性守卫（目标动画不在当前素材库时判失败返回，不再让 `lib.movie(name)` 的 KeyError 崩进 GUI 线程），一次性守住余额档位动画与音乐唱歌动画两条绕过资源池的直传路径；配置记住的角色素材目录缺失（如 DLC 卸载）时**回退默认角色**重试一次，不再直接弹错退出；点击台词绑定对话框改走 `catalog.resolve_character_video_dir`（外部 DLC 目录优先）并识别 webm/gif，不再只读内置目录、不再回退到与磁盘真实文件名已漂移的旧常量。
 
@@ -146,7 +147,7 @@
 - **审批气泡恢复后没有同意/拒绝按钮**：全屏隐藏→恢复路径漏传 `_sticky_buttons`（字段一直在正常存取，唯独这条路径漏了）。
 - **单进程多窗下审批按钮一直丢失**：`MultiWindowProxy`（共享管理器看到的“窗集合替身”）此前没有 `show_alert`/`resolve_alert`，导致 `agent_link` 里所有 `hasattr(win, "show_alert")` 判断都落进降级分支；补上后审批与控制气泡按钮全部恢复。
 - **首次告警必抛 `AttributeError`**：`exploration_watchdog` 的 payload `mode` 字段全仓无赋值、无消费方，首次触发告警必抛异常导致告警永远发不出（该模块此前零测试，本次补齐）——直接删除该字段而非补默认值。
-- **429 与 `execution/failed` 双提醒**：429 气泡展示 15s > 合并冷却 8s，`turn/end` 的 `execution/failed` 常在 8~15s 窗口到达而绕过旧抑制；收紧为“存在未 dismiss 的活跃 429 即抑制”，dismiss 后新失败仍正常提醒。
+- **429 与 `execution/failed` 双提醒**：429 气泡展示 15s > 合并冷却 8s，`turn/end` 的 `execution/failed` 常在 8–15 秒窗口到达而绕过旧抑制；收紧为“存在未 dismiss 的活跃 429 即抑制”，dismiss 后新失败仍正常提醒。
 - **`dsh_control` 每次请求必抛 TypeError**：`_log_event` 形参 `directory` 与调用方传入的同名字段撞名（零调用方所以从未暴露），不修则整条控制链点了不生效。
 - **opencode 假完成**：`step-finish` reason=`tool-calls`（模型停笔等工具结果）不再误报完成——治好长跑 task 子代理/慢工具（长 bash、dev server）的假完成音/气泡与回注后的假开始音。
 - **诊断经常失败**：`maxTokens` 700 → 2048（推理型模型先消耗 token 在 reasoning 上，700 预算常被吃光、正文一个字没出），空输出时打印 chunk 类型统计便于定位。
@@ -191,7 +192,7 @@
 
 ## 🧪 测试与工程汇总
 
-- **架构治理**：`window.py` 4307 → ~3900 行（行数预算 + 拆分公约 `docs/WINDOW_PY_SPLIT_GUIDE.md`）；`PetApp` 拆为 `AppShell`（进程级）+ `PetInstance`（每窗容器），为单进程多窗铺路；拆出 collision_client / platform_win / platform_mac / multi_window_shared / decode_fanout / predictive_prewarm / settings_widgets 等模块；`modern_settings_dialog.py` 4811 → 1857 行后继续清理孤儿簇（净 −1300+ 行死代码）。
+- **架构治理**：`window.py` 4307 → 约 3900 行（行数预算 + 拆分公约 `docs/WINDOW_PY_SPLIT_GUIDE.md`）；`PetApp` 拆为 `AppShell`（进程级）+ `PetInstance`（每窗容器），为单进程多窗铺路；拆出 collision_client / platform_win / platform_mac / multi_window_shared / decode_fanout / predictive_prewarm / settings_widgets 等模块；`modern_settings_dialog.py` 4811 → 1857 行后继续清理孤儿簇（净 −1300+ 行死代码）。
 - **架构红线机器化**：`tests/test_architecture.py`（纯逻辑层不依赖 Qt、解码链单向依赖、`PetWindow` 私有面冻结、行数预算、孤儿簇守卫）。
 - **配置键纪律**：普通顶层键三处登记（默认值 + reload 白名单 + schema 快照），特例键走迁移路径。
 - **CI**：三平台 PR 门禁（pytest offscreen + ruff）；时序 flake 家族隔离（webm 生命周期族、低优预热让路族等）并按需一次重跑；CI 成本纪律写入 `AGENTS.md`；修复 main 上 Windows/macOS 的原生崩溃（`parent=None` 的 manager 被循环 GC 在 worker 线程回收 → 跨线程删除带 QTimer/信号连接的 QObject 腐化 Qt 事件队列；现在 shutdown 过继给 QApplication + 停自带单发定时器 + 控制 worker 可取消，并新增 `TestManagerDeterministicTeardown` 回归）。
