@@ -486,6 +486,114 @@ class TestVersionManagerDiscovery:
         assert str(version_dir) in got
 
 
+class TestConfiguredPnpmBin:
+    """手动指定 pnpm 入口（config.pnpm_bin）：面向"环境特殊又不想改环境变量"的用户。
+
+    优先级：config.pnpm_bin → DSH_PNPM_BIN → 内置自动发现；配错只回落，不致命。
+    """
+
+    def _isolate(self, monkeypatch):
+        from pet import agent_link
+
+        monkeypatch.setattr(agent_link, "_configured_pnpm_bin", "")
+        monkeypatch.delenv("DSH_PNPM_BIN", raising=False)
+        monkeypatch.setattr(node_runtime, "_is_windows", lambda: False)
+        monkeypatch.setattr(node_runtime, "_POSIX_ABS_NODE_MODULES", ())
+
+    def test_configured_file_wins_over_discovery(self, tmp_path, monkeypatch):
+        from pet import agent_link
+
+        self._isolate(monkeypatch)
+        cli = _file(tmp_path / "custom" / "pnpm.cjs")
+        monkeypatch.setattr(agent_link, "_which", lambda name: None)
+        monkeypatch.setattr(agent_link, "global_node_modules_roots", lambda: [])
+
+        agent_link.set_configured_pnpm_bin(str(cli))
+
+        assert _same_path(agent_link._find_pnpm_cli(), cli)
+
+    def test_configured_directory_is_resolved(self, tmp_path, monkeypatch):
+        from pet import agent_link
+
+        self._isolate(monkeypatch)
+        cli = _file(tmp_path / "tools" / "node_modules" / "pnpm" / "bin" / "pnpm.cjs")
+        monkeypatch.setattr(agent_link, "_which", lambda name: None)
+        monkeypatch.setattr(agent_link, "global_node_modules_roots", lambda: [])
+
+        agent_link.set_configured_pnpm_bin(str(tmp_path / "tools"))
+
+        assert _same_path(agent_link._find_pnpm_cli(), cli)
+
+    def test_configured_wins_over_env(self, tmp_path, monkeypatch):
+        from pet import agent_link
+
+        self._isolate(monkeypatch)
+        configured = _file(tmp_path / "configured" / "pnpm.cjs")
+        env_cli = _file(tmp_path / "env" / "pnpm.cjs")
+        monkeypatch.setenv("DSH_PNPM_BIN", str(env_cli))
+        monkeypatch.setattr(agent_link, "_which", lambda name: None)
+        monkeypatch.setattr(agent_link, "global_node_modules_roots", lambda: [])
+
+        agent_link.set_configured_pnpm_bin(str(configured))
+
+        assert _same_path(agent_link._find_pnpm_cli(), configured)
+
+    def test_env_still_used_when_config_empty(self, tmp_path, monkeypatch):
+        from pet import agent_link
+
+        self._isolate(monkeypatch)
+        env_cli = _file(tmp_path / "env" / "pnpm.cjs")
+        monkeypatch.setenv("DSH_PNPM_BIN", str(env_cli))
+        monkeypatch.setattr(agent_link, "_which", lambda name: None)
+        monkeypatch.setattr(agent_link, "global_node_modules_roots", lambda: [])
+
+        agent_link.set_configured_pnpm_bin("")
+
+        assert _same_path(agent_link._find_pnpm_cli(), env_cli)
+
+    def test_broken_config_falls_back_to_discovery(self, tmp_path, monkeypatch):
+        """配错路径不该让桥接彻底装不上：只记警告并回落到自动发现。"""
+        from pet import agent_link
+
+        self._isolate(monkeypatch)
+        home = _dir(tmp_path / "home")
+        cli = _file(
+            home / ".nvm" / "versions" / "node" / "v18.20.5" / "lib" / "node_modules"
+            / "pnpm" / "bin" / "pnpm.cjs"
+        )
+        monkeypatch.setattr(node_runtime, "_home", lambda: home)
+        monkeypatch.setattr(agent_link, "_which", lambda name: None)
+
+        agent_link.set_configured_pnpm_bin(str(tmp_path / "nope" / "pnpm"))
+
+        assert _same_path(agent_link._find_pnpm_cli(), cli)
+
+    def test_apply_config_syncs_configured_value(self, tmp_path, monkeypatch):
+        from PySide6.QtWidgets import QApplication
+
+        from pet import agent_link
+        from pet.config import Config
+
+        QApplication.instance() or QApplication([])
+        monkeypatch.setattr(agent_link, "_configured_pnpm_bin", "")
+        cfg = Config(base=tmp_path)
+        cfg.set("pnpm_bin", "/opt/custom/pnpm")
+
+        class Win:
+            def show_bubble(self, *args, **kwargs):
+                pass
+
+            def isVisible(self):
+                return True
+
+        manager = agent_link.AgentLinkManager(Win(), cfg)
+        try:
+            assert agent_link.configured_pnpm_bin() == "/opt/custom/pnpm"
+        finally:
+            manager.shutdown()
+            agent_link.set_configured_pnpm_bin("")
+
+
 # ============================================================================
 # 4. agent_link：pnpm / npm JS 入口多布局发现（Windows 布局为主）
 # ============================================================================

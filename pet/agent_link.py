@@ -128,8 +128,25 @@ _SHIM_NAMES: dict[str, tuple[str, ...]] = {
 }
 _PNPM_MISSING_HINT = (
     "需要 pnpm，自动安装失败。可手动运行 npm install -g pnpm，"
-    "或用环境变量 DSH_PNPM_BIN 指定 pnpm 的可执行文件 / JS 入口路径"
+    "或在配置里设置 pnpm_bin（也可用环境变量 DSH_PNPM_BIN）指定 pnpm 的"
+    "可执行文件 / 目录 / JS 入口路径"
 )
+
+# 配置里的手动指定（config 键 pnpm_bin）：属于"环境特殊又不想改环境变量"的兜底。
+# 优先级：config.pnpm_bin → DSH_PNPM_BIN → 内置自动发现（见 _find_pnpm_cli）。
+# config 是应用自己的持久偏好，所以排在环境变量之前；空值表示未配置。
+_configured_pnpm_bin = ""
+
+
+def set_configured_pnpm_bin(value: str | None) -> None:
+    """设置手动指定的 pnpm 入口（config.pnpm_bin）；空值 = 回到自动发现。"""
+    global _configured_pnpm_bin
+    _configured_pnpm_bin = str(value or "").strip()
+
+
+def configured_pnpm_bin() -> str:
+    """当前生效的手动指定值（空串 = 未配置）。"""
+    return _configured_pnpm_bin
 
 
 def _is_js_cli(path: Path) -> bool:
@@ -271,16 +288,27 @@ def _find_pnpm_cli() -> str | None:
     """定位 pnpm 的 JS CLI 入口，不触发安装。
 
     覆盖真实世界里互相打架的多种安装方式（issue：只会一种布局就全漏）：
-    1. `DSH_PNPM_BIN` 显式指定（文件 / 目录 / 包装脚本）；
-    2. PATH 上的 pnpm（包装脚本解析出真实 JS 入口；POSIX 软链解析到 .cjs）；
-    3. 各版本管理器 / 包管理器根目录下的 `node_modules|lib/node_modules/pnpm/bin/pnpm.{mjs,cjs,js}`；
-    4. 独立安装的 `pnpm.exe`（无需 node，直接执行）。
+    1. config 里手动指定的 `pnpm_bin`（文件 / 目录 / 包装脚本）——优先级最高；
+    2. `DSH_PNPM_BIN` 环境变量（同样的语义，给不想改配置的人）；
+    3. PATH 上的 pnpm（包装脚本解析出真实 JS 入口；POSIX 软链解析到 .cjs）；
+    4. 各版本管理器 / 包管理器根目录下的 `node_modules|lib/node_modules/pnpm/bin/pnpm.{mjs,cjs,js}`；
+    5. 独立安装的 `pnpm.exe`（无需 node，直接执行）。
+
+    手动指定**失效**（路径不存在 / 解析不出来）时只记警告并回落到自动发现——
+    配错一个路径不该让桥接彻底装不上。
     """
-    hint = (os.environ.get("DSH_PNPM_BIN") or "").strip()
-    if hint:
+    for source, hint in (
+        ("config.pnpm_bin", _configured_pnpm_bin),
+        ("DSH_PNPM_BIN", os.environ.get("DSH_PNPM_BIN") or ""),
+    ):
+        hint = (hint or "").strip()
+        if not hint:
+            continue
         found = _resolve_cli_hint(Path(hint).expanduser(), "pnpm")
         if found is not None:
+            log.info("pnpm 入口取自 %s: %s", source, found)
             return str(found)
+        log.warning("%s 指向的 pnpm 不可用，回落到自动发现: %s", source, hint)
 
     roots: list[Path] = []
     direct_fallbacks: list[Path] = []
@@ -2335,6 +2363,10 @@ class AgentLinkManager(QObject):
         注意用 _running（生命周期状态）而非 is_running()（会被 pause 置 False）——
         否则"隐藏期间关配置"不会真正 stop，恢复显示时又会被 resume 拉起。"""
         agent_cfg = self.cfg.get("agent_link", {})
+        # 手动指定的 pnpm 入口（config.pnpm_bin）：空 = 回到内置自动发现。
+        # 在这里同步而非在探测时读配置，是为了让 agent_link 的探测保持
+        # "纯函数 + 模块状态"的可测形态（不必到处传 cfg）。
+        set_configured_pnpm_bin(self.cfg.get("pnpm_bin", ""))
         if not agent_cfg.get("dsh", False):
             self._clear_model_access_alerts()
         for key, monitor in self.monitors.items():

@@ -640,6 +640,10 @@ class Config:
             "edge_probe_enabled": False,   # 拖到屏幕左右边缘后自动进入探头姿态
             "autostart_wanted": False,     # 用户曾开启过开机自启（用于启动自检：被安全软件清理时提醒）
             "harness_autostart": False,    # 随桌宠启动自动拉起 dsh web 服务（只起服务，不开浏览器）
+            # 手动指定 pnpm 入口（文件 / 目录 / 包装脚本都行，语义同 DSH_PNPM_BIN）。
+            # 默认空 = 走内置的自动发现（PATH/注册表/各版本管理器/多布局）；
+            # 面向"环境特殊又不想改环境变量"的用户，属于开发者向高级键，不进设置页。
+            "pnpm_bin": "",
             "stream_capture_mode": False,  # 直播捕获兼容模式（Windows：Tool 窗口直播姬/OBS 枚举不到）
             "chat_background": "",  # 肥鱼牌小手机背景：空=纯色；builtin:* = 内置主题；否则为图片路径
             "modern_chat_background": "",  # 肥鱼版 DeepSeek 背景：空=纯色；否则为自定义图片路径
@@ -817,6 +821,7 @@ class Config:
             "idle_low_fps_enabled", "idle_low_fps_threshold",
             "click_show_balance", "click_show_self_talk",
             "balance_refresh_minutes", "autostart_wanted", "harness_autostart", "stream_capture_mode",
+            "pnpm_bin",
             "music_sing_enabled", "golden_spin_on_click", "golden_spin_direct", "edge_probe_enabled",
             "balance_tier_labels_mode", "balance_tier_label_peak",
             "balance_tier_label_idle", "balance_tier_color_enabled",

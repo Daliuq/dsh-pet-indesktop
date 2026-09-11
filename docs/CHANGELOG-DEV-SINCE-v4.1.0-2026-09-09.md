@@ -169,6 +169,7 @@
 - 配置键纪律：普通顶层键三处登记（默认值 + reload 白名单 + schema 快照）；特例键走迁移路径。
 - PR 门禁 CI（`pr-test.yml`）：三平台 pytest offscreen + ruff（此前 PR 无门禁）；时序 flake 家族隔离（webm 生命周期族、rapid_start_stop、低优预热让路族）并按需一次重跑；CI 成本纪律写入 AGENTS.md。
 - 时序用例确定性（09-10）：`session_store` 的写盘实现改为**构造期注入**（`_AsyncWriter(root, *, write=...)` / `_WriterRegistry(writer_factory=...)`，生产默认不变），`test_close_total_blocking_time_bounded_by_timeout` 不再事后替换模块全局——worker 被唤醒即落盘，事后替换在高负载下会让「等它进入卡住的写盘」永远等不到（CI 曾以「卡住的写盘未在时限内开始」误报）。
+- 环境发现补完（09-10，issue 双现场）：nvm 自定义根 `~/nvm`（无点号；GUI 启动拿不到 shell 的 `NVM_DIR`）与 nvm-windows 默认 `%APPDATA%\nvm` 兜底；package.json 坏依赖路径**实修**（能唯一确定的坏 spec 自动改写 + 备份 `package.json.bak-*` + pnpm 重试一次，lockfile 由 pnpm 重生成）；新增 `pnpm_bin` 配置键（优先级 config → `DSH_PNPM_BIN` → 自动发现，配错只回落不致命，面向"环境特殊又不想改环境变量"的开发者）。
 - 死代码清理（-1300+ 行）：孤儿簇整删（settings_widgets 等 715 行文件、3 个 QSS）、零引用符号、旧 onefile 缓存清理脚本等。
 - docs 体系：HANDOVER_2026-09、WINDOW_PY_SPLIT_GUIDE、SETTINGS 系列、PHASE3 调研稿、内存测量档案。
 

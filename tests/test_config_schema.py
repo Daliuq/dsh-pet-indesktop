@@ -41,6 +41,7 @@ RELOAD_WHITELIST_SNAPSHOT = frozenset({
     "cursor_hidden_passthrough", "drag_physics",
     "dynamic_island", "edge_probe_enabled", "facing",
     "golden_spin_on_click", "golden_spin_direct", "harness_autostart",
+    "pnpm_bin",
     "idle_low_fps_enabled", "idle_low_fps_threshold", "lock_position",
     "menu_easter_egg", "media_prewarm", "first_frame_cache_max_mb", "predict_prewarm_lead_ms", "ffmpeg_recycle_minutes",
     "modern_chat_background", "modern_chat_background_fill",
