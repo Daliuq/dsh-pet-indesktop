@@ -272,6 +272,43 @@ def test_unknown_event_ignored(tmp_path, monkeypatch):
     assert tracker.current_state is DshState.IDLE
 
 
+def test_llm_error_record_enters_error_state(tmp_path, monkeypatch):
+    """桥接真实写的是 llm_error（index.js），状态机必须认它——否则 ERROR 态不可达。
+
+    桥接在 bad_response_status_code（API 级错误）分支写 ``event: "llm_error"``；
+    旧键名 "llm/error" 与它只差一个分隔符，导致 API 错误永远进不了 ERROR。
+    """
+    tracker, bridge_dir = _make_tracker(tmp_path, monkeypatch, online=True)
+    tracker._poll_online()  # idle
+
+    states = []
+    tracker.state_changed.connect(lambda f, t: states.append(t))
+
+    _write(bridge_dir, {"event": "tool/call"})  # working
+    _write(bridge_dir, {
+        "event": "llm_error", "errorCode": "bad_response_status_code",
+        "errorMessage": "404", "errorKind": "api",
+    })
+    tracker._poll_events()
+
+    assert tracker.current_state is DshState.ERROR
+    assert states == ["working", "error"]
+
+
+def test_dead_event_keys_removed_from_state_map():
+    """状态表不得保留桥接从不写的事件键。
+
+    index.js:858 明确不转发流式 assistant/chunk，plan/mode 也只在 DSH 内部词汇里
+    出现——留着这两条只会让状态表看起来覆盖了并不存在的事件。
+    """
+    from pet.dsh_state import _EVENT_TO_STATE
+
+    assert "llm_error" in _EVENT_TO_STATE
+    assert "llm/error" not in _EVENT_TO_STATE, "桥接实际写 llm_error，旧键名匹配不到"
+    assert "assistant/chunk" not in _EVENT_TO_STATE
+    assert "plan/mode" not in _EVENT_TO_STATE
+
+
 def test_stop_drops_inflight_probe_result(tmp_path, monkeypatch):
     """stop() 后在途在线探测的结果必须被丢弃。
 

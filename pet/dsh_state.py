@@ -84,11 +84,9 @@ _AGENT_STATUS_STATE = {
 # 桥接「简单事件」（DSH 原始 session/event 类型）→ 统一状态。
 # 事件名来自 DSH dsh-session/known-event-types.js 的真实词汇。
 _EVENT_TO_STATE = {
-    # 用户提交 / turn 开始 / 流式生成 → 思考
+    # 用户提交 / turn 开始 → 思考
     "user/message": DshState.THINKING,
     "turn/start": DshState.THINKING,
-    "assistant/chunk": DshState.THINKING,
-    "plan/mode": DshState.THINKING,
     # 工具 / 步骤 / 命令执行 → working
     "assistant/message": DshState.WORKING,
     "tool/call": DshState.WORKING,
@@ -109,7 +107,7 @@ _EVENT_TO_STATE = {
     # 完成 / 出错
     "turn/end": DshState.SUCCESS,
     "llm/retry": DshState.ERROR,
-    "llm/error": DshState.ERROR,  # API 级错误（llm_error：errorCode 为真实上游码如 bad_response_status_code）
+    "llm_error": DshState.ERROR,  # API 级错误（errorCode 为真实上游码如 bad_response_status_code）
 }
 
 
