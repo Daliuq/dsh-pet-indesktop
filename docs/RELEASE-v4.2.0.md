@@ -79,6 +79,7 @@
 - **灵动岛单击聚合全部窗**（多开时）。
 
 ### 🤖 Agent 联动与 DSH 生态
+- **v4.2.0 之后的修复批**（2026-09，PR57 审计跟进）：桥接插件归零外部依赖——根治「打包副本缺依赖导致用户整个 dsh 插件树加载失败、web/headless/desktop 全 profile 无法启动」的事故（PR 门禁新增双层零依赖校验）；cordis 运行审批气泡按真实写盘形状读取（此前从未弹出过）；问题气泡在 mux 断线后可被兜底关闭（升级不再丢失 callId）；点「终止/自动优化」不再伴随「请更新/重装 bridge」假提醒；无 pnpm 时关闭联动改为备份并手改 manifest（不再假成功留悬空链接）；LLM API 错误（`llm_error`）真正进入 error 态；探索看门狗计时改任务级（启动宽限整个任务只送一次、连续运行降阈值真正生效），桌宠隐藏时看门狗暂停（隐藏期提醒恢复后补发而非永久丢失）；控制成功后给看门狗记宽限（不再刚点完又弹）；设置页新增「行为重复检测」组（开关 + 9 阈值）；移除一批引入后从未接线的死机制（事件分发层/Judge/宽限接口等）。
 - **DSH 富事件状态**：thinking（思考）/ working（干活，带工具名）/ attention（需确认）/ error / idle 多态呈现；多会话聚合优先级 attention > error > working > thinking > idle，子代理不抢状态；`agent/status` 始终作为聚合基线被采纳（旧宿主与富事件并存时以最后到达的事件推进状态，并不存在「见过富事件后自动停用」的开关）。
 - **统一事件层 / 事件队列**（PR #57）：bridge → monitor → AgentLinkManager → PetWindow 三层事件契约（`agent-event/v1`），定义审批/问题关联键、交互队列与气泡生命周期（见 `docs/DSH-BRIDGE-PET-EVENT-CONTRACT-2026-09-02.md`）。语义分类的 dataclass 保留，事件分发层（`AgentEventRuntime`）在实现后经评估移除——它自引入起零消费方，实际消费方只有 `AgentLinkManager._on_normalized_event` 直连 `normalized_event`。
 - **审批与提问交互**：审批气泡带「同意 / 拒绝」按钮；提问气泡支持多问题项（section header + 选项多选 + 气泡内提交，全部带选项时在气泡内完成，含自由文本时提示回 DSH 界面）；阻塞交互按 `interaction_id` 独立存储，同一 agent 并发审批/提问互不覆盖；新增 cordis `request-run` 交互。交互/告警气泡（sticky、interactive、alert）主体点击为 no-op，只有普通无按钮气泡点主体才打开快速对话。
@@ -196,7 +197,7 @@
 - **架构红线机器化**：`tests/test_architecture.py`（纯逻辑层不依赖 Qt、解码链单向依赖、`PetWindow` 私有面冻结、行数预算、孤儿簇守卫）。
 - **配置键纪律**：普通顶层键三处登记（默认值 + reload 白名单 + schema 快照），特例键走迁移路径。
 - **CI**：三平台 PR 门禁（pytest offscreen + ruff）；时序 flake 家族隔离（webm 生命周期族、低优预热让路族等）并按需一次重跑；CI 成本纪律写入 `AGENTS.md`；修复 main 上 Windows/macOS 的原生崩溃（`parent=None` 的 manager 被循环 GC 在 worker 线程回收 → 跨线程删除带 QTimer/信号连接的 QObject 腐化 Qt 事件队列；现在 shutdown 过继给 QApplication + 停自带单发定时器 + 控制 worker 可取消，并新增 `TestManagerDeterministicTeardown` 回归）。
-- **构建**：`scripts/fix_bridge_bundle.py`（pnpm junction 展开为自包含目录树 + dist 冒烟）、`scripts/verify_bundle_qt.py`（Qt DLL 链校验）、桥接依赖声明与 lockfile 快照硬校验、中文编码自检、Qt/ICU DLL 冲突自检；onedir 构建 + 便携 zip 一条命令。
+- **构建**：`scripts/fix_bridge_bundle.py`（打包产物的桥接零依赖防线：剥 node_modules 残留 + dist 清单零依赖校验 + hermetic 冒烟；桥接插件已归零外部依赖，pnpm junction 展开与 lockfile 快照校验随依赖清零移除）、`scripts/verify_bundle_qt.py`（Qt DLL 链校验）、中文编码自检、Qt/ICU DLL 冲突自检；onedir 构建 + 便携 zip 一条命令。PR 门禁新增桥接零依赖双层校验（全部 bridge 契约测试 + hermetic 冒烟）。
 
 ## 🙏 致谢
 

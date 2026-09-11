@@ -35,7 +35,7 @@ error
 |---|---|
 | DSH 不在线 | `offline` |
 | 在线但无活动 | `idle` |
-| `user/message`、`turn/start`、`plan/mode` | `thinking` |
+| `user/message`、`turn/start` | `thinking` |
 | `assistant/message`、`tool/call`、`tool/result`、`step/*`、`command/*` | `working` |
 | `approval/asked`、`approval/request` | `waiting_approval` |
 | `question/requested` | `waiting_question` |
@@ -87,17 +87,9 @@ error
 task_complete
 ```
 
-它们的输出是 `warning` 或 `control/judge`，再由 Judge 判断是否：
-
-```text
-NORMAL
-REPLAN
-ASK_USER
-STOP
-```
-
-因此“检测到重复”不等于“自动终止 Agent”。默认没有 Judge 时，Control 会降级为
-`REPLAN`，只发出重新规划建议，不直接中断 Agent。
+它们的输出是 `warning` 或 `control`。`control` 携带的 verdict 恒为
+`REPLAN`（可选 Judge 机制经评估已移除）：只发出重新规划建议，不直接中断 Agent。
+因此“检测到重复”不等于“自动终止 Agent”。
 
 ## 四、BehaviorPatternDetector：按 step 的行为模式检查
 
@@ -182,7 +174,7 @@ ExplorationWatchdog 与 BehaviorPatternDetector 不同，它按 `session` 保存
 ```text
 低于 warning 阈值 → 不输出
 达到 warning 阈值 → warning
-达到 control 阈值 → judge_required
+达到 control 阈值 → control（verdict 恒 REPLAN，只提醒不打断）
 ```
 
 默认参数为：
@@ -199,12 +191,12 @@ Edit/Run/Test、新 target、新证据会降低风险，避免把正常收敛过
 输出信号：
 
 ```python
-warning = Signal(str, object)
-judge_required = Signal(str, object)
-judge_result = Signal(str, object)
+warning = Signal(str, object)   # agent_key, payload
+pattern_control = Signal(str, object)   # agent_key, payload（verdict 恒 REPLAN）
 ```
 
-`judge_required` 只表示“需要 Judge 检查”，不表示已经决定停止。
+`pattern_control` 是控制级提醒（带「自动优化/终止/忽略」按钮入口，由
+AgentLinkManager 决定呈现），不代表已经决定停止。
 
 ## 六、StuckDetector：失败/超时型卡住检查
 
@@ -242,11 +234,9 @@ tool/call / command/run / tool-workflow/run-start
 计算 warning / control / stuck risk
         ↓
 warning：提示
-control：调用 Judge（若配置）
+control：控制级提醒（verdict 恒 REPLAN，只提醒不打断）
         ↓
-NORMAL / REPLAN / ASK_USER / STOP
-        ↓
-turn/end、idle、session 结束或新一代控制结果后清理
+turn/end、idle、session 结束或用户点击控制按钮后清理
 ```
 
 ## 八、当前已知边界
@@ -255,9 +245,8 @@ turn/end、idle、session 结束或新一代控制结果后清理
    审批或问题的精确关联。
 2. W6/W10 是滑动观察窗口，不是“最近 N 次工具调用”的简单计数；统计单位是 step。
 3. 同一步并行工具调用会去重，防止正常并发搜索放大风险。
-4. warning 不调用 Judge；control 才进入 Judge 路径。
-5. Judge 返回无效 JSON 或超时，不能被当成 STOP；必须使用安全降级策略并记录原因。
-6. 重复检查的 Risk/Warning/Control 不应覆盖真实 approval/question 交互，也不应直接
+4. warning 与控制级提醒共用同一套 cooldown/相位阈值；控制级带操作按钮入口，由联动管理器决定呈现。
+5. 重复检查的 Risk/Warning/Control 不应覆盖真实 approval/question 交互，也不应直接
    清理其他 session 的 pending 事件。
 
 ## 代码依据

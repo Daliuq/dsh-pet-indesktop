@@ -170,7 +170,7 @@ sessionId, sessionName, turn?, step?, event, data, callId?, requestId?
 | DSH 来源 | Bridge event | 关键字段 | Pet 用途 |
 |---|---|---|---|
 | `approval/requested` Mux | `approval/request` | `rpcId`, `sessionId`, `approvalId`, `toolName` | 审批请求 |
-| `approval/asked` session | 仅 `approval/asked`（状态/审计转发） | `approvalId`, `callId`, `sessionId` | PR57 起不再映射为 `approval/request`：只驱动 `dsh_state` 锁存 waiting_approval，不弹审批气泡 |
+| `approval/asked` session | 仅 `approval/asked`（状态/审计转发） | `event`, `step`, `sessionId`, `agentName`（状态事件只带身份字段，无 approvalId/callId） | PR57 起不再映射为 `approval/request`：只驱动 `dsh_state` 锁存 waiting_approval，不弹审批气泡 |
 | `approval/resolved` Mux | `approval/resolved`、`interaction/resolved`、`user_action` | `approvalId`, `sessionId`, `outcome` | 关闭审批气泡 |
 | `approval/decided` session | `approval/decided`、`user_action` | `approvalId`, `rpcId`, `sessionId` | 关闭已完成审批 |
 | `question/requested` Mux | `question/requested` | `rpcId`, `sessionId`, `questions[]` | 用户问题 |
