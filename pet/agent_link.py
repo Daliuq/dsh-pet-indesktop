@@ -4419,6 +4419,11 @@ class AgentLinkManager(QObject):
         """清理全部模型访问失败提醒、计数和定时器。"""
         session_keys = set(self._model_access_cache) | set(self._model_access_timers)
         self._model_access_cache.clear()
+        # tracker 内部按 (source, sessionId) 留存的连续 streak 也要清：只清外部
+        # 镜像的话，重新开启联动后同一会话的新失败会接着旧计数，提醒里出现
+        # 「已连续 N 次」虚高（镜像键与 tracker 键同为 (source, sessionId)）。
+        for source, session_id in list(self._model_access_retry_counts):
+            self._model_access_tracker.reset(source, session_id)
         self._model_access_retry_counts.clear()
         for session_key in list(self._model_access_timers):
             self._cancel_model_access_timer(session_key)

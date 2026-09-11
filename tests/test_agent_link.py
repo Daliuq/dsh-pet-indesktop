@@ -3266,6 +3266,69 @@ class TestModelAccessAlert:
         assert len(mgr.win.alerts) == 2, "提醒已收起后工具失败应正常提醒"
 
 
+class TestModelAccessStreakCleanup:
+    """F13：清理模型访问提醒时必须同步清空 tracker 内部 streak。
+
+    只清外部镜像（``_model_access_cache`` / ``_model_access_retry_counts``）会
+    让 tracker 里按 (source, session) 留存的连续计数残留；重新开启联动后同一
+    会话的新一轮失败直接接着旧计数，提醒里出现「已连续 N 次」虚高。
+    """
+
+    class _Win:
+        def __init__(self):
+            self.alerts = []
+            self.resolved = []
+
+        def isVisible(self):
+            return True
+
+        def show_alert(self, text, **_kwargs):
+            self.alerts.append(str(text))
+
+        def resolve_alert(self, alert_id):
+            self.resolved.append(str(alert_id))
+
+        def show_bubble(self, *_args, **_kwargs):
+            pass
+
+    def _make_mgr(self, tmp_path):
+        return AgentLinkManager(self._Win(), Config(base=tmp_path))
+
+    @staticmethod
+    def _retry():
+        from pet.agent_event_normalizer import normalize_event
+        return normalize_event({"event": "llm/retry", "agent": "dsh", "sessionId": "s-1",
+                                "errorCode": "RATE_LIMIT", "errorMessage": "429 too many requests"})
+
+    def _feed_and_next_streak(self, mgr):
+        """喂一条限流重试，返回 tracker 记账后的连续计数（经 consume 观察）。"""
+        out = mgr._model_access_tracker.consume(self._retry())
+        assert out is not None, "限流重试必须产出 streak"
+        return int(out["consecutiveRetryCount"])
+
+    def test_clear_resets_tracker_streak(self, tmp_path):
+        mgr = self._make_mgr(tmp_path)
+        mgr._on_normalized_event(self._retry())
+        mgr._on_normalized_event(self._retry())
+        assert self._feed_and_next_streak(mgr) == 3, "前置：tracker 已累计到 3"
+        mgr._clear_model_access_alerts()
+        assert self._feed_and_next_streak(mgr) == 1, "清理后 tracker streak 必须清零"
+
+    def test_disable_and_reenable_does_not_inherit_old_streak(self, tmp_path):
+        mgr = self._make_mgr(tmp_path)
+        mgr._on_normalized_event(self._retry())
+        mgr._on_normalized_event(self._retry())
+        # 关闭 DSH 联动：apply_config 走 _clear_model_access_alerts
+        cfg = dict(mgr.cfg.get("agent_link", {}))
+        cfg["dsh"] = False
+        mgr.cfg.set("agent_link", cfg)
+        mgr.apply_config()
+        # 重新开启后再来一次失败：计数必须从 1 开始（不继承旧 streak）
+        mgr._on_normalized_event(self._retry())
+        assert self._feed_and_next_streak(mgr) == 2, \
+            "重启用后不得继承旧 streak，否则提醒计数虚高"
+
+
 class TestSessionNameTruthfulness:
     """{sessionName} 只注入真实会话显示名，绝不把 sessionId 截短占位冒充（字段真实性）。
 
