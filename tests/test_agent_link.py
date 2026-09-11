@@ -3612,7 +3612,7 @@ class TestDetectorAlertThrottle:
     """N2 跨检测器弹窗节流：stuck/pattern/watchdog 同 agent 30s 内只弹一次窗
     （动画照常），升级档位放行，不同 scope 互不影响。"""
 
-    def _make_mgr(self, tmp_path):
+    def _make_mgr(self, tmp_path, **gate_overrides):
         class FakeWin:
             def __init__(self):
                 self.alerts = []
@@ -3638,8 +3638,10 @@ class TestDetectorAlertThrottle:
         cfg = Config(base=tmp_path)
         # 本类取证 N2 跨检测器节流：stuck/pattern/watchdog 三条检测类概率门开 1.0，
         # 避免文件头 autouse 基线（全 0.0）把「没弹窗」冒充「被节流」。
+        gates = {"stuck": 1.0, "pattern": 1.0, "watchdog": 1.0}
+        gates.update(gate_overrides)
         ag = dict(cfg.get("agent_link", {}))
-        ag["report_gates"] = _agent_gates(stuck=1.0, pattern=1.0, watchdog=1.0)
+        ag["report_gates"] = _agent_gates(**gates)
         cfg.set("agent_link", ag)
         mgr = AgentLinkManager(FakeWin(), cfg)
         mgr._clock = lambda: mgr._throttle_now[0]
@@ -3720,6 +3722,46 @@ class TestDetectorAlertThrottle:
         mgr._throttle_now[0] += 1.0
         mgr._on_exploration_warning("sess-1", {"agent_key": "dsh", "reasons": ["search"], "steps": []})
         assert len(mgr.win.alerts) == 1, "被丢弃的提醒不该占用节流槽"
+
+    def test_stuck_gate_rejected_alert_does_not_consume_throttle_slot(self, tmp_path):
+        """F14：概率门丢弃的提醒不该占 30s 节流槽（stuck 路径）。
+
+        先被概率门拒绝（未展示），随后一条放行的同 scope 提醒必须能正常弹；
+        旧实现先记节流槽再判概率门，第二次会被 30s 窗口误压。
+        """
+        mgr = self._make_mgr(tmp_path, stuck=0.5)
+        rolls = iter([0.99, 0.0])
+        mgr._rng = lambda: next(rolls)
+        mgr._on_stuck_intervention("dsh", {"severity": 2})
+        assert mgr.win.alerts == [], "概率门拒绝时不得弹窗"
+        mgr._throttle_now[0] += 5.0
+        mgr._on_stuck_intervention("dsh", {"severity": 2})
+        assert len(mgr.win.alerts) == 1, "被概率门丢弃的提醒不得占用节流槽"
+
+    def test_pattern_gate_rejected_alert_does_not_consume_throttle_slot(self, tmp_path):
+        """F14：pattern.control 同走 stuck 门，被门丢弃的提醒不得占节流槽。"""
+        mgr = self._make_mgr(tmp_path, stuck=0.5)
+        rolls = iter([0.99, 0.0])
+        mgr._rng = lambda: next(rolls)
+        payload = {"verdict": "REPLAN", "reason": "loop", "class": "search",
+                   "count": 8, "window": "10"}
+        mgr._on_pattern_control("dsh", payload)
+        assert mgr.win.alerts == [], "概率门拒绝时不得弹窗"
+        mgr._throttle_now[0] += 5.0
+        mgr._on_pattern_control("dsh", payload)
+        assert len(mgr.win.alerts) == 1, "被概率门丢弃的提醒不得占用节流槽"
+
+    def test_watchdog_gate_rejected_alert_does_not_consume_throttle_slot(self, tmp_path):
+        """F14：watchdog.warning 同走 stuck 门，被门丢弃的提醒不得占节流槽。"""
+        mgr = self._make_mgr(tmp_path, stuck=0.5)
+        rolls = iter([0.99, 0.0])
+        mgr._rng = lambda: next(rolls)
+        payload = {"agent_key": "dsh", "reasons": ["search"], "steps": []}
+        mgr._on_exploration_warning("sess-1", payload)
+        assert mgr.win.alerts == [], "概率门拒绝时不得弹窗"
+        mgr._throttle_now[0] += 5.0
+        mgr._on_exploration_warning("sess-1", payload)
+        assert len(mgr.win.alerts) == 1, "被概率门丢弃的提醒不得占用节流槽"
 
 
 # ============================================================================

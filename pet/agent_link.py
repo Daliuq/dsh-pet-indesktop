@@ -3841,7 +3841,10 @@ class AgentLinkManager(QObject):
         - 同 scope 窗口内已弹过同档或更高档提醒：本次抑制（避免连环换弹）；
         - 真正更高档（level 更大）的升级放行并刷新记录，让"情况恶化"的更强提醒
           能覆盖低档提醒；
-        - 不同 scope（不同 agent/session）互不影响；
+        - scope 由调用方给出（stuck / pattern / watchdog 都用 agent 键，故同一
+          Agent 的各检测器共用一个槽位）；不同 scope 互不影响；
+        - 本 gate 只做「记账」判定，调用方必须先过事件汇报概率门：被概率门抽稀
+          丢弃的提醒没有展示，不得占用 30s 节流槽；
         - 设置窗口打开期间 show_alert 会直接丢弃普通提醒（N2-a）：此时不记账也
           不放行，避免被丢掉的提醒白占节流槽。
         """
@@ -3876,11 +3879,6 @@ class AgentLinkManager(QObject):
             self.win.request_link_anim(anim)
         if severity < 2:
             return  # 档位 1：只播动画，不弹气泡
-        # N2 跨检测器节流：档位 2 属控制级（level=2），比普通 watchdog 提醒高、
-        # 可覆盖低档；但同 scope 已弹过同档提醒（pattern control / 上一次档位 2）
-        # 时由 gate 抑制，避免连环换弹。
-        if not self._detector_alert_gate(agent_key, level=2):
-            return
         # 档位 2：持续提醒（可自定义文案；{name} 占位 = Agent 显示名）
         from .stuck_detector import stuck_reminder_text
         name = self.AGENT_NAMES.get(agent_key, agent_key)
@@ -3888,7 +3886,14 @@ class AgentLinkManager(QObject):
         custom = str((agent_cfg.get("stuck_reminder_text") or "") if isinstance(agent_cfg, dict) else "")
         text = stuck_reminder_text(name, custom)
         # 事件汇报概率门（检测类）：档位 1 的动画不受影响，只有气泡受门控制。
+        # 概率门判定必须在 N2 节流记账之前：被抽稀丢弃的提醒并没有展示，不该
+        # 占用 30s 节流槽，否则同 scope 的下一条提醒会被误压（F14）。
         if not self._report_allowed(agent_cfg, "stuck.reminder"):
+            return
+        # N2 跨检测器节流：档位 2 属控制级（level=2），比普通 watchdog 提醒高、
+        # 可覆盖低档；但同 scope 已弹过同档提醒（pattern control / 上一次档位 2）
+        # 时由 gate 抑制，避免连环换弹。
+        if not self._detector_alert_gate(agent_key, level=2):
             return
         if hasattr(self.win, "show_alert"):
             self.win.show_alert(self._dialogue("stuck.reminder", text, name=name), duration_ms=self._STUCK_REMINDER_MS, sticky=False)
@@ -3951,13 +3956,14 @@ class AgentLinkManager(QObject):
             )
         key = "pattern.control" if verdict in ("STOP", "ASK_USER", "REPLAN") else "pattern.warning"
         text = self._dialogue(key, text, name=name, reasons=reason)
+        agent_cfg = self.cfg.get("agent_link", {})
+        # 事件汇报概率门（检测类）：动画照旧，只有气泡受门控制。判定先于 N2
+        # 节流记账——被抽稀丢弃的提醒没有展示，不该占 30s 节流槽（F14）。
+        if not self._report_allowed(agent_cfg, key):
+            return
         # N2 跨检测器节流：pattern control 属控制级（level=2），可覆盖普通
         # watchdog 提醒；同档重复则被 gate 抑制。
         if not self._detector_alert_gate(agent_key, level=2):
-            return
-        agent_cfg = self.cfg.get("agent_link", {})
-        # 事件汇报概率门（检测类）：动画照旧，只有气泡受门控制。
-        if not self._report_allowed(agent_cfg, key):
             return
         if hasattr(self.win, "show_alert"):
             self.win.show_alert(text, duration_ms=self._PATTERN_REMINDER_MS, sticky=False)
@@ -3987,10 +3993,16 @@ class AgentLinkManager(QObject):
             return
         payload = payload if isinstance(payload, dict) else {}
         is_control = str(payload.get("level") or "warning").strip().lower() == "control"
+        agent_cfg = self.cfg.get("agent_link", {})
+        # 事件汇报概率门（检测类）：循环检测 warning 按门抽稀；control 级是常驻
+        # 可操作气泡，不经过概率门。判定先于 N2 节流记账——被抽稀丢弃的提醒
+        # 没有展示，不该占 30s 节流槽（F14）。
+        if not is_control and not self._report_allowed(agent_cfg, "watchdog.warning"):
+            return
         # N2 跨检测器节流：warning 是非升级普通提醒（level=1）；control 属控制级
         # （level=2），可覆盖 30s 窗口内的普通提醒，同档重复仍被抑制（防连环换弹）。
-        # scope 归一到 agent_key：payload 携带 state 记录的 agent_key，
-        # 缺失时用 session_key 前缀近似（dsh 联动同一会话即同一 agent）。
+        # scope 是 agent 键：stuck/pattern 用同一把键，故同一 Agent 的各检测器
+        # 共用一个槽位；payload 缺 agent_key 时按 session 兜底隔离。
         scope_key = str(payload.get("agent_key") or "") or f"session:{session_key}"
         if not self._detector_alert_gate(scope_key, level=2 if is_control else 1):
             return
@@ -4003,10 +4015,6 @@ class AgentLinkManager(QObject):
             "watchdog.warning", f"{name} 近期存在重复探索行为：{reasons}，暂不打断运行。",
             name=name, reasons=reasons,
         )
-        agent_cfg = self.cfg.get("agent_link", {})
-        # 事件汇报概率门（检测类）：循环检测提醒按门抽稀。
-        if not self._report_allowed(agent_cfg, "watchdog.warning"):
-            return
         if hasattr(self.win, "show_alert"):
             self._show_alert_compat(text, duration_ms=self._EXPLORATION_REMINDER_MS,
                                 sticky=False, alert_id=f"exploration-warning:{session_key}",
