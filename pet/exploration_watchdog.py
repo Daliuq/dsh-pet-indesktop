@@ -228,6 +228,8 @@ class ExplorationWatchdog(QObject):
         self.long_think_seconds = 120
         self._states = {}
         self._lock = threading.RLock()
+        self._paused = False
+        self._paused_at = 0.0
         self._think_timer = QTimer(self)
         self._think_timer.setInterval(1000)
         self._think_timer.timeout.connect(self._poll_long_think)
@@ -235,6 +237,43 @@ class ExplorationWatchdog(QObject):
 
     def close(self):
         self._think_timer.stop()
+
+    def pause(self) -> None:
+        """桌宠隐藏时暂停（产品决策：方案A）——停 1s 轮询并冻结全部计时锚点。
+
+        不采用「照常检测、显示层丢弃」：_poll_long_think 发射前置位
+        long_think_reported，显示层（_on_exploration_warning）在窗口不可见时
+        直接 return，提醒会永久丢失。暂停期间喂入的记录一并忽略。
+        """
+        with self._lock:
+            if self._paused:
+                return
+            self._paused = True
+            self._paused_at = time.monotonic()
+            self._think_timer.stop()
+
+    def resume(self) -> None:
+        """恢复显示：隐藏时长不计入任何时长判定——计时锚点整体后移暂停时长。
+
+        可见期已积累的时长保留（提醒推迟到恢复后补发，而不是丢失）。
+        """
+        with self._lock:
+            if not self._paused:
+                return
+            shift = time.monotonic() - self._paused_at
+            self._paused = False
+            self._paused_at = 0.0
+            for state in self._states.values():
+                state["started_at"] = state.get("started_at", 0.0) + shift
+                if state.get("grace_until") is not None:
+                    state["grace_until"] = state["grace_until"] + shift
+                steps = list(state["steps"].values())
+                if state.get("current") is not None:
+                    steps.append(state["current"])
+                for step in steps:
+                    if getattr(step, "think_started_at", None) is not None:
+                        step.think_started_at += shift
+            self._think_timer.start()
 
     def configure(self, config: dict):
         config = config if isinstance(config, dict) else {}
@@ -264,6 +303,8 @@ class ExplorationWatchdog(QObject):
 
     def feed_record(self, agent_key: str, record: dict):
         if not self.enabled or not isinstance(record, dict):
+            return
+        if self._paused:
             return
         event = _text(record.get("event"))
         session = _text(record.get("sessionId") or record.get("session_id") or agent_key) or agent_key
@@ -369,6 +410,8 @@ class ExplorationWatchdog(QObject):
 
     def _poll_long_think(self):
         """Detect a still-running Think without waiting for a Think-end event."""
+        if self._paused:
+            return
         pending = []
         now = time.monotonic()
         with self._lock:

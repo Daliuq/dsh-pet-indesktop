@@ -541,3 +541,22 @@ class TestWatchdogDisabledIsZeroOverhead:
             mgr._exploration_watchdog.feed_record(
                 "dsh", {"event": "command/run", "step": "s1", "command": "ls"})
         assert mgr.win.alerts, "开启时仍应正常告警"
+
+
+class TestWatchdogPauseOnHide:
+    def test_manager_pause_stops_watchdog_and_resume_restarts(self, app, tmp_path):
+        """桌宠隐藏时 manager.pause() 必须同步暂停探索看门狗（决策：方案A）。"""
+        cfg = Config(base=tmp_path)
+        agent_cfg = dict(cfg.get("agent_link", {}))
+        agent_cfg["dsh"] = True
+        cfg.set("agent_link", agent_cfg)
+        manager = AgentLinkManager(FakeWin(), cfg)
+        try:
+            assert manager._exploration_watchdog is not None
+            manager.pause()
+            assert not manager._exploration_watchdog._think_timer.isActive(), \
+                "隐藏时看门狗轮询必须停走（否则告警在隐藏期发射后被丢弃，永久丢失）"
+            manager.resume()
+            assert manager._exploration_watchdog._think_timer.isActive(), "恢复显示后轮询必须重启"
+        finally:
+            manager.shutdown()

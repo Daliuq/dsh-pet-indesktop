@@ -2629,6 +2629,10 @@ class AgentLinkManager(QObject):
             mon.pause()
         self._stuck_detector.pause()
         self._behavior_detector.pause()
+        # 探索看门狗随隐藏暂停：隐藏期继续跑只会让提醒在显示层被丢弃
+        # （_poll_long_think 发射前置位已上报标志），永久丢失；暂停后恢复时
+        # 计时锚点整体后移，隐藏时长不计入任何时长判定（产品决策：方案A）。
+        self._exploration_watchdog.pause()
         if hasattr(self.win, "clear_pending_link_anim"):
             self.win.clear_pending_link_anim()
         for key in list(self._done_pending):
@@ -2641,6 +2645,7 @@ class AgentLinkManager(QObject):
             mon.resume()
         self._stuck_detector.resume()
         self._behavior_detector.resume()
+        self._exploration_watchdog.resume()
 
     def shutdown(self) -> None:
         """窗口销毁/角色切换时停止所有 monitor worker，且作废安装回调。"""
