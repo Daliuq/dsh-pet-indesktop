@@ -98,6 +98,28 @@ def test_petwindow_lazy_ensure_creates_optional_services(tmp_path):
         app.processEvents()
 
 
+def test_petwindow_startup_applies_configured_optional_services(tmp_path):
+    """开机即按配置装配可选服务（不触碰任何菜单/设置对话框）。
+
+    回归：监视器实例由 AgentLinkManager.__init__ 装配，但真正启动靠
+    apply_config()；构造末尾若只调 _install_effect_services()，配置里
+    已开启的 Agent 联动（含 custom_agents 通道）与主动识屏要等用户展开
+    「Agent 联动」菜单或开关一次设置对话框才会启动。
+    """
+    from tests.test_collision_window import FakeLibrary
+
+    app = _qapp()
+    cfg = _disabled_config(tmp_path)
+    cfg.set("agent_link", {"opencode": True})
+    win = PetWindow(FakeLibrary(), cfg)
+    try:
+        assert win.agent_link_manager is not None
+        assert win.agent_link_manager.monitors["opencode"]._running
+    finally:
+        win.close()
+        app.processEvents()
+
+
 def test_petwindow_proactive_toggle_creates_watcher(tmp_path, monkeypatch):
     from tests.test_collision_window import FakeLibrary
 
