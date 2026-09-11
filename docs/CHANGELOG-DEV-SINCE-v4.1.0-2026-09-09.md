@@ -155,6 +155,7 @@
 14. **显示/缩放**：跨 DPI 屏/系统缩放变化画面不重建（Qt 信号驱动重建）；squash 期间命中 mask 重建限频（收势帧强制同步）；素材原地替换后旧帧残留。
 15. **全屏隐藏误判**：工具窗口/输入法候选框不再视为全屏；截图覆盖层进程级排除。
 16. 其它健壮性（三方盲审批次 17 项等）：畸形碰撞消息不抛异常、更新检查线程收口+重入防护、`>7 天 pet-*.log` 启动清理、SSE 空心跳行跳过、设置 Esc 关闭也落盘、图标解码 30s 超时逃生、菜单树释放 3s 总上限、`shiboken6.isValid` 守卫消 RuntimeWarning 等。
+17. **Agent 联动/主动识屏开机不生效**：`PetWindow.__init__` 收尾只调了 `_install_effect_services()`，没有走 `sync_optional_services()`——config.json 里已开启的 Agent 联动（DSH/Claude/Cursor/OpenCode 与 `custom_agents` 通道）和主动识屏要等用户展开「Agent 联动」菜单或开关一次设置对话框才真正启动（日志里看不到「Agent 监视器 [...] 已启动」）。修复：末尾等价替换为 `sync_optional_services()`（其内部以 `_install_effect_services` 收尾，净增 0 行，window.py 行数预算不变），开机即按配置装配。**行为变化**：已开启主动识屏的用户重启后不再需要打开一次设置对话框，识屏按配置直接生效（隐私红线不变：仍受 `proactive_screen.enabled` 与白名单/上限/冷却约束）。回归断言：`tests/test_feature_gating.py::test_petwindow_startup_applies_configured_optional_services`。
 
 ---
 
