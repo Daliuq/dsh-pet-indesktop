@@ -60,6 +60,33 @@ def test_consume_does_not_count_non_model_access_retry():
     assert tracker.count("dsh", "s-1") == 0
 
 
+def test_consume_counts_consecutive_timeout_retries():
+    """连接/超时类重试必须累计（真实事故：5 次 TIMEOUT 零提醒）。
+
+    回归（2026-09-11）：会话 session-b5b4f120… 连续 5 次 llm/retry 均为
+    errorCode=TIMEOUT（"upstream response headers timed out before streaming
+    started"）后恢复正常，旧实现 is_model_access 只认限流码，连续计数永远为空，
+    桌宠侧重试异常提醒完全不触发。TIMEOUT 类重试同属「本次模型请求未成功」，
+    必须进入连续计数供提醒兜底。
+    """
+    tracker = ModelAccessTracker()
+    for i in (1, 2, 3):
+        out = tracker.consume(_norm("llm/retry", retry=i, errorCode="TIMEOUT",
+                                    errorMessage="upstream response headers timed out before streaming started"))
+        assert out is not None, "TIMEOUT 重试必须产出一份 streak"
+        assert out["consecutiveRetryCount"] == i
+    assert tracker.count("dsh", "s-1") == 3
+
+
+def test_consume_counts_connection_failure_message_without_code():
+    """错误码缺失但消息含连接断词时也计数（消息兜底）。"""
+    tracker = ModelAccessTracker()
+    out = tracker.consume(_norm("llm/retry", retry=1,
+                                errorMessage="upstream connection reset by peer"))
+    assert out is not None
+    assert out["consecutiveRetryCount"] == 1
+
+
 def test_consume_resets_streak_on_recovery_events():
     """恢复/交互类事件必须复位连续限流计数（否则模型访问失败提示会一直叠加）。"""
     tracker = ModelAccessTracker()

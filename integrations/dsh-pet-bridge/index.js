@@ -41,13 +41,28 @@ function aggregateWrite() {
   writeRecord({ state: next });
 }
 
-// 判定是否为模型访问失败（服务端限流/过载）。DSH 实测 errorCode 为 "RATE_LIMIT"（消息如 "429: ..."），
-// 偶见直接 "429"。必须同时匹配 code 与 message，避免漏判。
+// 连接/超时类失败错误码（与下方 isModelAccessError 共用；DSH 的 llm/retry 里
+// 错误码不统一，消息必含超时或连接断词，码+消息两者归一判定）。
+const MODEL_ACCESS_CONN_CODES = new Set([
+  "TIMEOUT", "REQUEST_TIMEOUT", "UPSTREAM_TIMEOUT", "ETIMEDOUT",
+  "ESOCKETTIMEDOUT", "ECONNABORTED", "ECONNRESET", "ECONNREFUSED",
+  "EPIPE", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "NETWORK_ERROR",
+]);
+
+// 判定是否为模型访问失败（服务端限流/过载，或上游响应连接/超时类故障）。
+// DSH 实测 errorCode 为 "RATE_LIMIT"（消息如 "429: ..."），偶见直接 "429"；
+// 网络类故障常见 errorCode 为 "TIMEOUT"/"ETIMEDOUT" 等（消息形如
+// "upstream stream read failed before completion: upstream response headers
+// timed out before streaming started"）。连接/超时与限流同样属于「本次模型
+// 请求未成功、进入重试链」的异常，累计到阈值后也必须提醒桌宠（见下方
+// RETRY_EVENT_THRESHOLD 注释）。必须同时匹配 code 与 message，避免漏判。
 function isModelAccessError(code, message) {
   const c = String(code || "").trim().toUpperCase();
   const m = String(message || "");
   if (c === "RATE_LIMIT" || c === "429" || c === "TOO_MANY_REQUESTS") return true;
-  return m.startsWith("429") || /\b429\b/.test(m) || /rate.?limit/i.test(m);
+  if (m.startsWith("429") || /\b429\b/.test(m) || /rate.?limit/i.test(m)) return true;
+  if (MODEL_ACCESS_CONN_CODES.has(c)) return true;
+  return /\btimed?\s?out\b|timed out before|connection (reset|refused|aborted|closed|reset by peer)|network (error|unreachable|is unreachable)|socket hang up|eai_again|read ?ec 0|econnreset|etimedout/i.test(m);
 }
 
 // 桥目录必须与桌宠端一致：win32=%APPDATA%，darwin=~/Library/Application Support，其他=~/.config
@@ -369,7 +384,8 @@ const TEXT_MAX = 300;
 // 恢复后的连续重试，绝不把不同时段已恢复的抖动累加成长期故障。
 // 只在 turn/end 时判定并写一条脱敏记录（错误码保留、错误正文不落盘）。
 const RETRY_EXHAUSTED_THRESHOLD = 4;
-// 限流/连接重试只在同一 session 连续达到 5 次时提醒一次。
+// 限流/连接超时类重试只在同一 session 连续达到 5 次时提醒一次（识别口径与
+// isModelAccessError 一致：429/RATE_LIMIT 与 TIMEOUT/连接断类故障都算）。
 // 原始 llm/retry 仍然逐条转发，便于桌宠侧做详细诊断；这里只抑制高优先级
 // model_access 事件，避免一次短暂抖动连续轰炸桌宠。
 const RETRY_EVENT_THRESHOLD = 5;
@@ -1658,6 +1674,7 @@ export const __retryTest = {
   threshold: RETRY_EVENT_THRESHOLD,
   reset: resetRetryConnection,
   note: noteRetryConnection,
+  isModelAccess: isModelAccessError,
 };
 export const __hardFailureTest = {
   threshold: RETRY_EXHAUSTED_THRESHOLD,
