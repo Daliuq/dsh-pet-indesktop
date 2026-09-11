@@ -143,3 +143,84 @@ def test_pause_does_not_latch_long_think_and_resume_reanchors(app, monkeypatch):
         assert seen[0]["threshold_phase"] == "long-think"
     finally:
         wd.close()
+
+
+def test_turn_reset_preserves_time_anchors(app, monkeypatch):
+    """方案A1：turn 边界重建状态时沿用旧的 started_at/grace_until。
+
+    宽限/长运行是任务级语义（设置页文案：「Agent 启动后的前 N 分钟」
+    「连续运行超过 N 分钟」），每轮重置会让宽限在 30 秒一轮的 workload 下
+    永久生效、长运行永不触发。
+    """
+    import pet.exploration_watchdog as watchdog_mod
+
+    clock = _FakeClock()
+    monkeypatch.setattr(watchdog_mod, "time", clock)
+    wd = ExplorationWatchdog()
+    try:
+        for _ in range(5):
+            wd.feed_record("agent", {"event": "command/run", "step": "s1", "command": "ls"})
+        with wd._lock:
+            state = wd._states["agent"]
+            started_at = state["started_at"]
+            grace_until = state["grace_until"]
+        clock.now += 30  # 本轮 30 秒
+        wd.feed_record("agent", {"event": "turn/end", "step": "s1"})
+        clock.now += 5
+        for _ in range(5):
+            wd.feed_record("agent", {"event": "command/run", "step": "s2", "command": "ls"})
+        with wd._lock:
+            state2 = wd._states["agent"]
+            assert state2["steps"] == {} or state2["current"] is not None, "重复窗口应照常清空"
+            assert state2["started_at"] == started_at, "turn 重置不得刷新 started_at（任务级计时）"
+            assert state2["grace_until"] == grace_until, "turn 重置不得刷新 grace_until（启动宽限只送一次）"
+    finally:
+        wd.close()
+
+
+def test_resume_shifts_anchor_memory(app, monkeypatch):
+    """pause/resume 的锚点后移必须同时作用于锚点记忆，否则隐藏时长会被计入。"""
+    import pet.exploration_watchdog as watchdog_mod
+
+    clock = _FakeClock()
+    monkeypatch.setattr(watchdog_mod, "time", clock)
+    wd = ExplorationWatchdog()
+    try:
+        for _ in range(5):
+            wd.feed_record("agent", {"event": "command/run", "step": "s1", "command": "ls"})
+        with wd._lock:
+            started_before = wd._states["agent"]["started_at"]
+        wd.pause()
+        clock.now += 600
+        wd.resume()
+        wd.feed_record("agent", {"event": "turn/end", "step": "s1"})
+        for _ in range(5):
+            wd.feed_record("agent", {"event": "command/run", "step": "s2", "command": "ls"})
+        with wd._lock:
+            assert wd._states["agent"]["started_at"] == started_before + 600, \
+                "恢复后重置引用的锚点记忆必须已整体后移（隐藏时长不得计入）"
+    finally:
+        wd.close()
+
+
+def test_idle_reset_preserves_anchors_under_wall_clock(app, monkeypatch):
+    """A1 墙钟语义：idle/sleeping 重置同样沿用锚点（任务时间轴连续）。"""
+    import pet.exploration_watchdog as watchdog_mod
+
+    clock = _FakeClock()
+    monkeypatch.setattr(watchdog_mod, "time", clock)
+    wd = ExplorationWatchdog()
+    try:
+        for _ in range(5):
+            wd.feed_record("agent", {"event": "command/run", "step": "s1", "command": "ls"})
+        with wd._lock:
+            started_at = wd._states["agent"]["started_at"]
+        clock.now += 120  # 干活 2 分钟后 idle
+        wd.feed_record("agent", {"event": "AgentStatus", "state": "idle"})
+        clock.now += 1800  # 用户离开半小时再回来
+        for _ in range(5):
+            wd.feed_record("agent", {"event": "command/run", "step": "s2", "command": "ls"})
+        with wd._lock:
+            assert wd._states["agent"]["started_at"] == started_at, "idle 重置不得刷新 started_at（A1 墙钟语义）"
+    finally:
+        wd.close()

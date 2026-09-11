@@ -195,7 +195,7 @@ class WatchdogSettingsPage(QWidget):
             SettingRow("long_run_minutes", "长运行降阈值",
                         "连续运行超过 N 分钟后，风险阈值自动降低 1，提高敏感度。", self.long_run_spin),
             SettingRow("long_think_seconds", "单次超长 Think",
-                        "单次思考超过该时长（秒）后降低风险阈值。", self.long_think_spin),
+                        "单次思考超过该时长（秒）后直接提醒（不调整其他阈值）。", self.long_think_spin),
         ], self))
 
         root.addWidget(SettingsSection("卡住检测", [

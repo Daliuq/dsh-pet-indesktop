@@ -227,6 +227,7 @@ class ExplorationWatchdog(QObject):
         self.long_run_seconds = 10 * 60
         self.long_think_seconds = 120
         self._states = {}
+        self._anchor_memory: dict[str, tuple[float, float]] = {}
         self._lock = threading.RLock()
         self._paused = False
         self._paused_at = 0.0
@@ -273,6 +274,9 @@ class ExplorationWatchdog(QObject):
                 for step in steps:
                     if getattr(step, "think_started_at", None) is not None:
                         step.think_started_at += shift
+            # 锚点记忆同样后移：否则隐藏时长会被后续重建的状态计入。
+            for session, anchors in list(self._anchor_memory.items()):
+                self._anchor_memory[session] = (anchors[0] + shift, anchors[1] + shift)
             self._think_timer.start()
 
     def configure(self, config: dict):
@@ -299,7 +303,17 @@ class ExplorationWatchdog(QObject):
 
     def reset(self, session_key: str):
         with self._lock:
-            self._states.pop(session_key, None)
+            old = self._states.pop(session_key, None)
+            if old is not None:
+                # 方案A1（任务级语义）：turn/idle 等边界重建状态时沿用旧的
+                # started_at/grace_until，否则 30 秒一轮的 workload 下启动宽限
+                # 永久生效、长运行降阈值永不触发（设置页文案是任务级承诺）。
+                self._anchor_memory[session_key] = (
+                    float(old.get("started_at") or 0.0),
+                    float(old.get("grace_until") or 0.0),
+                )
+                while len(self._anchor_memory) > 64:
+                    self._anchor_memory.popitem(last=False)
 
     def feed_record(self, agent_key: str, record: dict):
         if not self.enabled or not isinstance(record, dict):
@@ -351,9 +365,11 @@ class ExplorationWatchdog(QObject):
         fp = make_fingerprint(record, cls, target)
         with self._lock:
             now = time.monotonic()
+            anchors = self._anchor_memory.get(session)
             state = self._states.setdefault(session, {"steps": OrderedDict(), "current": None,
                 "last_inspected_seq": 0, "seq": 0, "goal": "",
-                "started_at": now, "grace_until": now + self.early_grace_seconds,
+                "started_at": anchors[0] if anchors else now,
+                "grace_until": anchors[1] if anchors else now + self.early_grace_seconds,
                 "agent_name": _text(record.get("agentName") or record.get("agent") or agent_key),
                 "agent_key": agent_key})
             current = state["current"]
