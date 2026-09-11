@@ -3642,6 +3642,35 @@ class TestUnknownBridgeEventReminder:
         assert [(k, d.get("event")) for k, d in unknown] == [("dsh", "brand/sparkle")]
         mon.stop()
 
+    def test_watchdog_and_control_events_are_not_unknown(self, tmp_path):
+        """桥接/桌宠回显真实会写、语义层与状态机都没建模的事件不得判成「未知」。
+
+        漏登记后果与 user/message 同型：每次写盘触发一次「更新/重装 bridge」
+        误提醒（10 分钟冷却 → 表现为偶发弹窗）。来源：
+        - tool-workflow/run-end：桥接 STATE_EVENT_TYPES（与已登记的 run-start 成对）；
+        - web_search_begin / web_search_end / context_compacted：桥接
+          WATCHDOG_EVENT_TYPES 直写（供探索看门狗，非状态迁移）；
+        - pet/control-queued：桌宠控制队列写盘回显（pet/dsh_control.py）。
+        """
+        app = QApplication.instance() or QApplication([])
+        mon = BaseAgentMonitor("dsh", tmp_path)
+        unknown = []
+        mon.unknown_bridge_event.connect(lambda k, d: unknown.append((k, d)))
+        events_file = mon.events_file
+        events_file.parent.mkdir(parents=True, exist_ok=True)
+        events_file.touch()
+        mon._poll()  # 初始化 tailer（首轮不重放）
+        with open(events_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"event": "tool-workflow/run-end", "step": 1, "ts": 1}) + "\n")
+            f.write(json.dumps({"event": "web_search_begin", "ts": 2}) + "\n")
+            f.write(json.dumps({"event": "web_search_end", "ts": 3}) + "\n")
+            f.write(json.dumps({"event": "context_compacted", "ts": 4}) + "\n")
+            f.write(json.dumps({"event": "pet/control-queued", "ts": 5}) + "\n")
+            f.write(json.dumps({"event": "brand/sparkle", "ts": 6}) + "\n")  # 真未知仍要报
+        mon._poll()
+        assert [(k, d.get("event")) for k, d in unknown] == [("dsh", "brand/sparkle")]
+        mon.stop()
+
     def test_non_dsh_monitor_never_emits_unknown(self, tmp_path):
         """claude/cursor 等 transcript 噪声不算桥接未知事件（只查 DSH 监视器）。"""
         app = QApplication.instance() or QApplication([])

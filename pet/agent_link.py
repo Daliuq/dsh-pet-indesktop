@@ -76,6 +76,16 @@ _RAW_BRIDGE_KNOWN_EVENTS: frozenset[str] = frozenset({
     "command/done",
     "pet/control-clicked",
     "bridge/control-received",
+    # - tool-workflow/run-end：桥接 STATE_EVENT_TYPES 直写，与已登记的
+    #   tool-workflow/run-start 成对（语义层只认识 run-start）；
+    # - web_search_begin / web_search_end / context_compacted：桥接
+    #   WATCHDOG_EVENT_TYPES 直写（供探索看门狗，非状态迁移）；
+    # - pet/control-queued：桌宠控制队列写盘回显（pet/dsh_control.py）。
+    "tool-workflow/run-end",
+    "web_search_begin",
+    "web_search_end",
+    "context_compacted",
+    "pet/control-queued",
 })
 
 
