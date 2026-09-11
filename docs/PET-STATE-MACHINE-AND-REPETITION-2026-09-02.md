@@ -148,7 +148,7 @@ W6 是短时爆发视图，W10 是长期趋势视图。一个 step 内并行发�
 ```python
 pattern_warning = Signal(str, object)  # agent_key, payload
 pattern_control = Signal(str, object)  # agent_key, payload
-pattern_resolved = Signal(str)          # agent_key
+# pattern_resolved 信号已随 PR57 审计批 3 移除（零消费方）。
 ```
 
 payload 包含：
@@ -262,8 +262,8 @@ turn/end、idle、session 结束或新一代控制结果后清理
 
 ## 代码依据
 
-- [行为模式检测器](</W:/deepseek-harness/dsh-pet-indesktop/pet/behavior_detector.py>)
-- [探索循环 Watchdog](</W:/deepseek-harness/dsh-pet-indesktop/pet/exploration_watchdog.py>)
-- [卡住检测器](</W:/deepseek-harness/dsh-pet-indesktop/pet/stuck_detector.py>)
-- [DSH 状态跟踪器](</W:/deepseek-harness/dsh-pet-indesktop/pet/dsh_state.py>)
-- [Agent 联动管理器](</W:/deepseek-harness/dsh-pet-indesktop/pet/agent_link.py>)
+- [行为模式检测器](<pet/behavior_detector.py>)
+- [探索循环 Watchdog](<pet/exploration_watchdog.py>)
+- [卡住检测器](<pet/stuck_detector.py>)
+- [DSH 状态跟踪器](<pet/dsh_state.py>)
+- [Agent 联动管理器](<pet/agent_link.py>)

@@ -29,7 +29,7 @@
 1. **纯逻辑层不依赖 Qt**：`collision.py` / `physics.py` / `collision_codec.py` 禁止 import PySide6。
 2. **共享解码链单向依赖**：`decode_fanout.py` 不得反向依赖 `window.py` / `webm_clip.py`，窗口钩子只能通过注入接入。
 3. **窗口私有面冻结**：`PetWindow` 的 `win._xxx` 只允许 `window.py` 自身与 `collision_client.py` 访问；`app.py` / `agent_link.py` / `context_menus/` 出现即为违规。
-4. **`window.py` 行数预算**：当前预算 `4385` 行（= 实测值，2026-09-11 校准；含 klxxya 的 #101 探头位移闸门与 #102 启动装配注释）。预算只随实测校准，**不靠压缩行宽/合并语句硬塞**；确需上调要在 PR 说明理由。
+4. **`window.py` 行数预算**：当前预算 `4293` 行（= 实测值，2026-09-11 校准；含 klxxya 的 #101 探头位移闸门与 #102 启动装配注释）。预算只随实测校准，**不靠压缩行宽/合并语句硬塞**；确需上调要在 PR 说明理由。
 5. **`modern_settings_dialog.py` 行数预算**：当前预算 `2018` 行（实测 1826 行，已拆到 `settings_widgets` / `settings_menu_layout_editor` / `chat/ai_settings_page` / `settings_theme_qss`），再往主对话框塞新页面属于红线。
 6. **孤儿簇守卫**：`settings_widgets.py`、`settings_styles*.qss` 等文件不允许“存在但零引用”——要么删除，要么真正接线；防再发由测试守护。
 

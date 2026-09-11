@@ -70,7 +70,7 @@
 
 ### 2.6 Agent 联动与 DSH（#73/#76/#80/#82/#64 等）
 
-- **DSH 桥接富事件归约**：thinking（思考）/working（干活，带工具名）/attention（需确认）/error/idle 多态，多会话聚合优先级 attention>error>working>thinking>idle，子代理不抢状态；agent/status 作旧宿主回退（见过富事件后自动停用）。
+- **DSH 桥接富事件归约**：thinking（思考）/working（干活，带工具名）/attention（需确认）/error/idle 多态，多会话聚合优先级 attention>error>working>thinking>idle，子代理不抢状态；agent/status 始终作为聚合基线被采纳（不存在"见过富事件后自动停用"机制）。
 - **opencode reason 分流**：`step-finish` reason=tool-calls（模型停笔等工具结果）不再误报完成——治好长跑 task 子代理/慢工具（长 bash/dev server）的**假完成音/气泡**与回注后的假开始音。
 - **启动 Harness 复用本机已有实例**：探测顺序改为配置端口优先、其次官方默认 3080——用户已自己跑着 dsh web 时直接复用打开，不再重复拉起第二个实例（关联 issue #10 双开浏览器）；菜单点击启动新实例时冒泡提示「正在后台启动」（首次 npx 拉包可能几分钟）。
 - **「随桌宠启动 dsh 服务」开关**：配置键 `harness_autostart`（默认关）——开机自启场景下主窗就绪即后台拉起 dsh web（只起服务、不开浏览器、不弹窗口）；设置 → 常规 → 应用启动新增开关，仅主桌宠可设置，slot 落种不继承。
