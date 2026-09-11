@@ -526,6 +526,27 @@ def _bounded_children(folder: Path, cap: int = 200) -> list[Path]:
     return out
 
 
+def _safe_is_dir(path: Path) -> bool:
+    """目录判定不得让权限/竞态错误逃逸。
+
+    `Path.is_dir()` 只在路径**不存在**时返回 False；祖先目录没有搜索权限时会抛
+    PermissionError（CI ubuntu 实测：tmp 落在 snap private /tmp 下直接 EACCES）。
+    本模块的探测跑在「安装失败文案」与「启动自检」路径上——那里绝不允许抛异常。
+    """
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
+def _safe_mtime(path: Path) -> float:
+    """mtime 排序键：stat 失败（EACCES/竞态）退化为 0.0，不值得让体检崩掉。"""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def _suggest_path_replacement(
     missing: Path, *, max_ancestors: int = 5, scan_cap: int = 200,
 ) -> Path | None:
@@ -535,9 +556,11 @@ def _suggest_path_replacement(
     1. 名字里带版本：`pkg-0.12.80.tgz` → 磁盘上是 `pkg-0.13.6.tgz`；
     2. 上层目录改名：`dist-onedir/<旧构建名>/.../dsh-pet-bridge` → 新构建名下的同一相对路径。
     只做有界扫描，且只给建议（绝不自动改写用户的 package.json）。
+
+    全程用 `_safe_*` 探测：任何文件系统错误都退化为"没有建议"，绝不往外抛。
     """
     parent = missing.parent
-    if parent.is_dir():
+    if _safe_is_dir(parent):
         match = _VERSION_TOKEN.search(missing.name)
         if match:
             prefix, suffix = missing.name[:match.start()], missing.name[match.end():]
@@ -551,17 +574,17 @@ def _suggest_path_replacement(
     parts = missing.parts
     for depth in range(1, min(max_ancestors, len(missing.parents) - 1) + 1):
         base = missing.parents[depth]
-        if not base.is_dir():
+        if not _safe_is_dir(base):
             continue
         tail = parts[-depth:]
         matches = [
             candidate for entry in _bounded_children(base, scan_cap)
-            if entry.is_dir()
+            if _safe_is_dir(entry)
             for candidate in [entry.joinpath(*tail)]
-            if candidate.is_dir()
+            if _safe_is_dir(candidate)
         ]
         if matches:
-            return max(matches, key=lambda p: p.stat().st_mtime)
+            return max(matches, key=_safe_mtime)
     return None
 
 

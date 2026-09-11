@@ -109,6 +109,46 @@ class TestMissingDependencySpecs:
 
         assert newer.name in finding, finding
 
+    def test_probes_survive_permission_errors(self, tmp_path, monkeypatch):
+        """回归（CI ubuntu 实测）：祖先目录无搜索权限时 `Path.is_dir()` 抛 EACCES，
+        候选扫描必须退化成「没有建议」，绝不能把 PermissionError 抛进安装失败路径。
+
+        CI 现场：tmp_path 落在 snap private /tmp 下，stat 直接 Permission denied。
+        """
+        real_is_dir = Path.is_dir
+
+        def fake_is_dir(self):
+            if "gone" in str(self):
+                raise PermissionError(13, "Permission denied")
+            return real_is_dir(self)
+
+        monkeypatch.setattr(Path, "is_dir", fake_is_dir)
+        missing = tmp_path / "gone" / "ghost-ext"
+        profile = _profile(tmp_path, deps={"ghost-ext": f"link:{missing}"})
+
+        findings = agent_link._missing_dependency_specs(profile, _manifest(profile))
+
+        assert len(findings) == 1
+        assert "ghost-ext" in findings[0]
+        assert "疑似应改为" not in findings[0], "探测失败时应退化为无建议"
+
+    def test_safe_probes_swallow_permission_errors(self, tmp_path, monkeypatch):
+        """候选扫描用的两个探测助手都必须吞掉权限/竞态错误（CI ubuntu 实测 EACCES）。
+
+        注：`Path.is_dir()` 内部也走 stat，所以"只让 mtime 排序失败"没法用打桩区分——
+        这两条保证只能各自单元断言（集成面由上面的 permission 用例覆盖）。
+        """
+        target = tmp_path / "x"
+        target.mkdir()
+
+        def boom(*args, **kwargs):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(Path, "stat", boom)
+
+        assert agent_link._safe_is_dir(target) is False
+        assert agent_link._safe_mtime(target) == 0.0
+
 
 # ---------------------------------------------------------------- 失败文案
 
