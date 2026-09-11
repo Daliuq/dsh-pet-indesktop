@@ -42,7 +42,6 @@ from .click_sound import play_sound, resolve_builtin_sound
 from .report_gates import should_report, should_report_event
 from .agent_event_protocol import parse_agent_event
 from .agent_event_normalizer import normalize_event
-from .agent_event_runtime import AgentEventRuntime
 from .model_access_tracker import ModelAccessTracker
 from .node_runtime import augmented_path as _augmented_path
 from .node_runtime import global_node_modules_roots
@@ -2319,7 +2318,6 @@ class AgentLinkManager(QObject):
         # 过程汇报气泡与 tool 信号同轮触发，用它把 target 等字段显式送进气泡，
         # 不再依赖「恰好是最后一条记录」的隐式上下文。
         self._last_tool_records: dict[str, dict[str, Any]] = {}
-        self._event_runtime = AgentEventRuntime()
         self._model_access_tracker = ModelAccessTracker()
         # 待处理阻塞型交互：interaction_id → {"agent_key", "kind": "approval"|"question",
         # "text": str, "tool"?: str, "questions"?: list, "rpc_id"?, "approval_id"?,
@@ -2386,7 +2384,6 @@ class AgentLinkManager(QObject):
 
         for mon in self.monitors.values():
             mon.raw_record.connect(self._remember_dialogue_record)
-            mon.normalized_event.connect(self._event_runtime.dispatch)
             mon.normalized_event.connect(self._on_normalized_event)
             mon.state_event.connect(self._on_agent_state_event)
             mon.activity_event.connect(self._on_agent_activity_event)

@@ -69,22 +69,5 @@ class AgentEvent:
             data = {k: v for k, v in record.items() if k not in excluded}
         return cls(str(_first(record, "schema", default=SCHEMA) or SCHEMA), timestamp, source, name, project_id, project_name, session, session_name, _first(record, "turn"), _first(record, "step"), event, bounded_data(data), str(_first(record, "callId", "call_id", default="") or ""), str(_first(record, "requestId", "request_id", default="") or ""))
 
-    def display_context(self) -> str:
-        """Human-facing context with conservative fallbacks; IDs are never displayed."""
-        project = self.project_name.strip()
-        session = self.session_name.strip()
-        agent = self.agent_name.strip() or self.source.strip() or "Agent"
-        if project and session: return f"{project} · {session}"
-        if session: return session
-        return agent
-
-    def to_record(self) -> dict[str, Any]:
-        record = {"schema": self.schema or SCHEMA, "ts": self.timestamp, "source": self.source, "agentName": self.agent_name, "projectId": self.project_id, "projectName": self.project_name, "sessionId": self.session_id, "sessionName": self.session_name, "event": self.event, "data": bounded_data(self.data)}
-        if self.turn is not None: record["turn"] = self.turn
-        if self.step is not None: record["step"] = self.step
-        if self.call_id: record["callId"] = self.call_id
-        if self.request_id: record["requestId"] = self.request_id
-        return record
-
 def parse_agent_event(record: Mapping[str, Any], *, source_hint: str = "", agent_name_hint: str = "") -> AgentEvent:
     return AgentEvent.from_record(record, source_hint=source_hint, agent_name_hint=agent_name_hint)
