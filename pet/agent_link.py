@@ -33,6 +33,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import unquote
 
 from PySide6.QtCore import QCoreApplication, QObject, QTimer, Signal
 from PySide6.QtWidgets import QMessageBox
@@ -440,6 +441,157 @@ def _manifest_set_bundle(pkg: dict, profile_dir: Path, present: bool) -> bool:
         json.dumps(pkg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
     return True
+
+
+# ---------------------------------------------------------------------------
+# 依赖规格体检（issue：桥接装不上，报错只说 pnpm 失败，看不出是哪条依赖）
+#
+# profile 的 package.json 里可能有**指向本地磁盘**的依赖（`link:` / `file:` /
+# 裸相对路径 / 绝对路径），而路径里往往嵌着会变的东西：打包构建目录名、
+# 文件名里的版本号、本机绝对路径。目录改名或版本升级后 spec 就指向不存在的
+# 路径，pnpm 解析失败。这里只做**诊断**：指名是哪条依赖、并给出"疑似应改为"
+# 的候选路径；绝不自动改用户的 package.json。
+# ---------------------------------------------------------------------------
+
+_LOCAL_SPEC_PREFIXES = ("link:", "file:")
+# 非本地规格：版本区间 / registry / git / 远端压缩包等，不存在"路径是否存在"的问题
+_REMOTE_SPEC_PREFIXES = (
+    "http:", "https:", "git:", "git+", "github:", "gitlab:", "bitbucket:",
+    "workspace:", "npm:", "portal:", "patch:", "catalog:",
+)
+_PATHLIKE_SPEC = re.compile(r"^(?:\.{1,2}[\\/]|[\\/]{1,2}|[A-Za-z]:[\\/])")
+_VERSION_TOKEN = re.compile(r"(\d+(?:\.\d+)*(?:-[0-9A-Za-z.]+)?)")
+_WINDOWS_DRIVE_ABS = re.compile(r"^/[A-Za-z]:[\\/]")
+
+
+def _path_spec_target(spec: str, profile_dir: Path) -> Path | None:
+    """把依赖规格解析成本地路径；非路径型规格返回 None。
+
+    pnpm 除了 `link:` / `file:`，也接受裸相对路径（`./x`、`../x`）与绝对路径，
+    这些同样会在目标不存在时让安装失败，必须一起检查。
+    """
+    text = (spec or "").strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    if lowered.startswith(_REMOTE_SPEC_PREFIXES):
+        return None
+    raw: str | None = None
+    for prefix in _LOCAL_SPEC_PREFIXES:
+        if lowered.startswith(prefix):
+            raw = text[len(prefix):]
+            break
+    if raw is None:
+        if not _PATHLIKE_SPEC.match(text):
+            return None
+        raw = text
+    raw = unquote(raw.strip())
+    if raw.lower().startswith("file://"):
+        raw = raw[len("file://"):]
+    raw = raw.strip()
+    if not raw:
+        return None
+    if _WINDOWS_DRIVE_ABS.match(raw):  # file:///W:/x → W:/x
+        raw = raw[1:]
+    path = Path(raw)
+    if not path.is_absolute():
+        path = profile_dir / path
+    try:
+        return path.resolve()
+    except OSError:
+        return path
+
+
+def _version_key(name: str) -> tuple:
+    """挑"更新的同类"时的排序键：按数字段比较，非版本名退化为名字序。"""
+    numbers = [int(part) for part in re.findall(r"\d+", name)][:4]
+    padded = tuple(numbers + [0] * (4 - len(numbers)))
+    return (*padded, name)
+
+
+def _newest(paths: list[Path]) -> Path:
+    return max(paths, key=lambda p: _version_key(p.name))
+
+
+def _bounded_children(folder: Path, cap: int = 200) -> list[Path]:
+    """有界列举目录内容：依赖体检绝不能因为一个超大目录卡住启动路径。"""
+    out: list[Path] = []
+    try:
+        for entry in folder.iterdir():
+            out.append(entry)
+            if len(out) >= cap:
+                break
+    except OSError:
+        return []
+    return out
+
+
+def _suggest_path_replacement(
+    missing: Path, *, max_ancestors: int = 5, scan_cap: int = 200,
+) -> Path | None:
+    """为一个不存在的路径找"疑似替代"。
+
+    两类真实场景：
+    1. 名字里带版本：`pkg-0.12.80.tgz` → 磁盘上是 `pkg-0.13.6.tgz`；
+    2. 上层目录改名：`dist-onedir/<旧构建名>/.../dsh-pet-bridge` → 新构建名下的同一相对路径。
+    只做有界扫描，且只给建议（绝不自动改写用户的 package.json）。
+    """
+    parent = missing.parent
+    if parent.is_dir():
+        match = _VERSION_TOKEN.search(missing.name)
+        if match:
+            prefix, suffix = missing.name[:match.start()], missing.name[match.end():]
+            siblings = [
+                entry for entry in _bounded_children(parent, scan_cap)
+                if entry.name.startswith(prefix) and entry.name.endswith(suffix)
+            ]
+            if siblings:
+                return _newest(siblings)
+
+    parts = missing.parts
+    for depth in range(1, min(max_ancestors, len(missing.parents) - 1) + 1):
+        base = missing.parents[depth]
+        if not base.is_dir():
+            continue
+        tail = parts[-depth:]
+        matches = [
+            candidate for entry in _bounded_children(base, scan_cap)
+            if entry.is_dir()
+            for candidate in [entry.joinpath(*tail)]
+            if candidate.is_dir()
+        ]
+        if matches:
+            return max(matches, key=lambda p: p.stat().st_mtime)
+    return None
+
+
+def _missing_dependency_specs(profile_dir: Path, pkg: dict) -> list[str]:
+    """profile 里指向不存在路径的依赖（pnpm 会因此安装失败），一行一条。"""
+    deps = pkg.get("dependencies") if isinstance(pkg, dict) else None
+    if not isinstance(deps, dict):
+        return []
+    findings: list[str] = []
+    for name, spec in deps.items():
+        target = _path_spec_target(str(spec), profile_dir)
+        if target is None or target.exists():
+            continue
+        line = f"{name} 指向不存在的路径：{spec}"
+        suggestion = _suggest_path_replacement(target)
+        if suggestion is not None:
+            line += f"（疑似应改为 {suggestion}）"
+        findings.append(line)
+    return findings
+
+
+def _dependency_spec_hint(profile_dir: Path, pkg: dict, *, limit: int = 2) -> str:
+    """把缺失依赖压成一句可拼进报错的提示；没有问题时返回空串。"""
+    findings = _missing_dependency_specs(profile_dir, pkg)
+    if not findings:
+        return ""
+    shown = "；".join(findings[:limit])
+    more = f"（另有 {len(findings) - limit} 条同类问题）" if len(findings) > limit else ""
+    return f"；依赖路径缺失：{shown}{more}"
+
 
 # 标准统一状态词汇
 VALID_STATES = {"idle", "thinking", "working", "attention", "sleeping", "error"}
@@ -1136,6 +1288,8 @@ class DshMonitor(BaseAgentMonitor):
         # events_file 保留为旧字段名（兼容既有调用/测试），实际读取走 DirGlobTailer。
         self.events_file = self.events_dir / "dsh.jsonl"
         self._tailer = DirGlobTailer(self.events_dir, pattern="dsh*.jsonl")
+        # 启动自检只做一次（每实例）：pnpm 解析可能数十秒，绝不能重复触发
+        self._link_check_started = False
 
     @staticmethod
     def bundled_plugin_dir() -> Path | None:
@@ -1168,6 +1322,99 @@ class DshMonitor(BaseAgentMonitor):
             if p.is_dir() and (p / "cordis.yml").is_file()
         )
         return profiles or ["web"]
+
+    @classmethod
+    def bridge_link_stale(cls) -> list[tuple[str, str]]:
+        """已装插件、但 `link:` 目标不是当前内置插件目录（或目标已失效）的 profile。
+
+        为什么需要：profile 里记的是**安装那一刻的绝对路径**（源码运行是仓库
+        integrations/，打包版是 dist-onedir/<构建名>/_internal/integrations/...），
+        重新打包或换构建目录后这条 link 就成了孤儿——dsh 仍会加载旧代码，或直接
+        解析失败。安装/刷新只在用户重新切换联动开关时才发生（见 install_bridge），
+        联动一直开着的人不会自愈，所以在启动路径补一次自检。
+
+        只认路径型 spec：从 registry 装的版本型 spec 视为用户有意为之，不动。
+        """
+        plugin = cls.bundled_plugin_dir()
+        if plugin is None:
+            return []
+        try:
+            current = plugin.resolve()
+        except OSError:
+            current = plugin
+        stale: list[tuple[str, str]] = []
+        for profile in _real_profiles():
+            pkg = _read_manifest(profile)
+            if pkg is None or not _manifest_has_plugin(pkg):
+                continue
+            spec = str((pkg.get("dependencies") or {}).get(DSH_PLUGIN_NAME) or "")
+            target = _path_spec_target(spec, profile)
+            if target is None:  # 版本型 spec：不属于 link 陈旧
+                continue
+            if not target.exists() or target != current:
+                stale.append((profile.name, spec))
+        return stale
+
+    @classmethod
+    def refresh_stale_bridge_links(cls) -> list[str]:
+        """把陈旧 link 刷新为当前内置插件目录，返回刷新成功的 profile 名。
+
+        只处理**已装插件**的 profile——启动自检绝不替用户安装（安装需用户同意）。
+        """
+        plugin = cls.bundled_plugin_dir()
+        if plugin is None:
+            return []
+        stale_names = {name for name, _spec in cls.bridge_link_stale()}
+        if not stale_names:
+            return []
+        refreshed: list[str] = []
+        for profile in _real_profiles():
+            if profile.name not in stale_names:
+                continue
+            rc, out = _run_pnpm(profile, "add", str(plugin))
+            if rc != 0:
+                log.warning(
+                    "桥接 link 刷新失败 %s: %s", profile.name, (out or "")[-200:],
+                )
+                continue
+            pkg = _read_manifest(profile)
+            if pkg is not None:
+                try:
+                    _manifest_set_bundle(pkg, profile, True)
+                except Exception:
+                    log.exception("桥接 bundles 写入失败: %s", profile.name)
+            refreshed.append(profile.name)
+        return refreshed
+
+    def schedule_link_refresh_check(self, spawn=None) -> None:
+        """启动后自检一次桥接 link（每实例一次；后台线程，不阻塞 GUI）。
+
+        spawn 仅为测试注入：默认真起守护线程。
+        """
+        if self._link_check_started:
+            return
+        self._link_check_started = True
+        runner = spawn or self._spawn_link_check
+        try:
+            runner(self._refresh_links_worker)
+        except Exception:
+            log.exception("桥接 link 自检启动失败")
+
+    @staticmethod
+    def _spawn_link_check(target) -> None:
+        threading.Thread(
+            target=target, daemon=True, name="dsh-bridge-link-check",
+        ).start()
+
+    def _refresh_links_worker(self) -> None:
+        """后台刷新陈旧 link：失败只记日志（自检是静默修复，不打扰用户）。"""
+        try:
+            refreshed = self.refresh_stale_bridge_links()
+        except Exception:
+            log.exception("桥接 link 自检失败")
+            return
+        if refreshed:
+            log.info("桥接 link 已刷新为当前构建: %s", ", ".join(refreshed))
 
     @staticmethod
     def _summarize_install_error(output: str) -> str:
@@ -1245,7 +1492,10 @@ class DshMonitor(BaseAgentMonitor):
                 # pnpm add 会更新已有的 link spec；失败时保留原安装并报告。
                 rc, out = _run_pnpm(profile, "add", str(plugin))
                 if rc != 0:
-                    failed.append(f"{profile.name}: pnpm refresh 失败 {(out or '')[-150:]}")
+                    failed.append(
+                        f"{profile.name}: pnpm refresh 失败 {(out or '')[-150:]}"
+                        f"{_dependency_spec_hint(profile, pkg)}"
+                    )
                     continue
                 pkg = _read_manifest(profile)
                 if pkg is None:
@@ -1261,7 +1511,10 @@ class DshMonitor(BaseAgentMonitor):
                 continue
             rc, out = _run_pnpm(profile, "add", str(plugin))
             if rc != 0:
-                failed.append(f"{profile.name}: pnpm add 失败 {(out or '')[-150:]}")
+                failed.append(
+                    f"{profile.name}: pnpm add 失败 {(out or '')[-150:]}"
+                    f"{_dependency_spec_hint(profile, pkg)}"
+                )
                 continue
             pkg = _read_manifest(profile)
             if pkg is None:
@@ -1981,6 +2234,10 @@ class AgentLinkManager(QObject):
             should_run = bool(agent_cfg.get(key, False))
             if should_run and not monitor._running:
                 monitor.start()
+                if isinstance(monitor, DshMonitor):
+                    # 启动自检（后台、每实例一次）：重新打包/换构建目录后，profile 里
+                    # 记的 link 可能已指向旧构建；只在陈旧时刷新，绝不新建安装。
+                    monitor.schedule_link_refresh_check()
             elif not should_run and monitor._running:
                 monitor.stop()
         # 卡住检测：开关 + 阈值/窗口/冷却参数同步（DSH 联动开启才有效）

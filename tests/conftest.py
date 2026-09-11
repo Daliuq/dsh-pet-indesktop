@@ -71,6 +71,25 @@ def _no_modal_message_boxes(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_dsh_profile_write(monkeypatch):
+    """禁止测试触发对**真实** ~/.dsh/profiles 的桥接 link 自检。
+
+    产品在启动路径会自检桥接 link（陈旧则跑 `pnpm add` 刷成当前构建，见
+    DshMonitor.schedule_link_refresh_check）；测试若启用 dsh 联动又没打桩，
+    那个后台线程会读到开发者/CI 机器上的真实 profile 并真的执行 pnpm，
+    改写用户配置——测试绝对不许有这种副作用。这里只拦"起真线程"这一步，
+    自检逻辑本身仍可测（用例自行注入 spawn，或直接调 refresh_stale_bridge_links）。
+    """
+    try:
+        from pet.agent_link import DshMonitor
+    except Exception:
+        return
+    monkeypatch.setattr(
+        DshMonitor, "_spawn_link_check", staticmethod(lambda target: None),
+    )
+
+
+@pytest.fixture(autouse=True)
 def _close_session_writers():
     """会话异步写盘（B8）：每个测试结束后关闭所有后台 writer，
     避免守护线程在 tmp_path 已清理后继续写盘（WinError 145 之类的 teardown 竞态）。"""
