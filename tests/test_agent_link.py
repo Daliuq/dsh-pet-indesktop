@@ -2559,6 +2559,27 @@ class TestApprovalStickyBubble:
         assert item["interactive"] is True
         assert mgr.win.shown_buttons[-1][1] == ["方案 A", "方案 B", "方案 C"]
 
+    def test_hint_upgrade_keeps_call_id(self, tmp_path):
+        """升级重建保留旧 callId：hint 带 callId → 交互版升级 → 兜底 resolved 仍能关闭。
+
+        桥接双通道的真实形状：tool/call 兜底记录带 callId，随后 mux 交互帧只带
+        rpcId（不带 callId）。升级重建若把 call_id 覆盖成 None，mux 断线时兜底
+        发出的 question/resolved(callId) 就再也匹配不上，气泡永久挂住。
+        """
+        mgr = self._make_mgr(tmp_path)
+        mgr._on_question_request("dsh", {"questions": self.QUESTIONS, "callId": "call-keep"})
+        mgr._on_question_request(
+            "dsh", {"questions": self.QUESTIONS, "rpcId": "rpc-keep", "sessionId": "s-1"}
+        )
+        pending = mgr.pending_interactions_for("dsh")
+        assert len(pending) == 1, "同一条问题只应有一条 pending"
+        item = next(iter(pending.values()))
+        assert item["interactive"] is True
+        assert item["rpc_id"] == "rpc-keep"
+        assert item["call_id"] == "call-keep", "升级重建不得丢掉旧 callId"
+        mgr._on_question_resolved("dsh", {"callId": "call-keep"})
+        assert mgr.pending_interactions_for("dsh") == {}, "兜底 callId 关闭必须仍然有效"
+
     def test_interactive_not_downgraded_by_late_hint(self, tmp_path):
         """先到带 rpcId 的交互版，后到无 rpcId 的提示→不降级，仍保持可点选。
 

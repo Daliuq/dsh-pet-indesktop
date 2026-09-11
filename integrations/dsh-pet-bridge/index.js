@@ -1006,6 +1006,42 @@ function resolveQuestion(callId, sessionId) {
   });
 }
 
+// mux question 帧只带 rpcId，callId 只有 tool/call 兜底路径才登记（复合键
+// sessionId|callId）。桌宠端升级重建后靠 callId 与兜底 question/resolved 配对，
+// 帧里缺 callId 时 mux 断线后的兜底关闭就失效，气泡永久挂住——按会话反查补上。
+function pendingCallIdForSession(sessionId) {
+  const prefix = `${String(sessionId || "")}|`;
+  for (const key of pendingQuestionCallIds) {
+    if (key.startsWith(prefix)) return key.slice(prefix.length);
+  }
+  return "";
+}
+
+// 帧自带 callId 时以它为准（DSH 后续版本可能补上）；否则按会话反查。
+function muxQuestionCallId(payload) {
+  return String(payload.callId || "") || pendingCallIdForSession(payload.sessionId);
+}
+
+function muxQuestionRequestedRecord(rpcId, payload) {
+  return {
+    event: "question/requested",
+    rpcId,
+    sessionId: payload.sessionId,
+    questions: payload.questions,
+    callId: muxQuestionCallId(payload),
+  };
+}
+
+function muxQuestionResolvedRecord(rpcId, payload) {
+  return {
+    event: "question/resolved",
+    rpcId,
+    sessionId: payload.sessionId,
+    outcome: payload.outcome,
+    callId: muxQuestionCallId(payload),
+  };
+}
+
 // ===== interactive mux relay =====
 // DSH's /api/events.mux (WebSocket) pushes the SAME interaction frames the web
 // UI renders: approval/requested, approval/resolved, question/requested,
@@ -1095,10 +1131,10 @@ function muxConnect() {
           sessionId: p.sessionId,
         });
       } else if (p.type === "question/requested") {
-        writeRecordDedup({ event: "question/requested", rpcId: msg.rpcId, sessionId: p.sessionId, questions: p.questions });
+        writeRecordDedup(muxQuestionRequestedRecord(msg.rpcId, p));
       } else if (p.type === "question/resolved") {
         const questionRpcId = p.questionRpcId || msg.rpcId;
-        writeRecord({ event: "question/resolved", rpcId: questionRpcId, sessionId: p.sessionId, outcome: p.outcome });
+        writeRecord(muxQuestionResolvedRecord(questionRpcId, p));
         writeInteractionResolved("question", p.sessionId, { rpcId: questionRpcId }, p.outcome || "answered");
         // 用户介入信号
         writeRecord({
@@ -1710,4 +1746,11 @@ export const __hardFailureTest = {
   noteRetry: noteStatsRetry,
   recovery: noteStatsRecovery,
   noteToolResult: noteStatsToolResult,
+};
+export const __questionTest = {
+  questionCallIdentity,
+  pendingQuestionCallIds,
+  pendingCallIdForSession,
+  muxQuestionRequestedRecord,
+  muxQuestionResolvedRecord,
 };

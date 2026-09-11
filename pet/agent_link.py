@@ -3271,11 +3271,18 @@ class AgentLinkManager(QObject):
             for iid, item in self._pending_interactions.items():
                 if (item.get("agent_key") == agent_key and item.get("kind") == kind
                         and not item.get("rpc_id")):
-                    self._pending_interactions[iid] = {
-                        "kind": kind, "text": text,
+                    # 重建保留 item 旧值，仅用新记录的非 None 字段覆盖：
+                    # 桥接双通道下交互版（mux 帧）可能不带 callId，而 callId 是
+                    # mux 断线时兜底 question/resolved 的唯一配对身份——若被
+                    # None 覆盖，升级后的气泡就再也关不掉。
+                    merged = {
+                        **item, "kind": kind, "text": text, "agent_key": agent_key,
                         "alert_id": item.get("alert_id", ""),
-                        "agent_key": agent_key, **extra,
                     }
+                    for key, value in extra.items():
+                        if value is not None:
+                            merged[key] = value
+                    self._pending_interactions[iid] = merged
                     self._saw_alert.add(agent_key)
                     self._show_interaction_bubble(iid)
                     return iid
