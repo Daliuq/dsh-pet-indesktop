@@ -216,6 +216,54 @@ def test_recovery_after_restart(tmp_path, monkeypatch):
     assert tracker.current_state is DshState.THINKING
 
 
+def test_user_message_plugin_source_ignored(tmp_path, monkeypatch):
+    """agent.inject() 注入上下文（sourceKind=plugin）不触发对话开始、不进状态机。
+
+    每轮 DSH 会注入 4-5 条 system-reminder/技能目录等 user/message,必须与真人
+    消息区分,否则「对话开始」被注入文案污染。
+    """
+    tracker, bridge_dir = _make_tracker(tmp_path, monkeypatch, online=True)
+    tracker._poll_online()  # idle
+    messages = []
+    tracker.user_message.connect(lambda sid, text: messages.append((sid, text)))
+
+    _write(bridge_dir, {"event": "user/message", "sourceKind": "plugin",
+                        "text": "<system-reminder> 技能目录……", "sessionId": "s1"})
+    tracker._poll_events()
+
+    assert messages == []
+    assert tracker.current_state is DshState.IDLE
+
+
+def test_user_message_real_emits_signal(tmp_path, monkeypatch):
+    """真人消息（sourceKind=user）触发 user_message(session, text) 并收敛 thinking。"""
+    tracker, bridge_dir = _make_tracker(tmp_path, monkeypatch, online=True)
+    tracker._poll_online()  # idle
+    messages = []
+    tracker.user_message.connect(lambda sid, text: messages.append((sid, text)))
+
+    _write(bridge_dir, {"event": "user/message", "sourceKind": "user",
+                        "text": "看看还有没有这个事件", "sessionId": "s1"})
+    tracker._poll_events()
+
+    assert messages == [("s1", "看看还有没有这个事件")]
+    assert tracker.current_state is DshState.THINKING
+
+
+def test_user_message_legacy_record_keeps_signal(tmp_path, monkeypatch):
+    """旧版桥接记录无 sourceKind：按真人消息兼容处理，绝不静默丢事件。"""
+    tracker, bridge_dir = _make_tracker(tmp_path, monkeypatch, online=True)
+    tracker._poll_online()  # idle
+    messages = []
+    tracker.user_message.connect(lambda sid, text: messages.append((sid, text)))
+
+    _write(bridge_dir, {"event": "user/message", "text": "hi", "sessionId": "s2"})
+    tracker._poll_events()
+
+    assert messages == [("s2", "hi")]
+    assert tracker.current_state is DshState.THINKING
+
+
 def test_unknown_event_ignored(tmp_path, monkeypatch):
     tracker, bridge_dir = _make_tracker(tmp_path, monkeypatch, online=True)
     tracker._poll_online()

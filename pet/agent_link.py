@@ -2644,6 +2644,21 @@ class AgentLinkManager(QObject):
     def _on_agent_activity_event(self, event: AgentEvent) -> None:
         self._on_agent_activity(event.agent, event.tool, event.gen)
 
+    def notify_dsh_state(self, state: str) -> None:
+        """DSH 统一状态收敛注入（dsh_state 跟踪器 → 既有呈现管线）。
+
+        legacy AgentStatus 基线只有 working/idle（bridge 设计，见桥端
+        STATE_EVENT_TYPES 注释），DSH 的 thinking 等状态对 legacy 监视器
+        结构性不可见——思考气泡因此从不触发。dsh_state.py 收敛出这些状态后
+        经本方法喂给与监视器完全相同的主管线（去抖/节流/气泡/动画/完成检测）。
+
+        联动未开启（DSH 监视器未运行）或代次不匹配时 no-op，绝不惊动用户。
+        """
+        mon = self.monitors.get("dsh")
+        if mon is None or not mon._running:
+            return
+        self._on_agent_state("dsh", state, mon._emit_gen)
+
     def _on_agent_state(self, agent_key: str, state: str, gen: int = 0) -> None:
         """接收 Agent 状态变更并调度桌宠动作/气泡（带去抖与节流）。"""
         if not self._gen_current(agent_key, gen):

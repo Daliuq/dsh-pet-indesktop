@@ -3596,3 +3596,76 @@ class TestUnknownBridgeEventReminder:
         mgr.monitors["dsh"].unknown_bridge_event.emit("dsh", {"event": "brand/sparkle"})
         assert len(bubbles) == 2, "冷却窗口过后应再次提醒"
         mgr.shutdown()
+
+
+class TestNotifyDshState:
+    """dsh_state 收敛状态注入（notify_dsh_state）回归。
+
+    legacy AgentStatus 基线只有 working/idle（bridge 设计），thinking 等状态由
+    dsh_state.py 收敛后经此喂给既有呈现管线——DSH 的思考气泡/对话开始反应
+    因此稳定触发（此前该状态对 legacy 监视器结构性不可见）。
+    """
+
+    def _make_mgr(self, tmp_path):
+        app = QApplication.instance() or QApplication([])
+        switched = []
+        bubbles = []
+
+        class DummyWin:
+            cats = {"acts": ["写代码", "原地敲击桌面互动", "吃Token", "轻快记录", "漂浮踏步"]}
+            idles = ["待机呼吸"]
+            _bubble_busy_until = 0.0
+
+            def isVisible(self):
+                return True
+
+            def _switch(self, name):
+                switched.append(name)
+
+            def request_link_anim(self, name):
+                switched.append(name)
+
+            def request_link_idle(self):
+                if self.idles:
+                    switched.append(self.idles[0])
+
+            def show_bubble(self, text, duration_ms=3000):
+                bubbles.append(text)
+
+            def _pick(self, lst):
+                return lst[0]
+
+        win = DummyWin()
+        win.switched = switched
+        cfg = Config(base=tmp_path)
+        data = cfg.data
+        data["agent_link"] = {**data.get("agent_link", {}),
+                              "report_gates": _agent_gates(state=1.0)}
+        cfg.save()
+        clock = [1000.0]
+        mgr = AgentLinkManager(win, cfg, min_interval=2.0, clock=lambda: clock[0])
+        return mgr, win, bubbles, clock
+
+    def test_thinking_drives_bubble_and_anim_when_linked(self, tmp_path):
+        """联动开启（白盒模拟 DSH 监视器运行）时，thinking 必须到达气泡+动画。
+
+        此前 DSH 的 thinking 只存在于 dsh_state 收敛结果里、永远不进 legacy 管线，
+        思考气泡从不触发；notify_dsh_state 必须打通这条链。"""
+        mgr, win, bubbles, clock = self._make_mgr(tmp_path)
+        mgr.monitors["dsh"]._running = True  # white-box：等效 agent_link.dsh 已启用
+        try:
+            mgr.notify_dsh_state("thinking")
+        finally:
+            mgr.shutdown()
+        assert any("思考" in b for b in bubbles), bubbles
+        assert win.switched, "thinking 必须驱动联动动画"
+
+    def test_thinking_noop_when_link_disabled(self, tmp_path):
+        """DSH 联动未开启（监视器未运行）时注入为 no-op，不惊动用户。"""
+        mgr, win, bubbles, clock = self._make_mgr(tmp_path)
+        try:
+            mgr.notify_dsh_state("thinking")
+        finally:
+            mgr.shutdown()
+        assert bubbles == []
+        assert win.switched == []

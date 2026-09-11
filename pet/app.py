@@ -939,6 +939,12 @@ class AppShell:
         self._balance_bridge = None
         self._on_about_to_quit_connected = False
         self._dsh_state_tracker = DshStateTracker(config.dir)
+        # 订阅 DSH 统一状态（d04fc10 曾接线，post-merge 重构时丢失，本分支恢复）：
+        # 收敛出的 thinking → 联动管线补 legacy 没有的思考气泡/对话开始反应；
+        # offline → 收掉已失效的常驻审批/问题气泡。真人消息经 user_message
+        # 信号做与状态边沿竞态解耦的稳定触发。
+        self._dsh_state_tracker.state_changed.connect(self._on_dsh_state_changed)
+        self._dsh_state_tracker.user_message.connect(self._on_dsh_user_message)
         self._balance_timer = QTimer()
         self._balance_timer.timeout.connect(self.show_balance)
         self._update_bridge = None
@@ -1121,6 +1127,42 @@ class AppShell:
                 logging.exception("随桌宠自动拉起 dsh 服务失败")
 
         threading.Thread(target=_run, daemon=True, name="pet-harness-autostart").start()
+
+    # ------------------------------------------------------------ DSH 状态接线
+    def _dsh_link_manager(self):
+        """当前主窗的 Agent 联动管理器（无窗/未创建时为 None）。"""
+        win = self.win
+        if win is None:
+            return None
+        return getattr(win, "agent_link_manager", None)
+
+    def _on_dsh_state_changed(self, from_state: str, to_state: str) -> None:
+        """订阅 DSH 统一状态变化（d04fc10 原设计，post-merge 丢失后恢复）。
+
+        - offline：DSH 断开/重启，审批/问题等阻塞交互必然失效，收掉常驻气泡；
+        - thinking：legacy AgentStatus 基线只有 working/idle（bridge 设计），
+          thinking 由 dsh_state 收敛后经联动管线补思考气泡/动画——对话开始的
+          稳定触发点之一（与真人消息双保险，呈现管线自带同态去重）。
+        """
+        if to_state == "offline":
+            alm = self._dsh_link_manager()
+            if alm is not None and hasattr(alm, "dismiss_all_interactions"):
+                alm.dismiss_all_interactions()
+            return
+        if to_state == "thinking":
+            alm = self._dsh_link_manager()
+            if alm is not None:
+                alm.notify_dsh_state("thinking")
+
+    def _on_dsh_user_message(self, session_id: str, text: str) -> None:
+        """真人消息 = 对话开始：与状态边沿竞态解耦的稳定触发点。
+
+        sourceKind 过滤已在 dsh_state 完成——只有真人输入（含旧版桥接记录
+        无字段的兼容）发本信号；agent.inject() 注入上下文不会到这里。
+        """
+        alm = self._dsh_link_manager()
+        if alm is not None:
+            alm.notify_dsh_state("thinking")
 
     # ------------------------------------------------------------ 退出收口
     def _on_about_to_quit(self) -> None:

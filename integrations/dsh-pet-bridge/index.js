@@ -1374,12 +1374,19 @@ export function apply(ctx) {
       // still the same state event consumed by dsh_state, only enriched with a
       // bounded text field; full conversation history is never forwarded.
       if (type === "user/message") {
+        const data = event.data || {};
+        // DSH 的 UserMessage.source.kind 区分真人输入（kind="user"）与
+        // agent.inject() 注入上下文（kind="plugin"：system-reminder/技能目录/
+        // 记忆等，每轮多条约 1200 字）——转发给桌宠侧，让它只把真人消息当作
+        // 「对话开始」触发，不被注入记录污染（dsh_state / 探索看门狗据此过滤）。
+        const src = (data && data.source && data.source.kind) || "";
         writeRecord({
           event: "user/message",
           agentName,
-          text: messageText(event.data || {}),
+          text: messageText(data),
           step: stepOf(event),
           sessionId,
+          ...(src ? { sourceKind: src } : {}),
         });
       }
 
