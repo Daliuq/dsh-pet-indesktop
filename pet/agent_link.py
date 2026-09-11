@@ -507,6 +507,54 @@ def _manifest_set_bundle(pkg: dict, profile_dir: Path, present: bool) -> bool:
     return True
 
 
+def _uninstall_manifest_without_pnpm(profile_dir: Path, pkg: dict) -> dict | None:
+    """没有 pnpm 时的纯 JSON 卸载：备份 → 删依赖条目 → 清 bundles → 写回。
+
+    无 pnpm 不能直接报成功：manifest 里的 ``link:`` 条目还指着即将被删除的
+    程序目录，dsh 启动解析失败会拖垮整个插件树（2026-09 事故同型）。返回写回
+    后的 manifest；备份或写入失败返回 None（保留原文件，绝不半改）。
+    """
+    manifest = profile_dir / "package.json"
+    backup = profile_dir / f"package.json.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+    try:
+        backup.write_text(manifest.read_text(encoding="utf-8"), encoding="utf-8")
+    except OSError:
+        log.exception("卸载桥接插件前备份失败，保留原 package.json: %s", profile_dir)
+        return None
+    deps = pkg.get("dependencies")
+    if isinstance(deps, dict):
+        deps.pop(DSH_PLUGIN_NAME, None)
+    bundles = ((pkg.get("dsh") or {}).get("profile") or {}).get("bundles")
+    if isinstance(bundles, list) and DSH_PLUGIN_NAME in bundles:
+        bundles.remove(DSH_PLUGIN_NAME)
+    try:
+        manifest.write_text(
+            json.dumps(pkg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+    except OSError:
+        log.exception("卸载桥接插件写入失败: %s", profile_dir)
+        return None
+    return pkg
+
+
+def _remove_linked_plugin_dir(profile_dir: Path) -> None:
+    """清掉 profile/node_modules 下的插件链接；失败只记日志（尽力而为）。
+
+    pnpm 的本地目录依赖在 Windows 上是 junction：``os.rmdir`` 只摘掉重解析点
+    本身，不会递归删掉链接目标里的文件；符号链接走 unlink。真实目录不动。
+    """
+    link = profile_dir / "node_modules" / "@dsh-pet" / "bridge"
+    try:
+        if link.is_symlink():
+            link.unlink()
+        elif link.is_dir():
+            link.rmdir()
+        elif link.exists():
+            link.unlink()
+    except OSError as exc:
+        log.debug("清理桥接插件链接失败(%s): %s", profile_dir, exc)
+
+
 # ---------------------------------------------------------------------------
 # 依赖规格体检（issue：桥接装不上，报错只说 pnpm 失败，看不出是哪条依赖）
 #
@@ -1707,24 +1755,34 @@ class DshMonitor(BaseAgentMonitor):
         """关闭联动时卸载桥接插件。返回是否全部成功（失败记日志）。
 
         幂等：未安装的 profile 直接视为成功；不再依赖 dsh CLI（同 install_bridge）。
+        没有 pnpm 时不能直接报成功：manifest 里的 `link:` 条目还指着即将被删除的
+        程序目录（2026-09 dsh 事故同型），改为纯 JSON 手改卸载——备份 package.json、
+        删依赖条目与 dsh.profile.bundles 登记、尽力删 profile 内的插件链接。
         """
-        if _pnpm_command() is None:
-            return True  # 没有运行环境视为无残留
+        has_pnpm = _pnpm_command() is not None
         ok = True
         for profile in _real_profiles():
             pkg = _read_manifest(profile)
             if pkg is None or not _manifest_has_plugin(pkg):
                 continue  # 未安装视为成功（幂等）
-            rc, out = _run_pnpm(profile, "remove", DSH_PLUGIN_NAME)
-            if rc != 0:
-                ok = False
-                log.warning("卸载 DSH 桥接插件失败(%s): %s", profile.name, (out or "")[-150:])
-                continue
-            pkg = _read_manifest(profile)
-            if pkg is None:
-                ok = False
-                log.warning("卸载 DSH 桥接插件失败(%s): 卸载后 package.json 读取失败", profile.name)
-                continue
+            if has_pnpm:
+                rc, out = _run_pnpm(profile, "remove", DSH_PLUGIN_NAME)
+                if rc != 0:
+                    ok = False
+                    log.warning("卸载 DSH 桥接插件失败(%s): %s", profile.name, (out or "")[-150:])
+                    continue
+                pkg = _read_manifest(profile)
+                if pkg is None:
+                    ok = False
+                    log.warning("卸载 DSH 桥接插件失败(%s): 卸载后 package.json 读取失败", profile.name)
+                    continue
+            else:
+                pkg = _uninstall_manifest_without_pnpm(profile, pkg)
+                if pkg is None:
+                    ok = False
+                    log.warning("卸载 DSH 桥接插件失败(%s): package.json 手改失败", profile.name)
+                    continue
+                _remove_linked_plugin_dir(profile)
             try:
                 _manifest_set_bundle(pkg, profile, False)
             except Exception as exc:

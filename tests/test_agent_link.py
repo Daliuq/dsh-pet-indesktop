@@ -1458,6 +1458,90 @@ class TestInstallErrorSummary:
         assert summary.startswith("Error:")
 
 
+class TestUninstallBridgeWithoutPnpm:
+    """没有 pnpm 时关闭联动不能假成功：manifest 里的 link: 残留会指向被删目录。
+
+    2026-09 dsh 事故同型——profile 的 package.json 还挂着 link:<即将删除的程序
+    目录>，dsh 启动时解析失败拖垮整个插件树。旧实现 _pnpm_command() is None
+    直接 return True，什么都不改。
+    """
+
+    def _profile(self, tmp_path, deps, bundles=None):
+        profile = tmp_path / "profiles" / "web"
+        profile.mkdir(parents=True)
+        data = {"dependencies": dict(deps)}
+        if bundles is not None:
+            data["dsh"] = {"profile": {"bundles": list(bundles)}}
+        (profile / "package.json").write_text(
+            json.dumps(data, ensure_ascii=False), encoding="utf-8"
+        )
+        return profile
+
+    def test_no_pnpm_removes_manifest_entries_with_backup(self, tmp_path, monkeypatch):
+        """无 pnpm：备份 → 删依赖条目 → 清 bundles → 删链接 → 返回 True。"""
+        plugin = tmp_path / "old-build" / "dsh-pet-bridge"
+        plugin.mkdir(parents=True)
+        profile = self._profile(
+            tmp_path,
+            deps={agent_link.DSH_PLUGIN_NAME: f"link:{plugin}", "keep-me": "^1.0.0"},
+            bundles=[agent_link.DSH_PLUGIN_NAME, "other-bundle"],
+        )
+        linked = profile / "node_modules" / "@dsh-pet" / "bridge"
+        linked.mkdir(parents=True)
+        monkeypatch.setattr(agent_link, "DSH_PROFILE_HOME", tmp_path)
+        monkeypatch.setattr(agent_link, "_pnpm_command", lambda: None)
+
+        assert DshMonitor.uninstall_bridge() is True
+
+        manifest = json.loads((profile / "package.json").read_text(encoding="utf-8"))
+        assert agent_link.DSH_PLUGIN_NAME not in manifest["dependencies"], \
+            "link: 残留必须删掉（否则指向即将删除的程序目录）"
+        assert manifest["dependencies"]["keep-me"] == "^1.0.0", "无关依赖不许动"
+        assert agent_link.DSH_PLUGIN_NAME not in manifest["dsh"]["profile"]["bundles"]
+        assert "other-bundle" in manifest["dsh"]["profile"]["bundles"]
+        assert list(profile.glob("package.json.bak-*")), "手改前必须备份"
+        assert not linked.exists(), "profile 内的插件链接应尽力清理"
+
+    def test_no_pnpm_profile_without_plugin_is_noop(self, tmp_path, monkeypatch):
+        """未安装的 profile 幂等成功，且不该产生备份。"""
+        profile = self._profile(tmp_path, deps={"keep-me": "^1.0.0"})
+        monkeypatch.setattr(agent_link, "DSH_PROFILE_HOME", tmp_path)
+        monkeypatch.setattr(agent_link, "_pnpm_command", lambda: None)
+
+        assert DshMonitor.uninstall_bridge() is True
+        assert not list(profile.glob("package.json.bak-*"))
+
+    def test_with_pnpm_still_uses_pnpm_remove(self, tmp_path, monkeypatch):
+        """有 pnpm 时保持现状：走 pnpm remove，再清 bundles，不做 JSON 手改备份。"""
+        plugin = tmp_path / "current-build" / "dsh-pet-bridge"
+        plugin.mkdir(parents=True)
+        profile = self._profile(
+            tmp_path,
+            deps={agent_link.DSH_PLUGIN_NAME: f"link:{plugin}"},
+            bundles=[agent_link.DSH_PLUGIN_NAME],
+        )
+        monkeypatch.setattr(agent_link, "DSH_PROFILE_HOME", tmp_path)
+        monkeypatch.setattr(agent_link, "_pnpm_command", lambda: ["pnpm"])
+        calls = []
+
+        def fake_run(profile_dir, *args):
+            calls.append(args)
+            data = json.loads((profile_dir / "package.json").read_text(encoding="utf-8"))
+            data["dependencies"].pop(agent_link.DSH_PLUGIN_NAME, None)
+            (profile_dir / "package.json").write_text(
+                json.dumps(data, ensure_ascii=False), encoding="utf-8"
+            )
+            return 0, ""
+
+        monkeypatch.setattr(agent_link, "_run_pnpm", fake_run)
+
+        assert DshMonitor.uninstall_bridge() is True
+        assert calls == [("remove", agent_link.DSH_PLUGIN_NAME)]
+        manifest = json.loads((profile / "package.json").read_text(encoding="utf-8"))
+        assert agent_link.DSH_PLUGIN_NAME not in manifest["dsh"]["profile"]["bundles"]
+        assert not list(profile.glob("package.json.bak-*")), "pnpm 路径不做手改备份"
+
+
 # ============================================================================
 # 14. Agent 动作轮换、过程汇报与 window 平滑衔接测试
 # ============================================================================
