@@ -481,3 +481,46 @@ class TestSpecRepair:
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+class TestInstallBridgeScaffoldsMissingProfile:
+    """安装链缺口：全新 dsh（从未运行过）没有 profile，一键安装桥接必失败。
+
+    dsh-app-boot 的 initProfile 会在首次运行时补出 profile；桌宠侧安装桥接
+    前若一个 profile 都没有，应按同一套三件套（manifest + cordis.patch.yml +
+    pnpm-workspace.yaml）补出默认 web profile 再继续，而不是把全新用户挡住。
+    """
+
+    def test_install_creates_default_web_profile_when_none_exists(self, tmp_path, monkeypatch):
+        plugin = tmp_path / "bundled" / "dsh-pet-bridge"
+        plugin.mkdir(parents=True)
+        (tmp_path / "profiles").mkdir()
+        monkeypatch.setattr(agent_link, "DSH_PROFILE_HOME", tmp_path)
+        monkeypatch.setattr(DshMonitor, "bundled_plugin_dir", classmethod(lambda cls: plugin))
+        monkeypatch.setattr(agent_link, "_pnpm_command", lambda: ["pnpm"])
+        calls: list[str] = []
+
+        def fake_run(profile_dir, *args):
+            calls.append(profile_dir.name)
+            data = json.loads((profile_dir / "package.json").read_text(encoding="utf-8"))
+            data.setdefault("dependencies", {})[agent_link.DSH_PLUGIN_NAME] = f"link:{plugin}"
+            (profile_dir / "package.json").write_text(
+                json.dumps(data, ensure_ascii=False), encoding="utf-8"
+            )
+            return 0, ""
+
+        monkeypatch.setattr(agent_link, "_run_pnpm", fake_run)
+
+        ok, message = DshMonitor.install_bridge()
+
+        assert ok is True, message
+        assert calls == ["web"], "应先补出默认 web profile 再在其中安装"
+        web = tmp_path / "profiles" / "web"
+        assert (web / "cordis.patch.yml").is_file(), "initProfile 三件套之一"
+        assert (web / "pnpm-workspace.yaml").is_file(), "initProfile 三件套之二"
+        manifest = json.loads((web / "package.json").read_text(encoding="utf-8"))
+        bundles = manifest["dsh"]["profile"]["bundles"]
+        assert bundles[:2] == [
+            "@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app",
+        ], "web 预设 bundles 应与 dsh-app-boot 的模板一致"
+        assert agent_link.DSH_PLUGIN_NAME in bundles, "安装后 bundles 层应登记桥接插件"

@@ -506,6 +506,48 @@ def _manifest_set_bundle(pkg: dict, profile_dir: Path, present: bool) -> bool:
     return True
 
 
+# dsh-app-boot initProfile 的等价产物（见该包 lib/index.js）：新装 dsh 从未
+# 运行时没有任何 profile，全新用户第一次开联动会被「没有可用的 dsh profile」
+# 挡住——安装桥接前先按同一套三件套补出默认 web profile。
+_WEB_PROFILE_BUNDLES = ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"]
+_PROFILE_PATCH_TEMPLATE = (
+    "# Your patch layer for this dsh profile, applied after every bundle layer:\n"
+    "# a top-level YAML array of loader patch entries (id-targeted config\n"
+    "# overrides, disables, and insert lists; `!!js` expressions allowed).\n"
+    "[]\n"
+)
+_PROFILE_PNPM_WORKSPACE = "packages:\n  - .\n\nnodeLinker: hoisted\n"
+
+
+def _ensure_profile(profile_dir: Path) -> bool:
+    """按 dsh initProfile 三件套补齐 profile（幂等：已有文件一律不动）。
+
+    manifest（web 预设 bundles）+ cordis.patch.yml + pnpm-workspace.yaml。
+    bundles 层与 dependencies 不同：只声明层列表，无需安装即可加 link: 依赖。
+    """
+    try:
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        manifest = profile_dir / "package.json"
+        if not manifest.exists():
+            manifest.write_text(json.dumps({
+                "name": f"dsh-profile-{profile_dir.name}",
+                "private": True,
+                "dependencies": {},
+                "dsh": {"profile": {"bundles": list(_WEB_PROFILE_BUNDLES),
+                                     "patchReload": "live"}},
+            }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        patch = profile_dir / "cordis.patch.yml"
+        if not patch.exists():
+            patch.write_text(_PROFILE_PATCH_TEMPLATE, encoding="utf-8")
+        workspace = profile_dir / "pnpm-workspace.yaml"
+        if not workspace.exists():
+            workspace.write_text(_PROFILE_PNPM_WORKSPACE, encoding="utf-8")
+        return True
+    except OSError:
+        log.exception("补齐 dsh profile 失败: %s", profile_dir)
+        return False
+
+
 def _prune_manifest_backups(profile_dir: Path, keep: int = 5) -> None:
     """package.json.bak-* 只保留最近 N 份（文件名含时间戳，按名排序即按时间）。
 
@@ -1690,7 +1732,14 @@ class DshMonitor(BaseAgentMonitor):
 
         profiles = _real_profiles()
         if not profiles:
-            return False, "没有可用的 dsh profile（~/.dsh/profiles 下无 package.json）"
+            # 全新 dsh（从未运行过）没有 profile：先按 dsh initProfile 三件套
+            # 补出默认 web profile 再安装；补不出才报错，不把新用户挡住。
+            if not _ensure_profile(DSH_PROFILE_HOME / "profiles" / "web"):
+                return False, ("没有可用的 dsh profile（~/.dsh/profiles 下无 package.json），"
+                               "且自动补齐默认 web profile 失败")
+            profiles = _real_profiles()
+            if not profiles:
+                return False, "补齐默认 web profile 后仍未识别到 dsh profile"
 
         failed = []
         succeeded = []
