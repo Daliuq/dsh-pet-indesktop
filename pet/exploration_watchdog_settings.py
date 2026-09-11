@@ -93,7 +93,7 @@ class WatchdogSettingsPage(QWidget):
 
         # ---- 卡住检测（stuck_detector：失败评分式人工介入建议，原仅右键菜单可配）----
         self.stuck_enabled_check = ToggleSwitch(self)
-        self.stuck_enabled_check.setChecked(bool(self._agent_cfg.get("stuck_detect", False)))
+        self.stuck_enabled_check.setChecked(bool(self._agent_cfg.get("stuck_detect", True)))
         self.stuck_worried_spin = BrowserSpinBox(self)
         self.stuck_worried_spin.setRange(1, 20)
         self.stuck_worried_spin.setSuffix(" 分")
@@ -192,7 +192,7 @@ class WatchdogSettingsPage(QWidget):
         self.grace_spin.setValue(int(self._agent_cfg.get("exploration_watchdog_early_grace_minutes", 5)))
         self.long_run_spin.setValue(int(self._agent_cfg.get("exploration_watchdog_long_run_minutes", 10)))
         self.long_think_spin.setValue(int(self._agent_cfg.get("exploration_watchdog_long_think_seconds", 120)))
-        self.stuck_enabled_check.setChecked(bool(self._agent_cfg.get("stuck_detect", False)))
+        self.stuck_enabled_check.setChecked(bool(self._agent_cfg.get("stuck_detect", True)))
         self.stuck_worried_spin.setValue(int(self._agent_cfg.get("stuck_worried_threshold", 3)))
         self.stuck_intervene_spin.setValue(int(self._agent_cfg.get("stuck_intervene_threshold", 5)))
         self.stuck_window_spin.setValue(int(self._agent_cfg.get("stuck_window_seconds", 90)))

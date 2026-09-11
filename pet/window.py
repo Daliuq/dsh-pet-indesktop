@@ -3904,107 +3904,16 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         概率门模型下（见 pet/report_gates.py），菜单只写两端值——开=1.0 全报、
         关=0.0 静音；细粒度概率一律回设置页滑块调。键名即概率门名，写进
         ``agent_link.report_gates``，不再产生旧的 notify_* 平铺键。
+        菜单只按 REPORT_GATE_DEFAULTS 里的门装配，非门名键直接忽略。
         """
+        if key not in REPORT_GATE_DEFAULTS:
+            return
         ag_data = dict(self.cfg.get('agent_link', {}))
-        if key in REPORT_GATE_DEFAULTS:
-            gates = dict(ag_data.get('report_gates') or {})
-            gates[key] = 1.0 if on else 0.0
-            ag_data['report_gates'] = gates
-        else:
-            ag_data[key] = bool(on)
+        gates = dict(ag_data.get('report_gates') or {})
+        gates[key] = 1.0 if on else 0.0
+        ag_data['report_gates'] = gates
         self.cfg.set('agent_link', ag_data)
         self.cfg.save()
-        # 卡住检测/行为模式检测开关是 AgentLinkManager.apply_config 在启动/切换时
-        # 同步的，需要立即触发，否则要等下次设置变更/重启才生效。
-        if key in ('stuck_detect', 'pattern_detect') and hasattr(self, 'agent_link_manager'):
-            self.agent_link_manager.apply_config()
-
-    def _set_dialogue_mode(self, mode: str) -> None:
-        """Switch wording for existing desktop-pet events; legacy remains default."""
-        mode = mode if mode in ("legacy", "whale_maid", "custom") else "legacy"
-        # 重设/切换内置风格时重新从磁盘加载内置 JSON 预设（文件改动即时生效）。
-        from .persona_phrases import reload_builtin_presets
-        reload_builtin_presets()
-        self.cfg.set("dialogue_mode", mode)
-        self.cfg.save()
-        label = {"legacy": "默认模式", "whale_maid": "鲸鱼娘女仆模式", "custom": "自定义台词"}[mode]
-        self.show_bubble(f"台词风格已切换为{label}", duration_ms=3000)
-
-    def _edit_dialogue_phrases(self) -> None:
-        """Edit templates for the existing event messages only."""
-        fields = (
-            ("start", "开始工作"), ("thinking", "思考"),
-            ("activity.read", "读取"), ("activity.search", "搜索"),
-            ("activity.edit", "编辑"), ("activity.run", "运行/测试"),
-            ("activity.default", "其他工具"),
-            ("approval.command", "审批命令"), ("approval.tool", "审批工具"),
-            ("approval.generic", "审批提示"),
-            ("question.empty", "无选项问题"), ("question.one", "用户问题"),
-            ("question.many", "多个问题"),
-            ("watchdog.warning", "循环警告"), ("model_access.one", "模型访问失败"),
-            ("model_access.many", "模型访问失败（连续）"),
-            ("done.success", "任务完成"), ("done.attention", "任务暂停"),
-            ("failure.retry", "重试失败"), ("failure.tool", "工具失败"),
-            ("failure.generic", "执行失败"),
-        )
-        dialog = QDialog(self)
-        dialog.setWindowTitle("自定义现有台词")
-        layout = QFormLayout(dialog)
-        current = self.cfg.get("dialogue_phrases", {})
-        edits = {}
-        for key, label in fields:
-            edit = QLineEdit(str(current.get(key, "") or ""))
-            edit.setPlaceholderText("留空则使用原有台词；可用 {name}、{command}、{reasons} 等变量")
-            layout.addRow(label, edit)
-            edits[key] = edit
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addRow(buttons)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        phrases = {key: edit.text().strip() for key, edit in edits.items() if edit.text().strip()}
-        self.cfg.set("dialogue_phrases", phrases)
-        self.cfg.set("dialogue_mode", "custom")
-        self.cfg.save()
-        self.show_bubble("自定义台词已保存并启用", duration_ms=3000)
-
-    def edit_agent_link_int(self, key: str, label: str, unit: str,
-                            default: int, minimum: int, maximum: int) -> None:
-        """编辑卡住检测整数参数（阈值/窗口/冷却），立即保存并同步到检测器。"""
-        ag_data = dict(self.cfg.get('agent_link', {}))
-        try:
-            current = int(ag_data.get(key, default))
-        except (TypeError, ValueError):
-            current = default
-        value, ok = QInputDialog.getInt(
-            self, '卡住检测设置', f'{label}（{unit}）：',
-            value=current, minValue=minimum, maxValue=maximum,
-        )
-        if not ok:
-            return
-        ag_data[key] = value
-        self.cfg.set('agent_link', ag_data)
-        self.cfg.save()
-        if hasattr(self, 'agent_link_manager'):
-            self.agent_link_manager.apply_config()
-        self.show_bubble(f'{label}：{value} {unit}')
-
-    def edit_agent_link_text(self, key: str, label: str) -> None:
-        """编辑卡住检测自定义文案（留空恢复默认），立即保存并同步。"""
-        ag_data = dict(self.cfg.get('agent_link', {}))
-        current = str(ag_data.get(key, '') or '')
-        text, ok = QInputDialog.getText(
-            self, '卡住检测设置', f'{label}（留空恢复默认）：', text=current,
-        )
-        if not ok:
-            return
-        ag_data[key] = text.strip()
-        self.cfg.set('agent_link', ag_data)
-        self.cfg.save()
-        if hasattr(self, 'agent_link_manager'):
-            self.agent_link_manager.apply_config()
-        self.show_bubble('卡住检测文案已更新' if text.strip() else '卡住检测文案已恢复默认')
 
     def set_agent_link_option(self, key: str, on: bool) -> None:
         """公开转发：联动气泡提醒子项开关（等价 _set_agent_link_option）。"""

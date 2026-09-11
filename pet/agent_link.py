@@ -1467,7 +1467,7 @@ class BaseAgentMonitor(QObject):
                     continue  # 不认识的事件类型：忽略，不误报为 working
                 self._emit_state(normalized, emit_gen)
             except Exception:
-                pass
+                log.debug("桥接记录处理失败，跳过该行", exc_info=True)
 
 # ----------------------------------------------------------------------
 # 各 Agent 具体监视器实现
@@ -1510,25 +1510,6 @@ class DshMonitor(BaseAgentMonitor):
             if (c / "package.json").is_file():
                 return c
         return None
-
-    @staticmethod
-    def _list_profiles() -> list[str]:
-        """枚举已存在的 dsh profile。
-
-        只认含 cordis.yml 的目录（真实 profile 的标志）；profiles 目录下
-        可能混入 node_modules 等包管理器/误操作残留的杂项目录，把它们当实例
-        安装会失败并触发整体回滚，必须过滤。目录不存在或无有效 profile 时
-        回退 ["web"]（安装命令会自动创建该 profile）。
-        统一使用 DSH_PROFILE_HOME（尊重 DSH_HOME），与 _real_profiles 一致。
-        """
-        profiles_dir = DSH_PROFILE_HOME / "profiles"
-        if not profiles_dir.is_dir():
-            return ["web"]
-        profiles = sorted(
-            p.name for p in profiles_dir.iterdir()
-            if p.is_dir() and (p / "cordis.yml").is_file()
-        )
-        return profiles or ["web"]
 
     @classmethod
     def bridge_link_stale(cls) -> list[tuple[str, str]]:
@@ -2233,12 +2214,12 @@ class AgentLinkManager(QObject):
     """多 Agent 联动总调度管理器。
 
     批6-5 拆分后本类只保留装配与编排：
-    - 装配：4 内置 + 配置驱动的自定义监视器、AgentLinkReducer（纯状态机）、
-      AgentLinkPresentation（气泡/音效/动画调度），并完成信号接线；
+    - 装配：4 内置 + 配置驱动的自定义监视器、StuckDetector / BehaviorPatternDetector /
+      ExplorationWatchdog，并完成信号接线；
     - 监视器生命周期：pause / resume / shutdown / apply_config；
     - set_enabled 安装/卸载编排（授权弹窗、后台安装、hooks 注入/移除）；
-    - 对既有调用面（PetWindow / AppShell / ProactiveScreenWatcher / 测试）的
-      薄转发。状态机与呈现逻辑分别位于 agent_link_reducer / agent_link_presentation。
+    - 对既有调用面（PetWindow / AppShell / ProactiveScreenWatcher / 测试）的薄转发。
+    去抖/节流/完成确认与气泡/音效/动画调度都在本类内实现。
     挂载于 PetWindow，持有 4 个 Agent 的监视器，并根据状态驱动桌宠动作与气泡。
     """
 
@@ -2380,7 +2361,6 @@ class AgentLinkManager(QObject):
         self._session_meta_cache: dict[str, dict] = {}
         self._exploration_alerts: dict[str, str] = {}
         self._exploration_names: dict[str, str] = {}
-        self._exploration_lifecycle_epoch: dict[str, int] = {}
 
         for mon in self.monitors.values():
             mon.raw_record.connect(self._remember_dialogue_record)
@@ -2478,10 +2458,10 @@ class AgentLinkManager(QObject):
             elif not should_run and monitor._running:
                 monitor.stop()
         # 卡住检测：开关 + 阈值/窗口/冷却参数同步（DSH 联动开启才有效）
-        self._stuck_detector.set_enabled(bool(agent_cfg.get("stuck_detect", False)))
+        self._stuck_detector.set_enabled(bool(agent_cfg.get("stuck_detect", True)))
         self._stuck_detector.get_config_overrides(agent_cfg if isinstance(agent_cfg, dict) else {})
         # 行为模式检测：开关 + 双窗口/step/冷却参数同步
-        self._behavior_detector.set_enabled(bool(agent_cfg.get("pattern_detect", False)))
+        self._behavior_detector.set_enabled(bool(agent_cfg.get("pattern_detect", True)))
         self._behavior_detector.get_config_overrides(agent_cfg if isinstance(agent_cfg, dict) else {})
         self._exploration_watchdog.configure(agent_cfg if isinstance(agent_cfg, dict) else {})
 
@@ -3939,7 +3919,7 @@ class AgentLinkManager(QObject):
 
     def _on_pattern_control(self, agent_key: str, payload: dict) -> None:
         """行为模式控制（🛑）：播焦急动画 + 弹气泡。
-        payload 中的 verdict 来自可选 Judge，默认 REPLAN（只提醒，不打断 Agent）。"""
+        payload 的 verdict 恒为 REPLAN（可选 Judge 机制已移除），只提醒、不打断 Agent。"""
         if not hasattr(self.win, "isVisible") or not self.win.isVisible():
             return
         payload = payload if isinstance(payload, dict) else {}
@@ -4239,7 +4219,6 @@ class AgentLinkManager(QObject):
             if event == "AgentStatus" and session == agent_key:
                 sessions.update(self._exploration_alerts)
             for key in sessions:
-                self._exploration_lifecycle_epoch[key] = self._exploration_lifecycle_epoch.get(key, 0) + 1
                 self._dismiss_exploration(key)
 
     # 阻塞交互兜底清理（approval / question / cordis 共用）。

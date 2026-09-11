@@ -28,9 +28,9 @@
 - **cooldown 门控**：触发后记录 ``inspected_seq``，下一次窗口只统计
   ``inspected_seq`` 之后的事件，且**至少新增 N 个 Agent step**（默认 3）才允许
   再次触发——避免同一批历史事件反复弹提醒。
-- **Control 不等于杀掉 Agent**：命中 Control 后调用可选的小型 LLM Judge
-  （``NORMAL / REPLAN / ASK_USER / STOP``），Judge 不可用/未配置时降级为
-  ``REPLAN``（只提醒，不打断 Agent）。本模块只负责「这个行为模式值得检查」。
+- **Control 不等于杀掉 Agent**：命中 Control 后只上报 ``REPLAN``（建议重新
+  规划，只提醒、不打断 Agent）。原先预留的小型 LLM Judge 从未接线，已随本次
+  清理删除；本模块只负责「这个行为模式值得检查」。
 
 事件来源：桥接插件 ``integrations/dsh-pet-bridge`` 写盘的 ``tool/call`` /
 ``command/run`` 等记录（每条约 80ms 合批一次），带 ``step`` 字段。
@@ -279,55 +279,6 @@ class PatternReason(str, Enum):
 
 
 # ---------------------------------------------------------------------------
-# Judge（可选小型 LLM）
-# ---------------------------------------------------------------------------
-
-
-class JudgeVerdict(str, Enum):
-    """Judge 判定结果。"""
-
-    NORMAL = "NORMAL"        # 正常，无需干预
-    REPLAN = "REPLAN"        # 建议重新规划（默认降级值）
-    ASK_USER = "ASK_USER"    # 需要询问用户
-    STOP = "STOP"            # 建议停止当前行为
-
-
-_JUDGE_KEYWORDS: tuple[tuple[tuple[str, ...], JudgeVerdict], ...] = (
-    (("STOP", "INTERRUPT", "HALT", "ABORT", "停止"), JudgeVerdict.STOP),
-    (("ASK_USER", "ASK THE USER", "ASK HUMAN", "CONSULT", "询问"), JudgeVerdict.ASK_USER),
-    (("REPLAN", "RE-PLAN", "CHANGE PLAN", "NEW PLAN", "重新规划", "换方案"), JudgeVerdict.REPLAN),
-    (("NORMAL", "OK", "FINE", "NO ACTION", "CONTINUE", "正常"), JudgeVerdict.NORMAL),
-)
-
-_DEFAULT_VERDICT = JudgeVerdict.REPLAN  # Judge 不可用/无输出时降级
-
-
-def parse_verdict(text: str) -> JudgeVerdict:
-    """从 LLM 输出解析 Judge 判定；找不到关键词时降级 REPLAN。"""
-    t = str(text or "").strip().upper()
-    if not t:
-        return _DEFAULT_VERDICT
-    for keywords, verdict in _JUDGE_KEYWORDS:
-        for kw in keywords:
-            if kw in t:
-                return verdict
-    return _DEFAULT_VERDICT
-
-
-def build_judge_prompt(behavior_summary: str, tool_sequence: str, context: str = "") -> str:
-    """构造 Judge 输入。行为摘要由 detector 提供，LLM 只需判断模式是否异常。"""
-    return (
-        "你是一个 Agent 行为模式审查员。桌宠检测到如下行为序列，请判断 Agent 是否"
-        "陷入低效循环（在探索/重复而无实质产出）。\n"
-        "只输出一个词：NORMAL（正常）/ REPLAN（建议重新规划）/ "
-        "ASK_USER（需询问用户）/ STOP（建议停止）。\n\n"
-        f"近期工具调用序列（按时间）：\n{tool_sequence}\n\n"
-        f"行为统计摘要：\n{behavior_summary}\n"
-        + (f"\n附加上下文：{context}\n" if context else "")
-    )
-
-
-# ---------------------------------------------------------------------------
 # 行为模式检测器
 # ---------------------------------------------------------------------------
 
@@ -369,8 +320,6 @@ class BehaviorPatternDetector(QObject):
     # 行为模式预警 / 控制：（agent_key, payload）
     pattern_warning = Signal(str, object)
     pattern_control = Signal(str, object)
-    # 模式解除（Agent 空闲 / 任务完成）：
-    pattern_resolved = Signal(str)
 
     def __init__(
         self,
@@ -386,7 +335,6 @@ class BehaviorPatternDetector(QObject):
         macro_w10_action: int = DEFAULT_MACRO_W10_ACTION,
         min_steps_between: int = DEFAULT_MIN_STEPS_BETWEEN,
         cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
-        judge=None,
     ) -> None:
         super().__init__(parent)
         self._clock = clock or time.monotonic
@@ -399,9 +347,6 @@ class BehaviorPatternDetector(QObject):
         self._macro_w10_action = int(macro_w10_action)
         self._min_steps_between = int(min_steps_between)
         self._cooldown_seconds = float(cooldown_seconds)
-        # judge：可调用对象 judge(behavior_summary, tool_sequence) -> JudgeVerdict；
-        # 缺省 None → Control 命中时 payload 携带默认 REPLAN 提示，不做 LLM 调用。
-        self._judge = judge
 
         # 每个 Agent 的状态
         self._states: dict[str, dict] = {}
@@ -430,8 +375,7 @@ class BehaviorPatternDetector(QObject):
 
     def reset(self, agent_key: str) -> None:
         """重置指定 Agent 的模式状态（空闲/离线/任务完成）。"""
-        if self._states.pop(agent_key, None) is not None:
-            self.pattern_resolved.emit(agent_key)
+        self._states.pop(agent_key, None)
 
     def reset_all(self) -> None:
         for key in list(self._states):
@@ -450,10 +394,6 @@ class BehaviorPatternDetector(QObject):
         self._macro_w10_action = int(config.get("pattern_macro_w10_action", DEFAULT_MACRO_W10_ACTION))
         self._min_steps_between = int(config.get("pattern_min_steps_between", DEFAULT_MIN_STEPS_BETWEEN))
         self._cooldown_seconds = float(config.get("pattern_cooldown_seconds", DEFAULT_COOLDOWN_SECONDS))
-
-    def set_judge(self, judge) -> None:
-        """注入 Judge 可调用对象（运行时切换，通常由 AgentLinkManager 配置）。"""
-        self._judge = judge
 
     # ------------------------------------------------------------ 事件消费
 
@@ -494,7 +434,6 @@ class BehaviorPatternDetector(QObject):
             "last_trigger_seq": None,
             "last_trigger_at": 0.0,
             "last_trigger_level": None,  # 上次触发的档位（warning / control）
-            "last_level": None,
         })
 
         # step 去重：同一 step 并行事件合并成一次行为决策
@@ -600,11 +539,6 @@ class BehaviorPatternDetector(QObject):
         if not is_upgrade and state["last_trigger_at"] and (now - state["last_trigger_at"]) < self._cooldown_seconds:
             return
 
-        # 同档位去抖：上次同档且内容一致则不重复发射（但 cooldown 已挡大部分）
-        prev = state["last_trigger_level"]
-        if prev == level and (state["last_trigger_at"] and (now - state["last_trigger_at"]) < self._cooldown_seconds):
-            return
-
         # 升级使用完整窗口（含 warning 之前的有效事件）；
         # 同档位只统计上次触发之后的新事件。
         if is_upgrade:
@@ -617,7 +551,6 @@ class BehaviorPatternDetector(QObject):
         state["last_trigger_seq"] = current_seq
         state["last_trigger_at"] = now
         state["last_trigger_level"] = level
-        state["last_level"] = level
 
         # 构建 payload
         summary_lines = [
@@ -634,15 +567,8 @@ class BehaviorPatternDetector(QObject):
             cls.value for d in decisions[-12:] for cls in sorted(d.classes, key=lambda c: c.value)
         ) or ""
 
-        # Judge：Control 才调用（Warning 只提醒）
-        verdict = None
-        if level is PatternLevel.CONTROL and self._judge is not None:
-            try:
-                verdict = self._judge("\n".join(summary_lines), tool_seq)
-            except Exception:
-                log.exception("行为模式 Judge 调用失败，降级 REPLAN")
-                verdict = _DEFAULT_VERDICT
-
+        # Control 档位固定上报 REPLAN：本模块只负责「值得检查」，不替 Agent
+        # 做决定，也不打断其执行（原先预留的 LLM Judge 从未接线，已删除）。
         payload = {
             "type": "pet/behavior-pattern",
             "level": level.value,
@@ -653,7 +579,7 @@ class BehaviorPatternDetector(QObject):
             "summary": "\n".join(summary_lines),
             "tool_sequence": tool_seq,
             "steps": len(w10),
-            "verdict": verdict.value if verdict else (_DEFAULT_VERDICT.value if level is PatternLevel.CONTROL else ""),
+            "verdict": "REPLAN" if level is PatternLevel.CONTROL else "",
         }
 
         log.info(

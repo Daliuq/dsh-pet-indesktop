@@ -930,30 +930,7 @@ class TestModernSettingsProactivePage:
 # 12. DSH profile 枚举（桥接插件安装/卸载目标）
 # ============================================================================
 class TestDshProfileEnumeration:
-    """_list_profiles 只认含 cordis.yml 的目录，过滤 node_modules 等杂项残留。"""
-
-    def test_filters_non_profile_dirs(self, tmp_path, monkeypatch):
-        dsh_home = tmp_path / "dsh-home"
-        monkeypatch.setattr(agent_link, "DSH_PROFILE_HOME", dsh_home)
-        profiles = dsh_home / "profiles"
-        for name in ("web", "headless"):
-            d = profiles / name
-            d.mkdir(parents=True)
-            (d / "cordis.yml").write_text("{}", encoding="utf-8")
-        # 包管理器/误操作残留的杂项目录，不应被当作 profile
-        (profiles / "node_modules").mkdir()
-        (profiles / "empty-dir").mkdir()
-        assert DshMonitor._list_profiles() == ["headless", "web"]
-
-    def test_fallback_when_profiles_dir_missing(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(agent_link, "DSH_PROFILE_HOME", tmp_path / "dsh-home")
-        assert DshMonitor._list_profiles() == ["web"]
-
-    def test_fallback_when_no_valid_profiles(self, tmp_path, monkeypatch):
-        dsh_home = tmp_path / "dsh-home"
-        monkeypatch.setattr(agent_link, "DSH_PROFILE_HOME", dsh_home)
-        (dsh_home / "profiles" / "node_modules").mkdir(parents=True)
-        assert DshMonitor._list_profiles() == ["web"]
+    """_real_profiles 只认含 package.json 的目录，过滤 node_modules 等杂项残留。"""
 
     def test_real_profiles_filters_node_modules_and_empty_dirs(self, tmp_path, monkeypatch):
         # issue #23：~/.dsh/profiles 下可能有 pnpm 产生的 node_modules 等杂项目录，

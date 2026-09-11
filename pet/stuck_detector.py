@@ -96,7 +96,6 @@ def _is_goal_candidate(e) -> bool:
 class StuckSeverity(int, Enum):
     WORRIED = 1          # 担忧——只播动画，不弹气泡
     RECOMMEND = 2        # 建议介入——动画 + 持续提醒气泡
-    MUST_INTERVENE = 3   # 必须介入（由 approval/question 阻塞，本模块不产生）
 
 
 # ---------------------------------------------------------------------------
@@ -201,12 +200,8 @@ class StuckDetector(QObject):
 
         detector = StuckDetector()
         detector.feed_record("dsh", {"event": "tool/result", "tool": "pip", ...})
-        detector.score_changed.connect(handler)
         detector.intervention_recommended.connect(handler)
     """
-
-    # 卡住评分变化：（agent_key, score, reason_list, is_peak）
-    score_changed = Signal(str, int, list, bool)
 
     # 建议介入：（agent_key, payload）
     # payload = {"type": "pet/intervention-recommended", "reason": str, "severity": int}
@@ -432,13 +427,9 @@ class StuckDetector(QObject):
                         score += SCORE_NO_PROGRESS_SAME_CAUSE
                         reasons.append(StuckReason.NO_PROGRESS_SAME_CAUSE)
 
-        # ---- 步骤 3：比较旧分数，发射变化 ----
+        # ---- 步骤 3：记录新分数（不再对外发中间态信号，只在阈值档位发通知）----
         old_score = self._scores.get(agent_key, 0)
         self._scores[agent_key] = score
-
-        if score != old_score:
-            is_peak = score > old_score
-            self.score_changed.emit(agent_key, score, reasons, is_peak)
 
         # ---- 步骤 4：阈值判断 ----
         # 检查是否达到干预推荐阈值

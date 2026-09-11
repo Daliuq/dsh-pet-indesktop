@@ -10,7 +10,7 @@
   W10 EXPLORATION >= 7 且 ACTION <= 1 → warning；
 - step 去重：同一步并行事件只算一次行为决策；
 - cooldown 门控：触发后至少新增 N 个 step 才允许再次触发；
-- Judge：Control 命中时调用 judge，缺省降级 REPLAN；
+- Control 档位固定上报 REPLAN（可选 Judge 机制已移除）；
 - idle / turn-end 重置；set_enabled 开关。
 
 注意：macro W6「全探索无行动」规则优先级高于细分类 W10 warning，且最后一个
@@ -28,14 +28,11 @@ from pet.behavior_detector import (
     BehaviorClass,
     BehaviorMacro,
     BehaviorPatternDetector,
-    JudgeVerdict,
     PatternLevel,
     PatternReason,
-    build_judge_prompt,
     classify_tool,
     macro_of,
     normalize_tool,
-    parse_verdict,
 )
 
 pytest.importorskip("PySide6.QtWidgets")
@@ -74,10 +71,8 @@ class _Collector:
     def __init__(self, det: BehaviorPatternDetector) -> None:
         self.warnings: list[dict] = []
         self.controls: list[dict] = []
-        self.resolved: list[str] = []
         det.pattern_warning.connect(lambda k, p: self.warnings.append(p))
         det.pattern_control.connect(lambda k, p: self.controls.append(p))
-        det.pattern_resolved.connect(lambda k: self.resolved.append(k))
 
 
 class TestClassifyTool:
@@ -293,61 +288,16 @@ class TestCooldownGate:
         assert len(col.controls) >= 2
 
 
-class TestJudge:
-    def test_parse_verdict_keywords(self):
-        assert parse_verdict("STOP") is JudgeVerdict.STOP
-        assert parse_verdict("REPLAN") is JudgeVerdict.REPLAN
-        assert parse_verdict("ASK_USER") is JudgeVerdict.ASK_USER
-        assert parse_verdict("NORMAL") is JudgeVerdict.NORMAL
-        assert parse_verdict("重新规划任务") is JudgeVerdict.REPLAN
-        assert parse_verdict("") is JudgeVerdict.REPLAN  # 缺省降级
-
-    def test_prompt_contains_sequence_and_summary(self):
-        prompt = build_judge_prompt("SEARCH=3", "SEARCH > READ > SEARCH")
-        assert "SEARCH=3" in prompt
-        assert "SEARCH > READ > SEARCH" in prompt
-
-    def test_control_invokes_judge(self):
-        calls = []
-
-        def fake_judge(summary, tool_seq):
-            calls.append((summary, tool_seq))
-            return JudgeVerdict.STOP
-
-        det, _ = _make_detector(judge=fake_judge)
-        col = _Collector(det)
-        for tool, s in [("web_search", 1), ("Read", 2), ("web_search", 3),
-                        ("pwd", 4), ("web_search", 5), ("Grep", 6)]:
-            det.feed_record("dsh", _call(tool, s))
-        assert col.controls
-        assert calls, "Control 命中应调用 Judge"
-        assert col.controls[0]["verdict"] == JudgeVerdict.STOP.value
-
-    def test_control_without_judge_defaults_replan(self):
+class TestControlVerdict:
+    def test_control_always_reports_replan(self):
+        """Judge 机制已移除：Control 档位固定上报 REPLAN（只提醒，不打断 Agent）。"""
         det, _ = _make_detector()
         col = _Collector(det)
         for tool, s in [("web_search", 1), ("Read", 2), ("web_search", 3),
                         ("pwd", 4), ("web_search", 5), ("Grep", 6)]:
             det.feed_record("dsh", _call(tool, s))
         assert col.controls
-        assert col.controls[0]["verdict"] == JudgeVerdict.REPLAN.value
-
-    def test_warning_does_not_invoke_judge(self):
-        calls = []
-
-        def fake_judge(summary, tool_seq):
-            calls.append(1)
-            return JudgeVerdict.NORMAL
-
-        det, _ = _make_detector(judge=fake_judge)
-        col = _Collector(det)
-        steps = [("web_search", 1), ("Bash", 2), ("Read", 3), ("think", 4),
-                 ("web_search", 5), ("Bash", 6), ("Grep", 7), ("web_search", 8),
-                 ("Bash", 9), ("cat", 10)]
-        for tool, s in steps:
-            det.feed_record("dsh", _call(tool, s))
-        assert col.warnings, "W10 Search=3 应触发 warning"
-        assert not calls, "Warning 档位不调用 Judge"
+        assert col.controls[0]["verdict"] == "REPLAN"
 
 
 class TestLifecycle:
@@ -357,7 +307,7 @@ class TestLifecycle:
         for tool, s in [("web_search", 1), ("Read", 2), ("web_search", 3)]:
             det.feed_record("dsh", _call(tool, s))
         det.feed_record("dsh", {"event": "AgentStatus", "state": "idle"})
-        assert col.resolved == ["dsh"]
+        assert _state_probe(det, "dsh") is None
         # 重置后立即创建新 collector（在重置后触发的任何 control 之前）
         col2 = _Collector(det)
         # 重置后重新累计，不沿用旧窗口：
@@ -374,11 +324,10 @@ class TestLifecycle:
 
     def test_reset_on_turn_end(self):
         det, _ = _make_detector()
-        col = _Collector(det)
         for tool, s in [("web_search", 1), ("Read", 2), ("web_search", 3)]:
             det.feed_record("dsh", _call(tool, s))
         det.feed_record("dsh", {"event": "turn/end"})
-        assert col.resolved == ["dsh"]
+        assert _state_probe(det, "dsh") is None
 
     def test_set_enabled_gates_processing(self):
         det, _ = _make_detector()

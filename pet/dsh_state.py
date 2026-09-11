@@ -168,7 +168,6 @@ class DshStateTracker(QObject):
 
         # 统一状态（edge-trigger）。初始 None，使首个状态（offline/idle）也真正落日志
         self.current_state: Optional[DshState] = None
-        self.last_state: Optional[DshState] = None
 
         # 阻塞型交互锁存（审批 / 用户问题同待遇）：
         # 进入 waiting_approval / waiting_question 后忽略 working/thinking，
@@ -234,7 +233,6 @@ class DshStateTracker(QObject):
         if to_state is self.current_state:
             return
         from_state = self.current_state  # 切换前状态（即上一步的当前态）
-        self.last_state = from_state     # 记录上一状态
         self.current_state = to_state
 
         if from_state is None:

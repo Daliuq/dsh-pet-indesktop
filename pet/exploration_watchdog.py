@@ -13,7 +13,6 @@ import logging
 import re
 import threading
 import time
-import uuid
 from collections import Counter, OrderedDict
 from enum import Enum
 
@@ -34,15 +33,6 @@ class WatchdogClass(str, Enum):
     RUN = "RUN"
     TEST = "TEST"
     OTHER = "OTHER"
-
-
-class WatchdogMacro(str, Enum):
-    EXPLORATION = "EXPLORATION"
-    ACTION = "ACTION"
-    OTHER = "OTHER"
-
-
-
 
 
 _EXPLORATION = frozenset({
@@ -168,14 +158,6 @@ def classify_event(record: dict) -> WatchdogClass:
     return WatchdogClass.OTHER
 
 
-def macro_of(cls: WatchdogClass) -> WatchdogMacro:
-    if cls in _EXPLORATION:
-        return WatchdogMacro.EXPLORATION
-    if cls in _ACTION:
-        return WatchdogMacro.ACTION
-    return WatchdogMacro.OTHER
-
-
 def make_fingerprint(record: dict, cls: WatchdogClass, target: str) -> str:
     tool = _text(record.get("tool") or record.get("toolName") or record.get("name")).lower()
     args_key = _text(record.get("argsKey") or record.get("fingerprint") or _args_obj(record), 180)
@@ -233,7 +215,6 @@ class _Step:
 
 class ExplorationWatchdog(QObject):
     warning = Signal(str, object)
-    resolved = Signal(str)
 
     def __init__(self, parent=None, *, goal_provider=None, cooldown_steps=3):
         super().__init__(parent)
@@ -280,7 +261,6 @@ class ExplorationWatchdog(QObject):
     def reset(self, session_key: str):
         with self._lock:
             self._states.pop(session_key, None)
-        self.resolved.emit(session_key)
 
     def feed_record(self, agent_key: str, record: dict):
         if not self.enabled or not isinstance(record, dict):
@@ -315,7 +295,7 @@ class ExplorationWatchdog(QObject):
             now = time.monotonic()
             with self._lock:
                 state = self._states.setdefault(session, {"steps": OrderedDict(), "current": None,
-                    "last_inspected_seq": 0, "seq": 0, "last_level": "", "goal": "",
+                    "last_inspected_seq": 0, "seq": 0, "goal": "",
                     "started_at": now, "grace_until": now + self.early_grace_seconds,
                     "agent_name": _text(record.get("agentName") or record.get("agent") or agent_key),
                     "agent_key": agent_key})
@@ -331,7 +311,7 @@ class ExplorationWatchdog(QObject):
         with self._lock:
             now = time.monotonic()
             state = self._states.setdefault(session, {"steps": OrderedDict(), "current": None,
-                "last_inspected_seq": 0, "seq": 0, "last_level": "", "goal": "",
+                "last_inspected_seq": 0, "seq": 0, "goal": "",
                 "started_at": now, "grace_until": now + self.early_grace_seconds,
                 "agent_name": _text(record.get("agentName") or record.get("agent") or agent_key),
                 "agent_key": agent_key})
@@ -585,7 +565,6 @@ class ExplorationWatchdog(QObject):
         level = "control" if score >= control_threshold else "warning"
         state["last_inspected_seq"] = current_seq
         payload = {"type": "pet/exploration-watchdog", "level": level, "risk": score,
-                   "generation_id": uuid.uuid4().hex,
                    "reasons": reasons, "steps": [s.payload() for s in w10],
                    "riskScore": score,
                    "targetCount": len({t for s in w10 for t in s.exploration_targets}),
