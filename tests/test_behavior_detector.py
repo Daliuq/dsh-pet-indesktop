@@ -326,6 +326,7 @@ class TestLifecycle:
         det, _ = _make_detector()
         for tool, s in [("web_search", 1), ("Read", 2), ("web_search", 3)]:
             det.feed_record("dsh", _call(tool, s))
+        assert _state_probe(det, "dsh") is not None, "前置：turn/end 前必须已建立状态"
         det.feed_record("dsh", {"event": "turn/end"})
         assert _state_probe(det, "dsh") is None
 

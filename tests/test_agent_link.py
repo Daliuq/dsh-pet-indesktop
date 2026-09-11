@@ -2677,6 +2677,16 @@ class TestApprovalStickyBubble:
         mgr._on_question_resolved("dsh", {"callId": "call-keep"})
         assert mgr.pending_interactions_for("dsh") == {}, "兜底 callId 关闭必须仍然有效"
 
+    def test_upgrade_empty_string_does_not_clear_call_id(self, tmp_path):
+        """升级帧显式带空串 callId（桥接 String(...) || \"\" 兜底形状）不得清掉旧身份。"""
+        mgr = self._make_mgr(tmp_path)
+        mgr._on_question_request("dsh", {"questions": self.QUESTIONS, "callId": "call-keep"})
+        mgr._on_question_request(
+            "dsh", {"questions": self.QUESTIONS, "rpcId": "rpc-keep", "sessionId": "s-1", "callId": ""}
+        )
+        item = next(iter(mgr.pending_interactions_for("dsh").values()))
+        assert item["call_id"] == "call-keep", "空串 callId 不得覆盖旧身份"
+
     def test_interactive_not_downgraded_by_late_hint(self, tmp_path):
         """先到带 rpcId 的交互版，后到无 rpcId 的提示→不降级，仍保持可点选。
 

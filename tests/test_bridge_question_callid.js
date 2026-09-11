@@ -6,6 +6,7 @@
 // 兜底发出的 question/resolved(callId) 就匹配不到，气泡永远关不掉。
 // 测试直接驱动与生产 mux 分支相同的构造函数，不启动 DSH 宿主与 WebSocket。
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -61,4 +62,13 @@ test("帧自带 callId 时原样保留", () => {
     questions: [],
   });
   assert.equal(rec.callId, "call-frame");
+});
+
+test("mux 分支确实走构造函数（防还原成内联写盘后本文件仍绿）", () => {
+  const src = fs.readFileSync(path.join(bridgeDir, "index.js"), "utf8");
+  const muxBranch = src.split("// ===== interactive mux relay =====")[1] || "";
+  assert.ok(
+    muxBranch.includes("muxQuestionRequestedRecord(") && muxBranch.includes("muxQuestionResolvedRecord("),
+    "mux relay 段必须调用 callId 构造函数；改回内联 writeRecord 会让 F2b 修复静默失效",
+  );
 });

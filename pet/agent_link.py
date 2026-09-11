@@ -3341,7 +3341,10 @@ class AgentLinkManager(QObject):
                         "alert_id": item.get("alert_id", ""),
                     }
                     for key, value in extra.items():
-                        if value is not None:
+                        # None 与空串都不覆盖旧身份：桥接可能写出 callId=""
+                        #（String(...) || "" 兜底），覆盖掉旧 callId 会让
+                        # mux 断线时的兜底关闭失配。
+                        if value is not None and value != "":
                             merged[key] = value
                     self._pending_interactions[iid] = merged
                     self._saw_alert.add(agent_key)
