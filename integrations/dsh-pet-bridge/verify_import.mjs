@@ -1,42 +1,81 @@
-// 桥接插件 import 冒烟：模拟 Cordis loader 的 ESM 解析路径。
-// 本文件位于 integrations\dsh-pet-bridge 内，ESM bare specifier 会从本目录
-// 向上解析 node_modules，与 Cordis loader 在 profile 中 import 插件时的行为一致。
-// 依次 import 插件及其全部直接/传递运行时依赖；任何一个缺包都会抛出
-// ERR_MODULE_NOT_FOUND 并让调用方（构建脚本）失败。
-import { dirname, resolve } from "node:path";
+// 桥接插件零依赖冒烟（hermetic）：把插件拷进一个干净的临时目录——那里
+// 保证没有任何 node_modules——再从临时副本 import。等价于 Cordis loader 在
+// profile 中加载 link: 链接的真实场景：任何外部 bare import 都会在此暴露，
+// 而不是在用户机器上炸掉整个 DSH 插件树（2026-09 事故：打包副本缺
+// @deepseek-ai/dsh-llm，dsh web/headless/desktop 全 profile 无法启动）。
+// 若在本插件源码目录内直接 import，ESM 向上解析会蹭到本机碰巧装着的
+// node_modules，缺依赖被静默掩盖——所以必须拷贝到隔离目录再验。
+import assert from "node:assert/strict";
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-const here = dirname(fileURLToPath(import.meta.url));
+const here = path.dirname(fileURLToPath(import.meta.url));
 
-const required = [
-  // 插件入口（会经 dsh-llm 的 createUserMessage 链）
-  pathToFileURL(resolve(here, "index.js")).href,
-  // Cordis 直接依赖 cosmokit / @standard-schema/spec
-  "@deepseek-ai/cordis",
-  "@deepseek-ai/cosmokit",
-  "@standard-schema/spec",
-  // dsh-invariants / dsh-llm 运行时依赖 schemastery，schemastery 又依赖 cosmokit
-  "@deepseek-ai/schemastery",
-  "@deepseek-ai/dsh-llm",
-  "@deepseek-ai/dsh-attachment",
-  "@deepseek-ai/dsh-brand",
-  "@deepseek-ai/dsh-invariants",
-  "@deepseek-ai/dsh-timeout",
-];
+// 插件清单必须零依赖（pnpm link: 不安装被链接包的依赖；peer/optional 同理）。
+const manifest = JSON.parse(readFileSync(path.join(here, "package.json"), "utf8"));
+const depFields = ["dependencies", "peerDependencies", "optionalDependencies"];
+const declared = depFields.flatMap((f) => Object.keys(manifest[f] || {}));
+assert.deepEqual(
+  declared,
+  [],
+  `桥接插件禁止声明任何运行时依赖（dependencies/peerDependencies/optionalDependencies），现有: ${declared.join(", ") || "(无)"}`,
+);
 
-let failed = 0;
-for (const spec of required) {
-  try {
-    await import(spec);
-    console.log(`[ok]   ${spec.replace(here + "\\", "")}`);
-  } catch (err) {
-    failed += 1;
-    console.error(`[fail] ${spec.replace(here + "\\", "")}: ${err?.code || ""} ${err?.message || err}`);
+const tmp = mkdtempSync(path.join(tmpdir(), "dsh-pet-bridge-smoke-"));
+try {
+  // hermeticity 负向对照：从临时目录内部尝试解析历史事故包——探测的是
+  // tmp 的祖先链（ESM 从 canary 文件自身位置向上解析），若 TEMP/TMPDIR 被
+  // 外部指到含 node_modules 的树内，这里直接判红而不是假绿。
+  const canary = path.join(tmp, "__hermetic_canary__.mjs");
+  writeFileSync(
+    canary,
+    'await import("@deepseek-ai/dsh-llm");\nexport {};\n',
+    "utf8",
+  );
+  await assert.rejects(
+    import(pathToFileURL(canary).href),
+    (err) => err && err.code === "ERR_MODULE_NOT_FOUND",
+    "冒烟临时目录的祖先链上存在 node_modules（TEMP/TMPDIR 被污染），hermetic 前提不成立",
+  );
+
+  for (const name of ["index.js", "package.json", "cordis.patch.yml"]) {
+    const src = path.join(here, name);
+    if (existsSync(src)) cpSync(src, path.join(tmp, name));
   }
+
+  // 静态禁令：源码里不允许出现外部动态 import / require（惰性加载可以逃过
+  // 上面的 import 检查——apply() 里的 import() 只有在 DSH host 调用时才执行）。
+  const source = readFileSync(path.join(tmp, "index.js"), "utf8");
+  assert.ok(!/createRequire|[^.\w]require\s*\(/.test(source),
+    "index.js 不得使用 require/createRequire（CommonJS 逃逸口）");
+  const dynamicImports = [...source.matchAll(/\bimport\s*\(\s*["']([^"']+)["']\s*\)/g)]
+    .map((m) => m[1]);
+  assert.deepEqual(
+    dynamicImports.filter((spec) => !spec.startsWith("node:")),
+    [],
+    `index.js 不得动态 import 外部包: ${dynamicImports.filter((s) => !s.startsWith("node:")).join(", ") || "(无)"}`,
+  );
+
+  const bridge = await import(pathToFileURL(path.join(tmp, "index.js")).href);
+
+  assert.equal(typeof bridge.apply, "function", "插件应导出 apply(ctx)");
+  assert.deepEqual(bridge.inject, ["llm", "agentDefaultModel"]);
+
+  // envelope 形状与 dsh createUserMessage 对齐（llm.stream / steer 直接消费）：
+  // role/id 补齐、深冻结、且不回冻调用方传入的对象。
+  const input = { content: [{ type: "text", text: "hi" }], source: { kind: "plugin", plugin: "smoke" } };
+  const msg = bridge.__messageTest.createUserMessage(input);
+  assert.equal(msg.role, "user");
+  assert.equal(typeof msg.id, "string");
+  assert.ok(msg.id.length > 0);
+  assert.deepEqual(msg.content, input.content);
+  assert.deepEqual(msg.source, input.source);
+  assert.ok(Object.isFrozen(msg) && Object.isFrozen(msg.content) && Object.isFrozen(msg.content[0]));
+  assert.ok(!Object.isFrozen(input), "envelope 不得冻结调用方传入的对象");
+} finally {
+  rmSync(tmp, { recursive: true, force: true });
 }
 
-if (failed > 0) {
-  console.error(`bridge import smoke: ${failed} package(s) failed to resolve`);
-  process.exit(1);
-}
-console.log("bridge import smoke: all packages resolved");
+console.log("bridge zero-dependency smoke: import + envelope + source bans OK");

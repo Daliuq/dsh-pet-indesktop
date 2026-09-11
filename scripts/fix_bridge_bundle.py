@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""修复 PyInstaller 打包后的 bridge node_modules（issue: Cannot find package
-'@deepseek-ai/cosmokit'）。
+"""打包后桥接插件的零依赖校验与清理。
 
-背景：PyInstaller 的 --add-data 复制 integrations 目录时，会把 pnpm 的
-junction/符号链接布局复制成损坏的空目录或指向源机器的链接（.bin shims 里
-甚至写死了 W:\\... 绝对路径）。Cordis loader 之后 import bridge/index.js 时，
-Node 沿着 bridge 目录向上解析依赖，遇到损坏的 node_modules 就抛
-ERR_MODULE_NOT_FOUND，整个 DSH plugin tree 初始化失败。
+历史背景：桥接插件曾声明 @deepseek-ai/* 运行时依赖（issue: Cannot find
+package '@deepseek-ai/cosmokit' / 'dsh-llm'）。PyInstaller 的 --add-data 会
+把源码 integrations 目录连同 pnpm 的 junction 布局一起复制成损坏副本，
+Cordis loader import bridge/index.js 时依赖解析失败，整个 DSH 插件树初始
+化失败、DSH 无法启动（web/headless/desktop 全 profile，2026-09 事故）。
 
-修复：把源码 bridge 的 node_modules 用"跟随链接展开"的方式复制成自包含的
-真实目录树，删除含机器路径的 .bin shims 与 pnpm 元数据，最后在 dist 副本
-上执行一次 ESM import 冒烟（verify_import.mjs），任何缺包都会让构建失败。
+现状：桥接插件已改为零外部依赖（package.json 不声明 dependencies，
+envelope 手写在 index.js 内，与 dsh createUserMessage 形状对齐）。本脚本
+随之退化为两道防线：
+  1. 剥离 dist 副本里可能存在的 node_modules（本机源码树残留 junk 被
+     PyInstaller 原样复制时会带进产物）；
+  2. 在 dist 副本上执行 hermetic 零依赖冒烟（verify_import.mjs 会把插件
+     拷进无 node_modules 的临时目录再 import），任何外部 bare import
+     都会让构建失败，而不是在用户机器上炸掉 dsh。
 
 用法（在构建脚本的 PyInstaller 之后调用）：
     python scripts/fix_bridge_bundle.py --app-dir dist-onedir/dsh-pet-standalone-webm-chat
 """
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -59,55 +64,45 @@ def main() -> int:
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     src_bridge = os.path.join(root, "integrations", "dsh-pet-bridge")
 
-    src_nm = os.path.join(src_bridge, "node_modules")
-
-    if not os.path.isdir(src_nm):
-        # 构建环境没有本地 node_modules（CI 首次 checkout / tag 构建）：
-        # 此时没有任何 pnpm junction 需要展开，bundle 里也不会带上 node_modules，
-        # 与 build_onedir.ps1「无 node_modules 时只做声明+lockfile 校验，
-        # 由运行时 install_bridge 用 pnpm 落盘」的既有设计一致——构建继续，
-        # 不能因为「没有可修复的东西」而失败。该判断先于布局探查，避免 CI
-        # 在无 node_modules 时仍被平台布局差异拖挂。
-        print("[bridge] source node_modules absent - skip bundle repair "
-              "(declaration check only; install_bridge resolves via pnpm at runtime)")
-        return 0
-
     dst_bridge = find_dist_bridge(args.app_dir)
     if dst_bridge is None:
         print(f"[bridge] dist bridge missing under: {args.app_dir}", file=sys.stderr)
         return 1
 
-    dst_nm = os.path.join(dst_bridge, "node_modules")
+    # 防线 0（不依赖 node，Linux/macOS 构建路径没有别的清单校验）：dist 副本的
+    # 清单必须零依赖——dependencies/peerDependencies/optionalDependencies 任一
+    # 有声明即判红。pnpm 的 link: 协议不安装被链接包自己的依赖，而链接目标常是
+    # 这份无 node_modules 的打包副本。
+    try:
+        with open(os.path.join(dst_bridge, "package.json"), encoding="utf-8") as fh:
+            dist_manifest = json.load(fh)
+    except Exception as exc:
+        print(f"[bridge] dist manifest unreadable: {exc}", file=sys.stderr)
+        return 1
+    declared = [
+        name
+        for field in ("dependencies", "peerDependencies", "optionalDependencies")
+        for name in (dist_manifest.get(field) or {})
+    ]
+    if declared:
+        print("[bridge] dist manifest declares runtime dependencies "
+              f"(zero-dependency red line): {', '.join(sorted(declared))}",
+              file=sys.stderr)
+        return 1
 
-    # 删除 PyInstaller 复制出的（可能损坏的）node_modules：它可能是普通目录、
-    # junction 或指向源路径的符号链接。
+    # 防线 1：dist 副本不允许带 node_modules。零依赖插件不需要它；若本机源码树
+    # 残留着带 pnpm junction 的 node_modules，PyInstaller 会把链接原样复制进产物，
+    # 在用户机器上变成悬空/损坏链接。它可能是普通目录、junction 或符号链接。
+    dst_nm = os.path.join(dst_bridge, "node_modules")
     if os.path.islink(dst_nm) or os.path.isdir(dst_nm):
         if os.path.islink(dst_nm) and not os.path.isdir(dst_nm):
             os.unlink(dst_nm)
         else:
             shutil.rmtree(dst_nm)
+        print(f"[bridge] stripped node_modules from bundle copy: {dst_nm}")
 
-    # 跟随 junction/symlink 展开复制成真实目录树（symlinks=False）。
-    # Python 3.8+ 将 Windows junction 视为符号链接并跟随复制其内容，
-    # 展开后即为自包含结构，与 Cordis loader 的向上解析完全兼容。
-    print(f"[bridge] expanding node_modules -> {dst_nm}")
-    shutil.copytree(src_nm, dst_nm, symlinks=False)
-
-    # 删除含机器绝对路径的 pnpm 产物：.bin shims（cmd/ps1/sh 内写死
-    # W:\\deepseek-harness\\... 等路径）与指向本机 store 的元数据。
-    for rel in (".bin", ".modules.yaml", ".package-map.json",
-                ".pnpm-workspace-state-v1.json"):
-        target = os.path.join(dst_nm, rel)
-        if os.path.islink(target):
-            os.unlink(target)
-        elif os.path.exists(target):
-            if os.path.isdir(target):
-                shutil.rmtree(target)
-            else:
-                os.remove(target)
-
-    # import 冒烟：模拟 Cordis loader 的解析路径。脚本位于 bridge 目录内，
-    # 保证 ESM bare specifier 从正确的位置向上解析 node_modules。
+    # 防线 2：hermetic 冒烟。脚本位于 bridge 目录内，会把插件拷进无
+    # node_modules 的临时目录再 import，验证零依赖不变量 + envelope 形状。
     smoke = os.path.join(dst_bridge, REQUIRED_SMOKE)
     src_smoke = os.path.join(src_bridge, REQUIRED_SMOKE)
     if not os.path.exists(smoke):
@@ -118,17 +113,18 @@ def main() -> int:
 
     node = shutil.which("node")
     if node:
-        print("[bridge] running import smoke on bundle copy...")
+        print("[bridge] running zero-dependency import smoke on bundle copy...")
         result = subprocess.run([node, smoke], cwd=dst_bridge)
         if result.returncode != 0:
-            print("[bridge] import smoke FAILED - bundle bridge is not self-contained",
-                  file=sys.stderr)
+            print("[bridge] zero-dependency smoke FAILED - bundle bridge violates "
+                  "the red line", file=sys.stderr)
             return 1
     else:
-        print("[bridge] node not found - declaration/lockfile checks only (install_bridge "
-              "resolves via pnpm at runtime)")
+        # 构建机没有 node 时无法执行冒烟；PR 门禁（node --test）仍会拦截，
+        # 这里只提示不判失败，保持本地无 node 环境可构建。
+        print("[bridge] node not found - smoke skipped (PR gate covers it)")
 
-    print("[bridge] node_modules self-contained OK")
+    print("[bridge] zero-dependency bundle OK")
     return 0
 
 

@@ -6,9 +6,28 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { randomUUID } from "node:crypto";
-import { createUserMessage } from "@deepseek-ai/dsh-llm";
 
-// The bridge uses DSH's canonical user-message envelope for steer/diagnosis.
+// ===== 零依赖红线 =====
+// 本插件必须保持零外部依赖：profile 经 pnpm 的 link: 协议链接到本目录，
+// pnpm 不会安装被链接包自己的依赖；而链接目标常常是打包版桌宠
+// _internal 内的副本（CI 构建不带 node_modules）。一旦此处声明运行时依赖，
+// 依赖解析失败会让 Cordis 插件树初始化整体抛错、DSH 无法启动（2026-09 事故：
+// 作者与多用户 dsh 全 profile 起不来）。因此 user-message envelope 手写，
+// 形状与 @deepseek-ai/dsh-llm 的 createUserMessage 完全对齐——
+// {...input, role: "user", id: randomUUID()}，structuredClone 后深冻结。
+// dsh 升级 envelope 形状时这里必须同步（inject 的 llm.stream / steer 消费它）。
+function deepFreezeMessage(value, seen = new WeakSet()) {
+  if (value === null || typeof value !== "object" || seen.has(value)) return value;
+  seen.add(value);
+  for (const key of Object.keys(value)) deepFreezeMessage(value[key], seen);
+  return Object.freeze(value);
+}
+
+// dsh createUserMessage 的本地等价物：补齐 role/id，返回不可变快照。
+function createUserMessage(input) {
+  const message = structuredClone({ ...input, role: "user", id: randomUUID() });
+  return deepFreezeMessage(message);
+}
 
 const MAX_BYTES = 1024 * 1024; // 事件文件超过 1MB 时轮转（保留 .1 备份，防无限增长）
 const PLUGIN_ID = "dsh-pet-bridge";
@@ -1677,6 +1696,7 @@ export { inject };
 // Kept private-by-convention: package tests use this surface to exercise the
 // control boundary without starting a DSH host or touching the real queue.
 export const __controlTest = { controlAgent, handleControlRequest, liveAgents, knownSessions };
+export const __messageTest = { createUserMessage };
 export const __retryTest = {
   threshold: RETRY_EVENT_THRESHOLD,
   reset: resetRetryConnection,

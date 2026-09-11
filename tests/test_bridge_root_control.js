@@ -5,9 +5,8 @@
 // 「终止没用」。修复方向：把控制归一到其根 session（interrupt = 停根 agent
 // 的当前回合；replan = 给根 agent 注入重规划建议）。
 //
-// 本测试聚焦新引入的纯函数 `resolveControlRoot`：给定目标 agent 与一个
-// session→agent 的查找函数，返回它是否为子代理、是否已归一化到根、根 session
-// 与父子链。它不依赖 DSH 运行时（@deepseek-ai/* 未安装时整份模块无法 import），
+// 本测试聚焦纯函数 `resolveControlRoot`：给定目标 agent 与一个 session→agent
+// 的查找函数，返回它是否为子代理、是否已归一化到根、根 session 与父子链。
 // 与仓库既有 bridge 契约测试一致：从源码中提取纯函数求值。
 import assert from "node:assert/strict";
 import fs from "node:fs";

@@ -60,64 +60,41 @@ $entry = $variants[$Variant].Entry
 $isGif = $variants[$Variant].Gif
 $noChat = $variants[$Variant].NoChat
 
-# Bridge is installed by pnpm after the desktop bundle is unpacked.  Keep its
-# runtime dependency in the plugin manifest and fail early if it is removed.
+# Bridge is linked into dsh profiles via pnpm's link: protocol, which does NOT
+# install the linked package's own dependencies, and the link target is usually
+# the packaged copy (_internal) that ships without node_modules. Declaring any
+# runtime dependency therefore bricks the user's entire dsh plugin tree on load
+# (2026-09 incident: missing @deepseek-ai/dsh-llm, all profiles fail to start).
+# Red line: the bridge must stay ZERO-dependency; enforce it at build time.
 $bridgeManifest = Join-Path $root 'integrations\dsh-pet-bridge\package.json'
 if (-not (Test-Path $bridgeManifest)) { throw "Bridge manifest missing: $bridgeManifest" }
 # PowerShell 5.1 reads Get-Content using the system ANSI codepage by default;
 # package.json is UTF-8 and its Chinese description would become invalid JSON.
 $bridgeManifestJson = [System.IO.File]::ReadAllText($bridgeManifest, [System.Text.Encoding]::UTF8)
 $bridgePackage = $bridgeManifestJson | ConvertFrom-Json
-
-# 桥接插件依赖完整性硬校验（issue: Cannot find package '@deepseek-ai/cosmokit'）：
-# Cordis 在 ESM import 时会立即解析它的运行时依赖（cosmokit / standard-schema），
-# dsh-invariants / dsh-llm 又依赖 schemastery。任何一个漏进 devDependencies 或
-# 从打包中漏掉，都会让 DSH 的 plugin tree 初始化失败、DSH 无法启动。
-$bridgeRequiredDeps = @(
-    '@deepseek-ai/cordis',
-    '@deepseek-ai/cosmokit',
-    '@deepseek-ai/dsh-attachment',
-    '@deepseek-ai/dsh-brand',
-    '@deepseek-ai/dsh-invariants',
-    '@deepseek-ai/dsh-llm',
-    '@deepseek-ai/dsh-timeout',
-    '@deepseek-ai/schemastery',
-    '@standard-schema/spec'
-)
-foreach ($dep in $bridgeRequiredDeps) {
-    if (-not $bridgePackage.dependencies.$dep) {
-        throw "[bridge] missing runtime dependency '$dep' in integrations\dsh-pet-bridge\package.json (must be in dependencies, not dev/peer)"
-    }
+$bridgeDepNames = @()
+foreach ($field in 'dependencies', 'peerDependencies', 'optionalDependencies') {
+    $deps = $bridgePackage.$field
+    if ($deps) { $bridgeDepNames += @($deps.PSObject.Properties | ForEach-Object { $_.Name }) }
 }
-$bridgeLock = Join-Path $root 'integrations\dsh-pet-bridge\pnpm-lock.yaml'
-if (-not (Test-Path $bridgeLock)) { throw "Bridge lockfile missing: $bridgeLock" }
-$bridgeLockText = [System.IO.File]::ReadAllText($bridgeLock, [System.Text.Encoding]::UTF8)
-foreach ($snapshot in @('@deepseek-ai/cosmokit@1.8.3', '@deepseek-ai/schemastery@3.18.2', '@standard-schema/spec@1.1.0')) {
-    if (-not $bridgeLockText.Contains($snapshot)) {
-        throw "[bridge] lockfile missing snapshot for '$snapshot' - run pnpm install in integrations\dsh-pet-bridge and commit pnpm-lock.yaml"
-    }
+if ($bridgeDepNames.Count -gt 0) {
+    throw "[bridge] runtime dependencies are forbidden (zero-dependency red line): " +
+          ($bridgeDepNames -join ', ') +
+          " - hand-roll what you need inside index.js instead"
 }
-# 若本地已安装 node_modules，则真实执行一次 ESM 导入冒烟（等价于 Cordis loader 的
-# import 路径）。构建环境没有 node_modules 时（CI 首次 checkout）只做声明校验，
-# 由 install_bridge 在运行时用 pnpm 落盘；两者都不允许静默放行缺声明的情况。
-# 冒烟脚本必须位于 bridge 目录内：ESM bare specifier 从脚本自身目录向上解析
-# node_modules，放在根 scripts\ 下会误报全部依赖缺失。
-$bridgeNodeModules = Join-Path $root 'integrations\dsh-pet-bridge\node_modules'
-if (Test-Path $bridgeNodeModules) {
+# Hermetic smoke: imports the plugin from a temp dir WITHOUT node_modules and
+# checks the envelope shape. Needs only node (preinstalled on CI runners); the
+# PR gate (node --test) covers environments without it.
+$nodeExe = Get-Command node -ErrorAction SilentlyContinue
+if ($nodeExe) {
     $smoke = Join-Path $root 'integrations\dsh-pet-bridge\verify_import.mjs'
     if (-not (Test-Path $smoke)) { throw "missing verify script: $smoke" }
-    Write-Host "[bridge] verifying plugin import + transitive deps..." -ForegroundColor Cyan
+    Write-Host "[bridge] verifying zero-dependency plugin import (hermetic smoke)..." -ForegroundColor Cyan
     & node $smoke
     if ($LASTEXITCODE -ne 0) { throw "[bridge] plugin import smoke test failed (exit $LASTEXITCODE)" }
     Write-Host "[bridge] import smoke OK" -ForegroundColor Green
 } else {
-    Write-Host "[bridge] node_modules absent - manifest/lockfile declaration check only (pnpm add resolves at install time)" -ForegroundColor Yellow
-}
-$bridgeLlmVersion = $bridgePackage.dependencies.'@deepseek-ai/dsh-llm'
-if ($bridgeLlmVersion) {
-    Write-Host "[bridge] legacy dsh-llm dependency declared: $bridgeLlmVersion"
-} else {
-    Write-Host "[bridge] standalone message envelope: no external dsh-llm dependency"
+    Write-Host "[bridge] node not found - smoke skipped (PR gate covers it)" -ForegroundColor Yellow
 }
 
 # GIF builds ship assets/characters_gif (webm dir must NOT be bundled, else runtime prefers webm)
@@ -205,14 +182,16 @@ if (-not $SkipBuild) {
 $appDir = Join-Path $root "dist-onedir\$name"
 if (-not (Test-Path $appDir)) { throw "Build output missing: $appDir" }
 
-# ---------- Bridge node_modules 自包含修复（issue: Cannot find package '@deepseek-ai/cosmokit'） ----------
-# PyInstaller 的 --add-data 会把 pnpm 的 junction 布局复制成损坏的空目录/源机器链接，
-# 导致 Cordis loader import bridge 时 cosmokit 等传递依赖解析失败、DSH 无法启动。
-# 这里把源码 node_modules 展开复制成自包含真实目录树，并在 dist 副本上跑 import 冒烟。
-Write-Host "[bridge] repairing bundle node_modules (expand junctions)..." -ForegroundColor Cyan
+# ---------- Bridge 零依赖防线（2026-09 事故：缺 @deepseek-ai/dsh-llm 导致
+# 用户整个 dsh 插件树加载失败） ----------
+# 桥接插件必须零外部依赖（package.json 不声明 dependencies）。PyInstaller 的
+# --add-data 若把本机残留的 node_modules junction 复制进产物，在这里剥掉；
+# 随后在 dist 副本上跑 hermetic 冒烟（拷进无 node_modules 的临时目录再 import），
+# 任何外部 bare import 都会直接判构建失败，而不是在用户机器上炸掉 dsh。
+Write-Host "[bridge] enforcing zero-dependency bundle..." -ForegroundColor Cyan
 python scripts\fix_bridge_bundle.py --app-dir $appDir
-if ($LASTEXITCODE -ne 0) { throw "Bridge bundle repair failed: $LASTEXITCODE" }
-Write-Host "[bridge] bundle node_modules self-contained OK" -ForegroundColor Green
+if ($LASTEXITCODE -ne 0) { throw "Bridge zero-dependency check failed: $LASTEXITCODE" }
+Write-Host "[bridge] zero-dependency bundle OK" -ForegroundColor Green
 
 # =====================================================================
 # Qt runtime post-build (issue: shiboken6 "找不到指定的模块")

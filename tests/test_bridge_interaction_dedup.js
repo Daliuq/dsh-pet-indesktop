@@ -1,9 +1,8 @@
 // P1-4：审批/问题写盘去重的降级键必须带 sessionId。
 //
 // 背景：`ap:tc:<tool>|<command>` 不含 session/审批身份，8 秒内两个不同审批
-// （同命令）会被静默丢弃。本测试直接读取并求值 index.js 里的纯函数
-// `_interactionDedupKeys`，避免拉起 DSH 运行时依赖（@deepseek-ai/* 未安装
-// 时整份模块无法 import）。
+// （同命令）会被静默丢弃。本测试直接从源码提取并求值纯函数
+// `_interactionDedupKeys`（与仓库既有 bridge 契约测试一致）。
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";

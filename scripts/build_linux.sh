@@ -91,8 +91,9 @@ for variant in "${variant_list[@]}"; do
     "$PYTHON_BIN" -m PyInstaller "${args[@]}" "$entry"
     # 中文编码自检（issue #26）：字节码/资源/文件名被编码污染即中止。
     "$PYTHON_BIN" scripts/check_bundle_encoding.py --dir "$DIST_DIR/$name"
-    # Bridge node_modules 自包含修复（issue: Cannot find package '@deepseek-ai/cosmokit'）：
-    # --add-data 复制 pnpm 符号链接布局可能损坏，展开为真实目录树并在副本上冒烟。
+    # Bridge 零依赖防线（2026-09 事故：缺 @deepseek-ai/dsh-llm 导致用户整个
+    # dsh 插件树加载失败）：剥掉 --add-data 可能带入的 node_modules 残留，
+    # 校验 dist 副本清单零依赖并跑 hermetic 冒烟（见 fix_bridge_bundle.py）。
     "$PYTHON_BIN" scripts/fix_bridge_bundle.py --app-dir "$DIST_DIR/$name"
 done
 
