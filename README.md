@@ -884,8 +884,6 @@ pet/
 ├── proactive_limiter.py      # 主动识屏频控
 ├── proactive_memory.py       # 主动识屏记忆
 ├── agent_link.py             # Agent 联动监视器（多 Agent 事件源：CLI/IDE/SQLite 轮询）
-├── agent_link_reducer.py     # 联动状态机（去抖/节流/完成确认，纯状态）
-├── agent_link_presentation.py # 联动表现层（气泡/音效）
 ├── multi_window_shared.py    # 进程级多窗共享子系统（agent_link/proactive/全屏 watcher）
 ├── vision.py                 # 视觉模型调用（看看屏幕/主动识屏；PIL 懒加载）
 ├── harness_launcher.py       # DeepSeek Harness 一键启动
@@ -1104,7 +1102,7 @@ python scripts/cleanup_mei_cache.py --delete
 **事件链路语义对齐（Bridge → 传输 → 气泡渲染）**
 - `rate_limit` 事件 → `model_access`（语义从「限流」扩展为「模型访问失败」：限流/过载/AI 服务错误）；`RateLimitTracker` → `ModelAccessTracker`。
 - `errorText` → `errorMessage`（tool/result 与 `llm/retry` 等统一）；`source` → `failureType`（`model_retry_exhausted` / `tool_failed`）。
-- 归一化层补 `event` 字段（`agent/status` 别名 → 规范名），修掉模型访问失败**连续计数丢失**；占位符与文案键同步迁移（`{source}`→`{failureType}`、`{errorText}`→`{errorMessage}`、`rate_limit.*`→`model_unavailable.*`）。
+- 归一化层补 `event` 字段（`agent/status` 别名 → 规范名），修掉模型访问失败**连续计数丢失**；占位符与文案键同步迁移（`{source}`→`{failureType}`、`{errorText}`→`{errorMessage}`、`rate_limit.*`→`model_access.*`）。
 
 **Persona 模板升级**
 - 记住上次编辑层 + Agent 层隐藏公共事件；导出模板支持全部 Agent 单独配置脚手架与 `entries` 语义描述；预设键序排齐、占位符迁移；修掉自定义模式 `{text}` 字面量泄漏与双层预设取 global 层的问题。

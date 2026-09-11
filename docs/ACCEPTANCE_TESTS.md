@@ -52,14 +52,14 @@ Qt 生命周期问题：
 
 ```powershell
 $env:QT_QPA_PLATFORM = "offscreen"
-python -m pytest -q -k "not cross_process_concurrent_publish_read_stress"
-python -m pytest -q tests/test_decode_broker_shm.py::test_cross_process_concurrent_publish_read_stress
+python -m pytest -q -k "not decode_fanout"
+python -m pytest -q tests/test_decode_fanout.py tests/test_decode_fanout_integration.py
 ```
 
 第一步应先完整结束且无 native abort；第二步只能在第一步通过后运行。本轮实测结果：
 
-- 主套件：`1421 passed, 7 skipped, 1 deselected`；
-- 跨进程压力测试：`1 passed`。
+- 主套件：`1843 passed, 8 skipped, 30 deselected`；
+- 解码扇出族（原跨进程 shm broker 已被进程内 fan-out 取代）：`29 passed`。
 
 生命周期重点覆盖 `PetWindow.closeEvent()` 的幂等关闭、外置
 `PetSpeechBubble` 的 owner 清理、右键菜单执行 seam、AgentLink/WebM/session

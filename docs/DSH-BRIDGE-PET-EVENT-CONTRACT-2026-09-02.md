@@ -14,7 +14,7 @@ Agent 适配器转换并写入标准 JSONL
         ↓
 Pet 对应 Monitor 读取并发出 Qt Signal
         ↓
-AgentLinkManager / AgentEventRuntime
+AgentLinkManager（语义事件直连消费）
         ↓
 PetWindow 提醒队列、气泡和桌宠行为
 ```
@@ -170,24 +170,27 @@ sessionId, sessionName, turn?, step?, event, data, callId?, requestId?
 | DSH 来源 | Bridge event | 关键字段 | Pet 用途 |
 |---|---|---|---|
 | `approval/requested` Mux | `approval/request` | `rpcId`, `sessionId`, `approvalId`, `toolName` | 审批请求 |
-| `approval/asked` session | `approval/request`，并可写 `approval/asked` | `approvalId`, `callId`, `sessionId` | 无 Mux 的审批提示 |
+| `approval/asked` session | 仅 `approval/asked`（状态/审计转发） | `approvalId`, `callId`, `sessionId` | PR57 起不再映射为 `approval/request`：只驱动 `dsh_state` 锁存 waiting_approval，不弹审批气泡 |
 | `approval/resolved` Mux | `approval/resolved`、`interaction/resolved`、`user_action` | `approvalId`, `sessionId`, `outcome` | 关闭审批气泡 |
 | `approval/decided` session | `approval/decided`、`user_action` | `approvalId`, `rpcId`, `sessionId` | 关闭已完成审批 |
 | `question/requested` Mux | `question/requested` | `rpcId`, `sessionId`, `questions[]` | 用户问题 |
-| `question/resolved` Mux | `question/resolved`、`interaction/resolved`、`user_action` | `questionRpcId`, `sessionId`, `outcome` | 关闭问题气泡 |
+| `question/resolved` Mux | `question/resolved`、`interaction/resolved`、`user_action` | `rpcId`, `sessionId`, `outcome` | 关闭问题气泡 |
 | `tool/call(ask_user_question)` | `question/requested` | `callId`, `sessionId`, `questions[]` | Mux 不可用时的兼容入口 |
-| 匹配的 `tool/result` | `user_action` | `callId`, `sessionId` | 结束 fallback 问题 |
+| 匹配的 `tool/result` | `question/resolved` | `callId`, `sessionId` | 结束 fallback 问题（PR57 起由 `resolveQuestion` 直接写盘，不再补写 `user_action` 兜底块） |
 | `turn/step start/end` | 同名 event | `sessionId`, `step` | 状态和行为检测 |
 | `tool/call` | `tool/call` | `tool`, `target`, `callId` | 工具活动，不是审批 |
 | `tool/result` | `tool/result` | `tool`, `target`, `ok`, `callId` | 工具结果 |
 | `assistant/message` | `assistant/message` | `text`, `sessionId` | 消息和行为分析 |
-| `agent/request-error` | `agent/request-error` | 错误字段、`sessionId` | 模型请求错误 |
+| `agent/request-error` | `agent/request-error` | 错误字段（`errorCode`/`errorMessage`，无 `sessionId`） | 模型请求错误（stuck_detector 取根因码） |
 | 模型访问失败（429）/ LLM 错误 | `model_access` / `llm_error` | `errorCode`, `sessionId` | Pet 错误提醒 |
 | `execution/failed` | `execution/failed` | `errorCode`, `sessionId` | 硬失败提醒 |
 
-当前尚未映射：`cordis/request-run`、`cordis/request-run-resolved`。这是动态 Cordis
-客户端运行审批，不能伪装成普通 `approval`。`authorization.prompt()` 属于配置期凭据
-授权，也不进入当前 Agent/Pet 审批队列。
+`cordis/request-run`、`cordis/request-run-resolved` 已接入。这是动态 Cordis 客户端
+运行审批，不能伪装成普通 `approval`，因此桥接按 `kind: "cordis"` 单独写盘：原始 request
+整体嵌在 `payload` 下（`requiresApproval` 也在 `payload` 内），顶层只带 `requestId`、
+`agentId`/`sessionId` 等身份字段。Pet 侧门禁从嵌套 `payload.requiresApproval === true`
+判定，同时兼容旧版桥/手写桩把字段平铺在顶层的写法。`authorization.prompt()` 属于配置期
+凭据授权，不进入当前 Agent/Pet 审批队列。
 
 ## Agent 适配器输出契约
 
@@ -217,7 +220,8 @@ sessionId, sessionName, turn?, step?, event, data, callId?, requestId?
 ```
 
 问题项应保留 `id`、`question`、`detail`、`header`、`options`、`multiSelect`、`intent`。
-`question/resolved` 必须用 `questionRpcId` 关联原请求，不能用 resolved 外层新的 `rpcId`。
+`question/resolved` 用字段 `rpcId` 关联原请求（取 `payload.questionRpcId`，缺失时回退该
+mux 帧外层的 `rpcId`），不能用 resolved 时新产生的 rpcId。
 
 统一完成事件形如：
 
@@ -246,6 +250,8 @@ approval_requested = Signal(str, object)
 approval_resolved = Signal(str, object)
 question_requested = Signal(str, object)
 question_resolved = Signal(str, object)
+cordis_requested = Signal(str, object)
+cordis_resolved = Signal(str, object)
 raw_record = Signal(str, object)       # agent_key, raw record
 normalized_event = Signal(object)       # SemanticEvent
 execution_failed = Signal(str, object)
@@ -253,6 +259,7 @@ session_meta = Signal(str, object)
 model_access = Signal(str, object)
 llm_error = Signal(str, object)
 user_action = Signal(str, object)
+unknown_bridge_event = Signal(str, object)
 ```
 
 生命周期方法：`start()`、`stop()`、`pause()`、`resume()`、`is_running()`。
@@ -281,7 +288,10 @@ kind, request_id, rpc_id, approval_id, call_id, outcome
 
 `ControlResultEvent` 还包含：`request_id`、`operation`、`ok`、`phase`。
 
-`AgentEventRuntime.dispatch()` 是语义事件 fan-out 入口；单个消费者异常不会阻断其他消费者。
+语义事件当前只有 `AgentLinkManager._on_normalized_event` 一个消费方（`normalized_event`
+信号直连）：它只用 `RetryEvent` 维护模型访问失败连续计数、用
+`InteractionResolvedEvent` 做交互 resolved 兜底清理，其余 dataclass 属于分类契约，
+暂无消费者。原先预留的 `AgentEventRuntime` 分发层自引入起零消费方，已在 PR57 移除。
 
 ## AgentLinkManager 交互接口
 
@@ -347,14 +357,15 @@ Agent 原始事件 → agent-event/v1
 1. `tool/call(edit)` 不是审批，只有真实 `approval/*` 请求才生成审批交互。
 2. 多 session 必须同时匹配 `sessionId` 和请求关联键。
 3. resolved、decided、按钮回写和 session 结束清理必须幂等。
-4. `cordis/request-run` 当前未接入，不能报告为 Pet 已支持。
+4. `cordis/request-run` 已接入，但与原 `approval` 区分：`requiresApproval` 嵌在
+   `payload` 内，报告时按 cordis 运行审批说明，不能混作普通审批。
 5. 官方契约之外的 `edit/requested` 等事件必须保留原始 payload 和生产者信息，不能用
    正则直接归类为审批。
 
 ## 代码依据
 
-- [Bridge](</W:/deepseek-harness/dsh-pet-indesktop/integrations/dsh-pet-bridge/index.js>)
-- [AgentLinkManager 与监视器](</W:/deepseek-harness/dsh-pet-indesktop/pet/agent_link.py>)
-- [统一事件协议](</W:/deepseek-harness/dsh-pet-indesktop/pet/agent_event_protocol.py>)
-- [事件规范化](</W:/deepseek-harness/dsh-pet-indesktop/pet/agent_event_normalizer.py>)
-- [PetWindow](</W:/deepseek-harness/dsh-pet-indesktop/pet/window.py>)
+- [Bridge](integrations/dsh-pet-bridge/index.js)
+- [AgentLinkManager 与监视器](pet/agent_link.py)
+- [统一事件协议](pet/agent_event_protocol.py)
+- [事件规范化](pet/agent_event_normalizer.py)
+- [PetWindow](pet/window.py)
