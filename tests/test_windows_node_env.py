@@ -763,10 +763,16 @@ class TestHarnessGlobalRoots:
 
     def test_manual_launch_finds_dsh_under_nvm_windows_root(self, tmp_path, monkeypatch):
         from pet import harness_launcher as hl
+        from pet import node_runtime
 
         root = _dir(tmp_path / "nvm" / "v18.20.5" / "node_modules")
         bin_js = _file(root / "@deepseek-ai" / "dsh" / "lib" / "bin.js", "//")
         monkeypatch.setattr(hl, "global_node_modules_roots", lambda: [root])
+        # 静态候选根（%APPDATA%\npm 等）取自真实环境变量：开发机若装了全局 dsh，
+        # 真实路径会先于本用例的 nvm 夹具命中，用例就不再只依赖夹具（CI 机器没有
+        # 全局 dsh，故此缺陷只在本地暴露）。与同文件 POSIX 用例一致地清空静态
+        # 候选，保证断言只反映「版本管理器根也能被找到」这一条产品语义。
+        monkeypatch.setattr(node_runtime, "_WINDOWS_NODE_MODULES", ())
         monkeypatch.setattr(
             hl, "_which", lambda name: "C:/nodejs/node.exe" if name == "node" else None
         )
