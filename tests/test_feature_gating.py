@@ -120,6 +120,31 @@ def test_petwindow_startup_applies_configured_optional_services(tmp_path):
         app.processEvents()
 
 
+def test_petwindow_agent_link_enabled_at_startup_constructs_manager(tmp_path):
+    """回归（#99）：agent_link 已开启时，启动路径必须创建 AgentLinkManager。
+
+    此前 __init__ 收尾只调 _install_effect_services()，没人调
+    sync_optional_services()/apply_config()——重启后已开启的 Agent 联动
+    必须手工展开一次联动菜单或开关一次设置对话框才生效。
+    """
+    from tests.test_collision_window import FakeLibrary
+
+    app = _qapp()
+    cfg = _disabled_config(tmp_path)
+    cfg.set("agent_link", {"dsh": True})
+    win = PetWindow(FakeLibrary(), cfg)
+    try:
+        assert win.agent_link_manager is not None
+        # DSH 通道同样必须真被 apply_config() 启动，而不只是创建了管理器。
+        assert win.agent_link_manager.monitors["dsh"]._running
+    finally:
+        mgr = win.agent_link_manager
+        if mgr is not None:
+            mgr.shutdown()
+        win.close()
+        app.processEvents()
+
+
 def test_petwindow_proactive_toggle_creates_watcher(tmp_path, monkeypatch):
     from tests.test_collision_window import FakeLibrary
 

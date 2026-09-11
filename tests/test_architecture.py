@@ -53,7 +53,11 @@ PET_DIR = Path(__file__).resolve().parents[1] / "pet"
 # 增量来自上游侧在 window.py 的气泡/告警触点调整（speech_bubble 拆出
 # speech_bubble_text 后本文件仅保留薄调用）；window.py 分块拆分仍是待办，
 # 拆分前预算只随实测校准，不靠压缩行宽硬塞。
-WINDOW_PY_LINE_BUDGET = 4373
+# 2026-09-11 再上调到 4385：klxxya 的两处修复落地（#102 把「启动即同步可选服务」
+# 的根因写在调用点注释里，+5 行；#101 在 _try_move 入口加探头会话位移闸门并补
+# 注释，+7 行）。按维护者约定，klxxya 的修复可越过本红线：两处都是行为修复所必需
+# 的守卫/注释，挪出 window.py 会切断控制流；拆分待办不变，预算只随实测校准。
+WINDOW_PY_LINE_BUDGET = 4385
 
 # modern_settings_dialog.py 行数预算：按结构线拆分后实测 1857 行（拆分前 4811 行）。
 # 主对话框 ModernSettingsDialog + 对话框装配/配置写回 + 为 pet/ 与 tests/ 保留的
