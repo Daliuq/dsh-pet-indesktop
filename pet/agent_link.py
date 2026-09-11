@@ -65,6 +65,17 @@ _RAW_BRIDGE_KNOWN_EVENTS: frozenset[str] = frozenset({
     "question/requested", "question/resolved",
     "cordis/request-run", "cordis/request-run-resolved",
     "execution/failed", "model_access", "llm_error", "user_action",
+    # 桥合法发出、语义层/状态机未建模的事件,漏登记会被误判成「未知桥接事件 →
+    # 提醒更新/重装 bridge」(10 分钟冷却 → 表现为偶发未知弹窗):
+    # - user/message:扁平记录(无 type/source),真人消息=对话开始,误判最扰民;
+    # - bridge/diagnostic:桥进程启动时写一次;
+    # - command/done:command/run 语义层认识而 done 漏了;
+    # - pet/control-clicked / bridge/control-received:pet 控制回显。
+    "user/message",
+    "bridge/diagnostic",
+    "command/done",
+    "pet/control-clicked",
+    "bridge/control-received",
 })
 
 

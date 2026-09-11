@@ -3555,6 +3555,37 @@ class TestUnknownBridgeEventReminder:
         assert [(k, d.get("event")) for k, d in unknown] == [("dsh", "brand/sparkle")]
         mon.stop()
 
+    def test_user_message_is_not_unknown(self, tmp_path):
+        """桥的核心合法事件绝不判为「未知桥接事件」。
+
+        回归：DSH 的 user/message 是扁平记录（无 type/source 字段），语义层
+        normalize_event 返回 None、状态机不建模 → 漏登记直通名单会把每次真人
+        消息（对话开始）误判成「更新/重装 bridge」提醒（10 分钟冷却 → 表现为
+        「有时候触发」的未知事件）。bridge/diagnostic、command/done、
+        pet/control-clicked、bridge/control-received 同属漏网：都是桥合法发出
+        的事件，语义层未建模，必须经直通名单兜底。真正未知的事件照常触发。
+        """
+        app = QApplication.instance() or QApplication([])
+        mon = BaseAgentMonitor("dsh", tmp_path)
+        unknown = []
+        mon.unknown_bridge_event.connect(lambda k, d: unknown.append((k, d)))
+        events_file = mon.events_file
+        events_file.parent.mkdir(parents=True, exist_ok=True)
+        events_file.touch()
+        mon._poll()  # 初始化 tailer（首轮不重放）
+        with open(events_file, "a", encoding="utf-8") as f:
+            # 与桥写出的形态一致：扁平记录，无 type 字段
+            f.write(json.dumps({"event": "user/message", "text": "hi", "step": None,
+                                "sessionId": "s1", "ts": 1}) + "\n")
+            f.write(json.dumps({"event": "bridge/diagnostic", "bridgeDir": "X", "ts": 2}) + "\n")
+            f.write(json.dumps({"event": "command/done", "step": 1, "ts": 3}) + "\n")
+            f.write(json.dumps({"event": "pet/control-clicked", "ts": 4}) + "\n")
+            f.write(json.dumps({"event": "bridge/control-received", "ts": 5}) + "\n")
+            f.write(json.dumps({"event": "brand/sparkle", "ts": 6}) + "\n")  # 真未知仍要报
+        mon._poll()
+        assert [(k, d.get("event")) for k, d in unknown] == [("dsh", "brand/sparkle")]
+        mon.stop()
+
     def test_non_dsh_monitor_never_emits_unknown(self, tmp_path):
         """claude/cursor 等 transcript 噪声不算桥接未知事件（只查 DSH 监视器）。"""
         app = QApplication.instance() or QApplication([])
