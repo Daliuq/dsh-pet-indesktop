@@ -427,6 +427,65 @@ class TestPosixEnvironment:
         assert agent_link._pnpm_command() == [str(shim)]
 
 
+class TestVersionManagerDiscovery:
+    """issue 实报的 nvm 现场：pnpm 装在 ~/nvm/.../bin/pnpm（**无点号** nvm）。
+
+    reporter 原话：pnpm 在 ~/nvm/versions/node/v18.20.5/bin/pnpm，
+    而源码只按 shim 同级的 node_modules 找，于是只能自己改源码。
+    """
+
+    def test_posix_nvm_without_dot_is_covered(self, tmp_path, monkeypatch):
+        """GUI 启动（macOS .app / 桌面启动器）拿不到 shell 里设的 NVM_DIR，
+        只认 ~/.nvm 会漏掉自定义根 ~/nvm。"""
+        from pet import agent_link
+
+        home = _dir(tmp_path / "home")
+        node_root = home / "nvm" / "versions" / "node" / "v18.20.5"
+        bin_dir = _dir(node_root / "bin")
+        lib = _dir(node_root / "lib" / "node_modules")
+        cli = _file(lib / "pnpm" / "bin" / "pnpm.cjs")
+        monkeypatch.setattr(node_runtime, "_is_windows", lambda: False)
+        monkeypatch.setattr(node_runtime, "_home", lambda: home)
+        monkeypatch.setattr(node_runtime, "_POSIX_ABS_NODE_MODULES", ())
+        monkeypatch.delenv("NVM_DIR", raising=False)
+
+        assert str(bin_dir) in [str(p) for p in node_runtime._posix_extra_bin_dirs({}, home)]
+        assert str(lib) in [str(p) for p in node_runtime.global_node_modules_roots()]
+
+        monkeypatch.setattr(agent_link, "_which", lambda name: None)
+        assert _same_path(agent_link._find_pnpm_cli(), cli)
+
+    def test_posix_nvm_dir_env_plus_defaults_all_scanned(self, tmp_path):
+        """NVM_DIR 自定义根 + ~/.nvm + ~/nvm 三者都要扫（谁存在算谁）。"""
+        home = _dir(tmp_path / "home")
+        custom_bin = _dir(tmp_path / "custom-nvm" / "versions" / "node" / "v20.11.1" / "bin")
+        dot_bin = _dir(home / ".nvm" / "versions" / "node" / "v18.20.5" / "bin")
+        plain_bin = _dir(home / "nvm" / "versions" / "node" / "v22.12.0" / "bin")
+
+        got = [
+            str(p) for p in node_runtime._version_manager_bin_dirs(
+                {"NVM_DIR": str(tmp_path / "custom-nvm")}, home, windows=False,
+            )
+        ]
+
+        assert str(custom_bin) in got
+        assert str(dot_bin) in got
+        assert str(plain_bin) in got
+
+    def test_windows_default_nvm_home_when_env_missing(self, tmp_path):
+        """nvm-windows 默认装在 %APPDATA%\\nvm：环境变量缺失时也要认。"""
+        appdata = _dir(tmp_path / "AppData" / "Roaming")
+        version_dir = _dir(appdata / "nvm" / "v20.11.1")
+
+        got = [
+            str(p) for p in node_runtime._version_manager_bin_dirs(
+                {"APPDATA": str(appdata)}, tmp_path / "home", windows=True,
+            )
+        ]
+
+        assert str(version_dir) in got
+
+
 # ============================================================================
 # 4. agent_link：pnpm / npm JS 入口多布局发现（Windows 布局为主）
 # ============================================================================

@@ -616,6 +616,79 @@ def _dependency_spec_hint(profile_dir: Path, pkg: dict, *, limit: int = 2) -> st
     return f"；依赖路径缺失：{shown}{more}"
 
 
+def _spec_with_replacement(spec: str, target: Path) -> str:
+    """按原 spec 的写法生成修正后的 spec（保留 ``link:`` / ``file:`` 前缀）。"""
+    text = str(spec).strip()
+    lowered = text.lower()
+    for prefix in _LOCAL_SPEC_PREFIXES:
+        if lowered.startswith(prefix):
+            return f"{text[:len(prefix)]}{target}"
+    return str(target)
+
+
+def _repair_missing_dependency_specs(profile_dir: Path, pkg: dict) -> list[str]:
+    """把**能唯一确定**的坏依赖路径改写掉，返回改动说明；改前先备份 package.json。
+
+    只在安装失败后的恢复动作里调用——用户此刻的意图就是"装上"，而坏 spec 是
+    拦路石（web-rc8-test 现场：package.json 指着不存在的 0.12.80，磁盘上是 0.13.6）。
+    找不到唯一候选的条目一律不动（宁可不修，不可乱改）；lockfile 不在这里碰，
+    由重跑的 pnpm 自己重生成。
+    """
+    deps = pkg.get("dependencies") if isinstance(pkg, dict) else None
+    if not isinstance(deps, dict):
+        return []
+    changes: list[tuple[str, str, str]] = []
+    for name, spec in deps.items():
+        target = _path_spec_target(str(spec), profile_dir)
+        if target is None or target.exists():
+            continue
+        suggestion = _suggest_path_replacement(target)
+        if suggestion is None:
+            continue
+        changes.append((name, str(spec), _spec_with_replacement(str(spec), suggestion)))
+    if not changes:
+        return []
+    manifest = profile_dir / "package.json"
+    backup = profile_dir / f"package.json.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+    try:
+        backup.write_text(manifest.read_text(encoding="utf-8"), encoding="utf-8")
+    except OSError:
+        log.exception("依赖路径修正前备份失败，放弃修正: %s", profile_dir)
+        return []
+    for name, _old, new in changes:
+        deps[name] = new
+    try:
+        manifest.write_text(
+            json.dumps(pkg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+    except OSError:
+        log.exception("依赖路径修正写入失败: %s", profile_dir)
+        return []
+    return [f"{name}: {old} → {new}" for name, old, new in changes]
+
+
+def _run_pnpm_repairing_specs(profile_dir: Path, *args: str) -> tuple[int, str, list[str]]:
+    """跑 pnpm；失败且存在可唯一修正的坏依赖路径时，修正后重试一次。
+
+    返回 (返回码, 输出, 修正说明列表)。修正会备份 package.json，并由 pnpm
+    在重试时重新生成 lockfile。
+    """
+    rc, out = _run_pnpm(profile_dir, *args)
+    if rc == 0:
+        return rc, out, []
+    pkg = _read_manifest(profile_dir)
+    if pkg is None:
+        return rc, out, []
+    repaired = _repair_missing_dependency_specs(profile_dir, pkg)
+    if not repaired:
+        return rc, out, []
+    log.warning(
+        "依赖路径已按探测结果修正并重试 pnpm %s: %s", " ".join(args), "；".join(repaired),
+    )
+    rc2, out2 = _run_pnpm(profile_dir, *args)
+    return rc2, out2, repaired
+
+
 # 标准统一状态词汇
 VALID_STATES = {"idle", "thinking", "working", "attention", "sleeping", "error"}
 
@@ -1504,6 +1577,7 @@ class DshMonitor(BaseAgentMonitor):
 
         failed = []
         succeeded = []
+        repaired_notes: list[str] = []
         for profile in profiles:
             pkg = _read_manifest(profile)
             if pkg is None:
@@ -1513,13 +1587,15 @@ class DshMonitor(BaseAgentMonitor):
                 # 已安装也要刷新本地 link。否则源码/打包版升级后，profile
                 # 仍可能指向旧的 dist-onedir bridge，重启 dsh 只会继续加载旧代码。
                 # pnpm add 会更新已有的 link spec；失败时保留原安装并报告。
-                rc, out = _run_pnpm(profile, "add", str(plugin))
+                rc, out, repaired = _run_pnpm_repairing_specs(profile, "add", str(plugin))
                 if rc != 0:
                     failed.append(
                         f"{profile.name}: pnpm refresh 失败 {(out or '')[-150:]}"
-                        f"{_dependency_spec_hint(profile, pkg)}"
+                        f"{_dependency_spec_hint(profile, _read_manifest(profile) or pkg)}"
                     )
                     continue
+                if repaired:
+                    repaired_notes.append(f"{profile.name}: " + "；".join(repaired))
                 pkg = _read_manifest(profile)
                 if pkg is None:
                     failed.append(f"{profile.name}: 刷新后 package.json 读取失败")
@@ -1532,13 +1608,15 @@ class DshMonitor(BaseAgentMonitor):
                     continue
                 succeeded.append(profile.name)
                 continue
-            rc, out = _run_pnpm(profile, "add", str(plugin))
+            rc, out, repaired = _run_pnpm_repairing_specs(profile, "add", str(plugin))
             if rc != 0:
                 failed.append(
                     f"{profile.name}: pnpm add 失败 {(out or '')[-150:]}"
-                    f"{_dependency_spec_hint(profile, pkg)}"
+                    f"{_dependency_spec_hint(profile, _read_manifest(profile) or pkg)}"
                 )
                 continue
+            if repaired:
+                repaired_notes.append(f"{profile.name}: " + "；".join(repaired))
             pkg = _read_manifest(profile)
             if pkg is None:
                 failed.append(f"{profile.name}: 安装后 package.json 读取失败")
@@ -1552,7 +1630,13 @@ class DshMonitor(BaseAgentMonitor):
         if failed:
             # 不做整批回滚：已装成功的保持不动（旧版回滚会把刚装好的反而卸掉）
             return False, "部分实例安装失败（已装成功的保持不动）——" + "；".join(failed)
-        return True, f"桥接插件已安装到 {len(succeeded)} 个 dsh 实例（{', '.join(succeeded)}）"
+        note = ""
+        if repaired_notes:
+            note = (
+                "；已自动修正失效的依赖路径（原文件备份为 package.json.bak-*）："
+                + "；".join(repaired_notes)
+            )
+        return True, f"桥接插件已安装到 {len(succeeded)} 个 dsh 实例（{', '.join(succeeded)}）{note}"
 
     @classmethod
     def uninstall_bridge(cls) -> bool:

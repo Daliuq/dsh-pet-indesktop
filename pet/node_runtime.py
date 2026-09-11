@@ -209,6 +209,36 @@ def _safe_glob(parent: Path, pattern: str) -> list[Path]:
 # ----------------------------------------------------------------------
 # 各平台的额外目录
 # ----------------------------------------------------------------------
+def _nvm_roots(env: Mapping[str, str], home: Path, *, windows: bool) -> list[Path]:
+    """nvm 候选根目录：环境变量优先，再补常见默认布局。
+
+    为什么不止一个：GUI 进程（macOS .app / 桌面启动器）拿不到 shell 里设的
+    ``NVM_DIR``，只认单个默认根就会漏——reporter 的 nvm 装在 ``~/nvm``（无点号），
+    官方默认却是 ``~/.nvm``；nvm-windows 默认在 ``%APPDATA%\\nvm``。
+    """
+    roots: list[Path] = []
+    names = ("NVM_HOME", "NVM_DIR") if windows else ("NVM_DIR",)
+    for name in names:
+        value = _env_get(env, name).strip()
+        if value:
+            roots.append(Path(value))
+    if windows:
+        appdata = _env_get(env, "APPDATA").strip()
+        if appdata:
+            roots.append(Path(appdata) / "nvm")
+    else:
+        roots.extend([home / ".nvm", home / "nvm"])
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for root in roots:
+        key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(root)
+    return unique
+
+
 def _version_manager_bin_dirs(env: Mapping[str, str], home: Path, *, windows: bool) -> list[Path]:
     """版本管理器（nvm / nvm-windows / fnm / volta / bun / pnpm）的 bin 目录。"""
     dirs: list[Path] = []
@@ -217,19 +247,15 @@ def _version_manager_bin_dirs(env: Mapping[str, str], home: Path, *, windows: bo
     if nvm_symlink:
         dirs.append(Path(nvm_symlink))
 
-    nvm_home = _env_get(env, "NVM_HOME").strip()
-    nvm_dir = _env_get(env, "NVM_DIR").strip()
     if windows:
         # nvm-windows：%NVM_HOME%\v<版本>\ 里同时有 node.exe 与全局包 shim
-        for root in (Path(nvm_home) if nvm_home else None, Path(nvm_dir) if nvm_dir else None):
-            if root is None:
-                continue
+        for root in _nvm_roots(env, home, windows=True):
             dirs.append(root)
             dirs.extend(_safe_glob(root, "v*"))
     else:
-        nvm_root = _env_root_or_default(env, "NVM_DIR", home / ".nvm")
-        for version in _safe_glob(nvm_root / "versions" / "node", "*"):
-            dirs.append(version / "bin")
+        for nvm_root in _nvm_roots(env, home, windows=False):
+            for version in _safe_glob(nvm_root / "versions" / "node", "*"):
+                dirs.append(version / "bin")
 
     fnm_dir = _env_get(env, "FNM_DIR").strip()
     if windows:
@@ -397,31 +423,31 @@ def global_node_modules_roots() -> list[Path]:
     home = _home()
     roots: list[Path] = list(static_node_modules_roots())
     if _is_windows():
-        for name in ("NVM_HOME", "NVM_DIR"):
-            root = _env_get(env, name).strip()
-            if root:
-                for version in _safe_glob(Path(root), "v*"):
-                    roots.append(version / "node_modules")
+        for root in _nvm_roots(env, home, windows=True):
+            for version in _safe_glob(root, "v*"):
+                roots.append(version / "node_modules")
         nvm_symlink = _env_get(env, "NVM_SYMLINK").strip()
         if nvm_symlink:
             roots.append(Path(nvm_symlink) / "node_modules")
-        volta_home = _env_get(env, "VOLTA_HOME").strip()
-        if volta_home:
-            for image in _safe_glob(Path(volta_home) / "tools" / "image" / "node", "*"):
-                roots.append(image / "node_modules")
+        volta_root = _env_root_or_default(env, "VOLTA_HOME", home / ".volta")
+        for image in _safe_glob(volta_root / "tools" / "image" / "node", "*"):
+            roots.append(image / "node_modules")
         fnm_dir = _env_get(env, "FNM_DIR").strip()
         fnm_root = Path(fnm_dir) if fnm_dir else home / "AppData" / "Roaming" / "fnm"
         for version in _safe_glob(fnm_root / "node-versions", "*"):
             roots.append(version / "installation" / "node_modules")
     else:
-        nvm_root = _env_root_or_default(env, "NVM_DIR", home / ".nvm")
-        for version in _safe_glob(nvm_root / "versions" / "node", "*"):
-            roots.append(version / "lib" / "node_modules")
-        for image in _safe_glob(home / ".volta" / "tools" / "image" / "node", "*"):
+        for nvm_root in _nvm_roots(env, home, windows=False):
+            for version in _safe_glob(nvm_root / "versions" / "node", "*"):
+                roots.append(version / "lib" / "node_modules")
+        volta_root = _env_root_or_default(env, "VOLTA_HOME", home / ".volta")
+        for image in _safe_glob(volta_root / "tools" / "image" / "node", "*"):
             roots.append(image / "lib" / "node_modules")
         fnm_root = _env_root_or_default(env, "FNM_DIR", home / ".local" / "share" / "fnm")
         for version in _safe_glob(fnm_root / "node-versions", "*"):
             roots.append(version / "installation" / "lib" / "node_modules")
+        bun_root = _env_root_or_default(env, "BUN_INSTALL", home / ".bun")
+        roots.append(bun_root / "install" / "global" / "node_modules")
         for store in _safe_glob(home / ".local" / "share" / "pnpm" / "global", "*"):
             roots.append(store / "node_modules")
     return _existing_dirs(roots)

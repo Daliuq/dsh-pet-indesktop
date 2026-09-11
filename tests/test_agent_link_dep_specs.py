@@ -330,5 +330,112 @@ class TestScheduling:
             manager.shutdown()
 
 
+# ---------------------------------------------------------------- 坏路径实修
+
+class TestSpecRepair:
+    """web-rc8-test 现场：package.json 指着不存在的旧版路径（0.12.80，实际 0.13.6），
+    必须**真修**——把能唯一确定的坏路径改写掉、备份原文件，然后让 pnpm 重生成 lockfile。"""
+
+    def test_repairs_unique_missing_path_and_backs_up(self, tmp_path):
+        artifacts = tmp_path / "artifacts"
+        artifacts.mkdir()
+        newer = artifacts / "deepseek-ai-dsh-ext-0.13.6.tgz"
+        newer.write_text("x", encoding="utf-8")
+        profile = _profile(
+            tmp_path,
+            deps={
+                "@deepseek-ai/dsh-ext": f"file:{artifacts / 'deepseek-ai-dsh-ext-0.12.80.tgz'}",
+                "keep-me": "^1.0.0",
+            },
+        )
+
+        changed = agent_link._repair_missing_dependency_specs(profile, _manifest(profile))
+
+        assert len(changed) == 1
+        assert "0.13.6" in changed[0]
+        deps = _manifest(profile)["dependencies"]
+        assert deps["@deepseek-ai/dsh-ext"] == f"file:{newer}"
+        assert deps["keep-me"] == "^1.0.0", "无关依赖不许动"
+        assert list(profile.glob("package.json.bak-*")), "改写前必须备份"
+
+    def test_repairs_link_spec_keeping_prefix(self, tmp_path):
+        new_target = tmp_path / "dist-onedir" / "new-build" / "dsh-pet-bridge"
+        new_target.mkdir(parents=True)
+        (tmp_path / "dist-onedir" / "old-build").mkdir(parents=True)
+        missing = tmp_path / "dist-onedir" / "old-build" / "dsh-pet-bridge"
+        profile = _profile(tmp_path, deps={"@dsh-pet/bridge": f"link:{missing}"})
+
+        changed = agent_link._repair_missing_dependency_specs(profile, _manifest(profile))
+
+        assert len(changed) == 1
+        assert _manifest(profile)["dependencies"]["@dsh-pet/bridge"] == f"link:{new_target}"
+
+    def test_leaves_unfixable_specs_alone(self, tmp_path):
+        spec = "file:W:/nowhere/ghost-1.0.0.tgz"
+        profile = _profile(tmp_path, deps={"ghost": spec})
+
+        changed = agent_link._repair_missing_dependency_specs(profile, _manifest(profile))
+
+        assert changed == []
+        assert _manifest(profile)["dependencies"]["ghost"] == spec
+        assert not list(profile.glob("package.json.bak-*")), "没改动就不该产生备份"
+
+    def test_install_bridge_repairs_then_retries(self, tmp_path, monkeypatch):
+        import json as _json
+
+        plugin = tmp_path / "dsh-pet-bridge"
+        plugin.mkdir()
+        artifacts = tmp_path / "artifacts"
+        artifacts.mkdir()
+        (artifacts / "ext-0.13.6.tgz").write_text("x", encoding="utf-8")
+        profile = _profile(
+            tmp_path, deps={"ext": f"file:{artifacts / 'ext-0.12.80.tgz'}"}
+        )
+        monkeypatch.setattr(agent_link, "DSH_PROFILE_HOME", tmp_path)
+        monkeypatch.setattr(DshMonitor, "bundled_plugin_dir", classmethod(lambda cls: plugin))
+        monkeypatch.setattr(agent_link, "_pnpm_command", lambda: ["pnpm"])
+        calls: list[tuple] = []
+
+        def fake_run(profile_dir, *args):
+            calls.append(args)
+            if len(calls) == 1:
+                return 1, "ERR_PNPM_ ... ext-0.12.80.tgz does not exist"
+            data = _json.loads((profile_dir / "package.json").read_text(encoding="utf-8"))
+            data.setdefault("dependencies", {})[agent_link.DSH_PLUGIN_NAME] = f"link:{plugin}"
+            (profile_dir / "package.json").write_text(
+                _json.dumps(data, ensure_ascii=False), encoding="utf-8"
+            )
+            return 0, ""
+
+        monkeypatch.setattr(agent_link, "_run_pnpm", fake_run)
+
+        ok, message = DshMonitor.install_bridge()
+
+        assert ok is True, message
+        assert len(calls) == 2, "修正后必须重试一次"
+        assert "0.13.6" in _manifest(profile)["dependencies"]["ext"]
+
+    def test_install_bridge_does_not_retry_unfixable(self, tmp_path, monkeypatch):
+        plugin = tmp_path / "dsh-pet-bridge"
+        plugin.mkdir()
+        _profile(tmp_path, deps={"ghost": "file:W:/nowhere/ghost-1.0.0.tgz"})
+        monkeypatch.setattr(agent_link, "DSH_PROFILE_HOME", tmp_path)
+        monkeypatch.setattr(DshMonitor, "bundled_plugin_dir", classmethod(lambda cls: plugin))
+        monkeypatch.setattr(agent_link, "_pnpm_command", lambda: ["pnpm"])
+        calls: list[tuple] = []
+
+        def fake_run(profile_dir, *args):
+            calls.append(args)
+            return 1, "ERR_PNPM_ network"
+
+        monkeypatch.setattr(agent_link, "_run_pnpm", fake_run)
+
+        ok, message = DshMonitor.install_bridge()
+
+        assert ok is False
+        assert len(calls) == 1, "没有可修正项就不该重试"
+        assert "ghost" in message
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
