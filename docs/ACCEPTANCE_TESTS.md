@@ -60,7 +60,7 @@ python -m pytest -q tests/test_decode_fanout.py tests/test_decode_fanout_integra
 
 第一步应先完整结束且无 native abort；第二步只能在第一步通过后运行。本轮实测结果：
 
-- 主套件：`1893 passed, 8 skipped, 2 deselected`（2 deselected = 本机两个已知环境假红：高刷屏 drag 节流钟差、collision 真时钟竞态）；
+- 主套件：`1895 passed, 8 skipped, 2 deselected`（2 deselected = 本机两个已知环境假红：高刷屏 drag 节流钟差、collision 真时钟竞态）；
 - 解码扇出族（原跨进程 shm broker 已被进程内 fan-out 取代）：`29 passed`。
 
 生命周期重点覆盖 `PetWindow.closeEvent()` 的幂等关闭、外置

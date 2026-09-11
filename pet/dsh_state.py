@@ -2,7 +2,8 @@
 """DSH 统一状态跟踪（第一版：状态联动 pipeline）。
 
 数据源：随桌宠内置的 DSH 桥接插件 ``integrations/dsh-pet-bridge`` 写入的
-``<数据基目录>/dsh-pet-bridge/dsh.jsonl``。桥接插件订阅 DSH 真实事件
+``<数据基目录>/dsh-pet-bridge/dsh-{pid}.jsonl``（多实例分区写入；消费端
+glob ``dsh*.jsonl``，兼容旧版单文件 ``dsh.jsonl``）。桥接插件订阅 DSH 真实事件
 （``agent/status``、``session/event`` 的 ``turn/start`` / ``turn/end`` /
 ``tool/call`` / ``approval/asked`` / ``approval/decided`` / ``llm/retry`` …，
 词汇见 DSH ``dsh-session/known-event-types``），以简单事件行追加写入。

@@ -24,7 +24,8 @@
 - 加载：`pet/persona_phrases.py`
   - `load_builtin_presets()`：模块导入（启动）时读盘全部内置预设 →
     模块级注册表 `_presets`。
-  - `reload_builtin_presets()`：「重设/恢复内置」入口，重新读盘；已持有的
+  - `reload_builtin_presets()`：重新读盘入口（数据契约由测试锁定；当前无生产
+    调用方，待设置页提供「重设/恢复内置」后再接线）；已持有的
     `PhrasePicker` 无需重建（渲染每次实时读注册表）。
   - `builtin_phrases(mode)`：取某模式当前预设（未知/未加载 → 空 → 调用方 fallback）。
   - 触发点：模块导入即加载（设置页 `pet/exploration_watchdog_settings.py` 等

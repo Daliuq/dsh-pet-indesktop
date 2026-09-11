@@ -3,9 +3,10 @@
 
 内置表达风格（dialogue_mode=legacy / whale_maid）的文案不写死在代码里，而是
 各自对应仓库数据文件 ``pet/persona_presets/<mode>.json``：模块导入（启动）时
-加载一次，调用方可在「重设/恢复内置」时调用 :func:`reload_builtin_presets`
-重新读盘。custom 模式的台词属于用户数据，持久化在 config.json 的
-``dialogue_phrases`` 键（按 agent_key 分层的统一预设），同样不落任何代码文件。
+加载一次；:func:`reload_builtin_presets` 供测试与未来「重设/恢复内置」设置
+入口重新读盘（当前无生产调用方）。custom 模式的台词属于用户数据，持久化在
+config.json 的 ``dialogue_phrases`` 键（按 agent_key 分层的统一预设），同样
+不落任何代码文件。
 """
 from __future__ import annotations
 
@@ -186,8 +187,8 @@ def _read_preset_file(mode: str) -> dict[str, list[str]]:
 def load_builtin_presets() -> dict[str, dict[str, list[str]]]:
     """（启动/模块导入时）读盘加载全部内置预设。
 
-    返回读盘快照；渲染实时读全局注册表，:func:`reload_builtin_presets` 可在
-    「重设/恢复内置」时重新读盘，已持有的 PhrasePicker 无需重建。
+    返回读盘快照；渲染实时读全局注册表，:func:`reload_builtin_presets` 供
+    测试/未来设置入口重新读盘，已持有的 PhrasePicker 无需重建。
     """
     global _presets
     _presets = {mode: _read_preset_file(mode) for mode in _BUILTIN_MODES}
