@@ -29,7 +29,7 @@ def test_all_advertised_fields_reach_presentation_layer():
     1. AST 解析 pet/agent_link.py 与 pet/app.py 里全部 _dialogue/_persona_text
        调用点，断言 PARAMETERS[key] == 该 key 调用点显式注入的 kwargs 并集
        （双向：多宣称=占位符永远原样露出的谎言；少宣称=已注入却不告知）。
-       动态 key 调用点（activity/pattern/rate_limit）按 kwargs 签名归组校验。
+       动态 key 调用点（activity/pattern/model_access）按 kwargs 签名归组校验。
     2. UPSTREAM_FIELDS 的每个上下文字段都必须在桥接插件源码中出现（桥确实
        会写出），或属于 Pet 侧注入（agent_key）。
     审计依据：docs/PERSONA-TEMPLATE-FIELD-ALIGNMENT-2026-09-05.md
@@ -66,25 +66,25 @@ def test_all_advertised_fields_reach_presentation_layer():
             else:
                 dynamic.append((has_expansion, frozenset(kws)))
 
-    # 动态 key 调用点：activity（**values 展开）/ pattern（name, reasons）/ rate_limit（count + **conditional 展开）
+    # 动态 key 调用点：activity（**values 展开）/ pattern（name, reasons）/ model_access（count + **conditional 展开）
     assert (True, frozenset()) in dynamic, "activity 调用点应显式传 values 字典（含 tool/command 等）"
     assert (False, frozenset({"name", "reasons"})) in dynamic, "pattern 动态调用点缺失"
     assert (False, frozenset({"count"})) in dynamic or (True, frozenset({"count"})) in dynamic, \
-        "rate_limit 动态调用点缺失（count + **conditional 展开）"
+        "model_access 动态调用点缺失（count + **conditional 展开）"
     # activity 调用点会读记录里的 target/ok 并按需注入，但桥接写出的 tool/call
     # 记录从不含这两个字段（只在 tool/result / watchdog reasoning）——活动气泡
     # 渲染时填充物是 tool/call，因此模板不宣称（写了就是永不替换的占位符）。
     activity_fields = ("name", "tool", "label", "command", "argsKey", "callId", "step",
                        "sessionName", "projectName")
     activity_unadvertised = {"target", "ok"}
-    # rate_limit 的 key 是变量：dynamic_delivered 需包含 count + 条件参数
-    rate_limit_fields = {"count"} | set(CONDITIONAL_PARAMETERS["rate_limit.one"])
+    # model_access 的 key 是变量：dynamic_delivered 需包含 count + 条件参数
+    model_access_fields = {"count"} | set(CONDITIONAL_PARAMETERS["model_access.one"])
     dynamic_delivered = {
         "activity.read": set(activity_fields), "activity.search": set(activity_fields),
         "activity.edit": set(activity_fields), "activity.run": set(activity_fields),
         "activity.default": set(activity_fields),
         "pattern.warning": {"name", "reasons"}, "pattern.control": {"name", "reasons"},
-        "rate_limit.one": set(rate_limit_fields), "rate_limit.many": set(rate_limit_fields),
+        "model_access.one": set(model_access_fields), "model_access.many": set(model_access_fields),
     }
 
     data = build_persona_template(None)
@@ -94,9 +94,9 @@ def test_all_advertised_fields_reach_presentation_layer():
     assert set(VARIABLES) == {
         "name", "command", "label", "body", "count", "reasons", "detail", "text",
         "tool", "toolName", "argsKey", "callId", "step",
-        "sessionName", "projectName",
-        "errorCode", "errorMessage", "consecutiveRetryCount", "retry",
-        "retries", "retryExhausted",
+        "sessionName", "projectName", "event",
+        "errorCode", "errorMessage", "errorKind", "consecutiveRetryCount", "retry",
+        "retries", "retryExhausted", "failureType",
     }
     assert "cordis" not in data["upstream"]["fields"]
     assert "sessionName" in UPSTREAM_FIELDS["base"], "Bridge 必须直接写出 sessionName"
@@ -114,7 +114,7 @@ def test_all_advertised_fields_reach_presentation_layer():
     assert entries["llm_error.api"]["parameters"] == []
     assert {"count", "errorCode", "errorMessage", "consecutiveRetryCount", "retry",
             "sessionName", "projectName"} == set(
-        entries["rate_limit.one"]["parameters"])
+        entries["model_access.one"]["parameters"])
     assert set(entries["approval.command"]["parameters"]) == {
         "name", "command", "toolName", "sessionName", "projectName", "label"}
 
@@ -155,7 +155,7 @@ def test_all_advertised_fields_reach_presentation_layer():
     assert set(entries["approval.command"]["parameters"]) >= {"name", "command", "toolName",
                                                              "sessionName", "projectName", "label"}
     assert set(entries["question.one"]["parameters"]) >= {"name", "body", "sessionName"}
-    assert {"count", "errorCode", "errorMessage"} <= set(entries["rate_limit.one"]["parameters"])
+    assert {"count", "errorCode", "errorMessage"} <= set(entries["model_access.one"]["parameters"])
     assert entries["balance.result"]["parameters"] == ["text"]
 
     # balance.loading/balance.result 真实渲染（pet/app.py），必须可导出；死键不得回流

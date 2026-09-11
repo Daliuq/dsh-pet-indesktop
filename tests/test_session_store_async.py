@@ -190,13 +190,14 @@ def test_close_drains_accepted_ops_before_shutdown(store):
 def test_close_total_blocking_time_bounded_by_timeout(tmp_path, monkeypatch):
     """P2：close(timeout) 的实际上界必须等于 timeout——flush 耗尽 deadline 后
     join 不得再额外阻塞（旧实现固定 join(5.0)，close(0.3) 实际约 5.3s；
-    close(10) 约 15s，close_all 多 root 逐个关闭还会继续累加）。"""
-    st = ss.SessionStore(tmp_path)
-    session = _make_session(st, sid="s-block")
-    assert st.save(session) is True
-    w = ss._registry.get_writer(st.root)
-    assert w is not None
+    close(10) 约 15s，close_all 多 root 逐个关闭还会继续累加）。
 
+    卡住的写盘必须**构造期注入**（`_WriterRegistry(writer_factory=...)`）：
+    worker 被唤醒就立刻落盘、没有批延迟，若先 save 再替换模块全局
+    `_atomic_write`，CI 高负载下 worker 可能已用原函数写完并清空待写项，
+    本用例就会误报「卡住的写盘未在时限内开始」。构造期注入保证第一次写盘
+    就是被卡住的那一次，无时序假设（2026-09-10 用抢占窗口确定性复现过）。
+    """
     entered = threading.Event()
     release = threading.Event()
     orig_write = ss._atomic_write
@@ -206,7 +207,18 @@ def test_close_total_blocking_time_bounded_by_timeout(tmp_path, monkeypatch):
         assert release.wait(timeout=10.0), "测试释放信号未到达"
         return orig_write(path, payload)
 
-    monkeypatch.setattr(ss, "_atomic_write", stuck_write)
+    # 独立注册表 + 构造期注入写盘实现：本用例不与其它测试共享 writer
+    monkeypatch.setattr(
+        ss,
+        "_registry",
+        ss._WriterRegistry(lambda root: ss._AsyncWriter(root, write=stuck_write)),
+    )
+
+    st = ss.SessionStore(tmp_path)
+    session = _make_session(st, sid="s-block")
+    assert st.save(session) is True
+    w = ss._registry.get_writer(st.root)
+    assert w is not None
 
     # 必须等 worker 确实进入卡住的写盘再 close——否则 CI 高负载下 close
     # 可能在 worker 开工前返回 True（竞态，CI macOS 实测踩中）

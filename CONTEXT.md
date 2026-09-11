@@ -75,3 +75,19 @@ _Avoid_: Inline settings grid, eager gallery
 A stable sidebar destination organized by user intent. Every persistent setting
 has one owning domain; platform support changes availability, not ownership.
 _Avoid_: Module page, Windows settings page
+
+**Report Gate**:
+The single control for how much of one aggregated event class the pet reports.
+It is a pass probability in `0.00–1.00` (`0.00` silences the class, `1.00`
+reports every occurrence) and there is no boolean switch: the settings slider is
+the only fine-grained control, while the pet menu offers only the two endpoints.
+A gate governs the bubble step alone — detectors and the raw-record chain are
+never sampled — and it never covers the whole feature.
+_Avoid_: Notification toggle, report percentage, global mute
+
+**Gate Group**:
+The collapsible settings block that collects every report gate with the
+bubble-phrase rows of its own event class, so a gate sits next to what it
+controls. It is expanded by default and auto-expands when a search matches a row
+inside it.
+_Avoid_: Hidden advanced panel, per-feature switch list

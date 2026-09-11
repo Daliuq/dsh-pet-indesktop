@@ -37,6 +37,26 @@ def test_repeated_command_warning_payload_is_emitted(app):
     assert "mode" not in payload
 
 
+def test_plugin_user_message_does_not_override_goal(app):
+    """agent.inject() 注入上下文（sourceKind=plugin）不得覆盖真人目标。
+
+    每轮 4-5 条 system-reminder/技能目录注入记录都是 user/message,若不区分,
+    goal 会被注入文案冲掉,探索看门狗据此误判「对话目标」。
+    """
+    wd = ExplorationWatchdog()
+    try:
+        wd.feed_record("agent", {"event": "user/message", "sourceKind": "user",
+                                 "text": "帮我修 user/message 事件"})
+        with wd._lock:
+            assert wd._states["agent"]["goal"] == "帮我修 user/message 事件"
+        wd.feed_record("agent", {"event": "user/message", "sourceKind": "plugin",
+                                 "text": "<system-reminder> 技能目录……"})
+        with wd._lock:
+            assert wd._states["agent"]["goal"] == "帮我修 user/message 事件"
+    finally:
+        wd.close()
+
+
 def test_long_think_warning_payload_is_emitted(app):
     """超长 Think 的定时轮询路径同样构造 payload，不得抛 AttributeError。"""
     wd = ExplorationWatchdog()

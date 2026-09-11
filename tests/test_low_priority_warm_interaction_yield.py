@@ -207,8 +207,13 @@ def test_no_busy_loop_while_waiting_gate(tmp_path, monkeypatch):
     （观测窗口内 0 次调用），忙循环实现会高频调用（数千次）。
     """
     lib = _make_lib(tmp_path, monkeypatch, BlockableClip)
+    # CI 顺序无关：低优池顺序来自目录枚举（平台/文件系统相关，禁止赌顺序）——
+    # 按真实池顺序取前两个。硬编码「写代码」时，若它排在第二位，第一个 clip 会
+    # 卡在 warm_meta 闸门上，本用例就会等待超时（本地 tmp 目录即稳定复现）。
+    _, low = lib._priority_names()
+    first, second = low[0], low[1]
     lib._warm_low_priority_background()  # 非交互状态启动批次
-    _wait_until(lambda: lib._movies["写代码"].meta_entered.is_set())
+    _wait_until(lambda: lib._movies[first].meta_entered.is_set())
 
     lib.begin_interaction()
     real_wait = lib._interaction_active.wait
@@ -220,17 +225,17 @@ def test_no_busy_loop_while_waiting_gate(tmp_path, monkeypatch):
 
     lib._interaction_active.wait = counting_wait  # 记录旧实现的忙循环调用
 
-    lib._movies["写代码"].meta_release.set()  # 放行第一个 clip → worker 进入第二个 clip 闸门
+    lib._movies[first].meta_release.set()  # 放行第一个 clip → worker 进入第二个 clip 闸门
     # 固定观测窗口（负向断言：等待线程应睡眠，而非空转；不是阶段猜测）
     time.sleep(0.25)
     assert len(wait_calls) == 0, "交互期间低优先级预热必须阻塞等待，不得忙循环"
 
-    lib._movies["吃白饭"].meta_release.set()
+    lib._movies[second].meta_release.set()
     lib.end_interaction()
     _wait_until(lambda: lib._low_first_frames_done)
-    assert lib._movies["吃白饭"].warmed_meta is True
-    assert lib._movies["吃白饭"].warmed_frame is True
-    assert lib._movies["写代码"].warmed_frame is True
+    assert lib._movies[second].warmed_meta is True
+    assert lib._movies[second].warmed_frame is True
+    assert lib._movies[first].warmed_frame is True
 
 
 def test_low_warm_waits_while_interaction_active_then_resumes(tmp_path, monkeypatch):
@@ -268,22 +273,25 @@ def test_low_warm_waits_while_interaction_active_then_resumes(tmp_path, monkeypa
 def test_low_warm_batch_dedup_in_flight(tmp_path, monkeypatch):
     """P1：批次去重——timer 到点/重试/resume 重排的并发触发不得重复起批。"""
     lib = _make_lib(tmp_path, monkeypatch, BlockableClip)
+    # CI 顺序无关：按真实池顺序取前两个（目录枚举顺序跨平台/跨文件系统不同）
+    _, low = lib._priority_names()
+    first, second = low[0], low[1]
     lib._warm_low_priority_background()
-    _wait_until(lambda: lib._movies["写代码"].meta_entered.is_set())
+    _wait_until(lambda: lib._movies[first].meta_entered.is_set())
     assert lib._low_warm_in_flight is True
 
     lib._warm_low_priority_background()  # 模拟 timer 重入：不得再起一批
     assert lib._low_warm_in_flight is True, "已有批次在飞时必须去重"
 
-    lib._movies["写代码"].meta_release.set()
-    lib._movies["吃白饭"].meta_release.set()
+    lib._movies[first].meta_release.set()
+    lib._movies[second].meta_release.set()
     _wait_until(lambda: lib._low_first_frames_done)
     assert lib._low_warm_in_flight is False
     # 同一批 clip 只被预热一次：没有重复批次重复启动 ffmpeg
-    assert lib._movies["写代码"].meta_calls == 1
-    assert lib._movies["吃白饭"].meta_calls == 1
-    assert lib._movies["写代码"].frame_calls == 1
-    assert lib._movies["吃白饭"].frame_calls == 1
+    assert lib._movies[first].meta_calls == 1
+    assert lib._movies[second].meta_calls == 1
+    assert lib._movies[first].frame_calls == 1
+    assert lib._movies[second].frame_calls == 1
 
 
 def test_pause_cancels_queued_interaction_retry(tmp_path, monkeypatch, app):

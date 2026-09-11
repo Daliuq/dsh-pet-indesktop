@@ -63,7 +63,7 @@ Watchdog Policy 单独将风险映射为 `NORMAL`、`WARNING`、`JUDGE_REQUIRED`
 ## 明确放弃的设计
 
 - 仅按 Read/Think 数量触发风险；
-- Bridge 产生 `rate_limit`、`execution/failed` 风险结论；
+- Bridge 产生 `model_access`、`execution/failed` 风险结论；
 - 无 session ID 时猜测合并事件；
 - 用完整思考、代码或命令作为长期诊断数据；
 - 把控制请求结果当作风险估计；

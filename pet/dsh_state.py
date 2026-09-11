@@ -109,7 +109,7 @@ _EVENT_TO_STATE = {
     # 完成 / 出错
     "turn/end": DshState.SUCCESS,
     "llm/retry": DshState.ERROR,
-    "llm/error": DshState.ERROR,  # PI_AI_ERROR（bad_response_status_code）等 API 级错误
+    "llm/error": DshState.ERROR,  # API 级错误（llm_error：errorCode 为真实上游码如 bad_response_status_code）
 }
 
 
@@ -138,6 +138,11 @@ class DshStateTracker(QObject):
 
     # 状态变化信号：emit(from_state, to_state)；from_state 为 "" 表示首个状态
     state_changed = Signal(str, str)
+    # 真人用户消息 → (session_id, text)：对话开始的稳定触发点，与状态边沿竞态
+    # 解耦。agent.inject() 注入上下文（sourceKind=plugin）不发本信号、也不进
+    # 状态机（system-reminder/技能目录/记忆等每轮 4-5 条，不能当真人输入）。
+    # 旧版桥接记录无 sourceKind 字段：按真人消息兼容处理，绝不静默丢事件。
+    user_message = Signal(str, str)
 
     # 后台线程完成在线探测后回主线程的结果（跨线程 emit，AutoConnection 队列投递）
     _online_checked = Signal(bool)
@@ -262,6 +267,18 @@ class DshStateTracker(QObject):
         state = map_event_to_state(record)
         if state is None:
             return
+
+        # 真人用户消息：发 user_message 信号（对话开始的稳定触发点）。
+        # agent.inject() 注入上下文（sourceKind=plugin）整体忽略——不进状态机、
+        # 不算对话开始，防止每轮 4-5 条 system-reminder/技能目录记录把「对话
+        # 开始」触发改成随机的（同 tick 批量应用 + 边沿去重 → 时触时不触）。
+        if event == "user/message":
+            if str(record.get("sourceKind") or "") == "plugin":
+                return
+            self.user_message.emit(
+                str(record.get("sessionId") or record.get("session_id") or ""),
+                str(record.get("text") or record.get("content") or record.get("summary") or ""),
+            )
 
         # approval/decided：解除审批锁存，回到 working（agent 仍在 running）
         if event == "approval/decided":

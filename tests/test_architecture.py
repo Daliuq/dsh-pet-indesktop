@@ -49,7 +49,11 @@ PET_DIR = Path(__file__).resolve().parents[1] / "pet"
 # 2026-09-08 上调到 4369：批 G——change_scale 子肥鱼置位 user_customized（+4）、
 # showEvent 启动即登记 runtime 标记（+7，含 try 兜底，修「退出子肥鱼」漏清未
 # 拖动过的小肥鱼），实测 4369。
-WINDOW_PY_LINE_BUDGET = 4369
+# 2026-09-11 上调到 4373：合入 origin/main（PR76 事件层合并同步）后实测 4373。
+# 增量来自上游侧在 window.py 的气泡/告警触点调整（speech_bubble 拆出
+# speech_bubble_text 后本文件仅保留薄调用）；window.py 分块拆分仍是待办，
+# 拆分前预算只随实测校准，不靠压缩行宽硬塞。
+WINDOW_PY_LINE_BUDGET = 4373
 
 # modern_settings_dialog.py 行数预算：按结构线拆分后实测 1857 行（拆分前 4811 行）。
 # 主对话框 ModernSettingsDialog + 对话框装配/配置写回 + 为 pet/ 与 tests/ 保留的

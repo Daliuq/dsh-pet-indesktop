@@ -10,6 +10,8 @@
 
 macOS：Finder 启动的 .app 环境 PATH 极简，本模块会额外探测 Homebrew、
 nvm、volta、bun、pnpm 等常见安装目录后回退 npx；需要机器装有 Node.js。
+Windows：Explorer / 开机自启的进程环境块是登录时的旧值，除增强 PATH 外还会
+探测 nvm-windows（`%NVM_HOME%\v*`）等全局包目录。
 
 行为：探测端口 —— 已在运行则直接打开浏览器；未运行则后台拉起
 （Windows 隐藏窗口脱离进程 / POSIX 新会话），就绪后自动打开浏览器。
@@ -26,6 +28,8 @@ import webbrowser
 from pathlib import Path
 
 from .node_runtime import augmented_path as _augmented_path
+from .node_runtime import global_node_modules_roots
+from .node_runtime import static_node_modules_roots
 from .node_runtime import which as _which
 
 # 3080 会落入 Windows winnat/Hyper-V 动态保留段（EACCES），默认改用 38080；
@@ -33,15 +37,6 @@ from .node_runtime import which as _which
 DEFAULT_PORT = int(os.environ.get("DSH_PORT") or 38080)
 # npx 首次拉取 @deepseek-ai/dsh 可能较慢，预留 90 秒就绪窗口
 _READY_TIMEOUT_SECONDS = 90.0
-
-_POSIX_NODE_MODULES = (
-    "~/.local/lib/node_modules",
-    "~/.npm-global/lib/node_modules",
-    "/usr/local/lib/node_modules",
-    "/opt/homebrew/lib/node_modules",
-    "/usr/lib/node_modules",
-)
-
 
 def is_running(port: int = DEFAULT_PORT) -> bool:
     """探测 127.0.0.1:port 是否有服务监听。"""
@@ -198,12 +193,15 @@ def _supports_no_open(base_command: list[str]) -> bool:
 
 
 def _npm_global_roots() -> list[Path]:
-    """候选的 npm 全局 node_modules 根目录。"""
-    roots: list[Path] = []
-    if os.name == "nt":
-        roots.append(Path(os.environ.get("APPDATA", "")) / "npm" / "node_modules")
-    else:
-        roots.extend(Path(directory).expanduser() for directory in _POSIX_NODE_MODULES)
+    """候选的 npm 全局 node_modules 根目录。
+
+    静态候选（~/.npm-global、%APPDATA%\\npm 等）不要求存在——没有就跳过；
+    再加 node_runtime 探测到的各版本管理器真实目录：Windows 上 nvm-windows
+    的全局包在 `%NVM_HOME%\\v*\\node_modules`，nvm 在 `~/.nvm/.../lib/node_modules`，
+    只认 %APPDATA%\\npm 会漏掉整台机器的 dsh 安装。
+    """
+    roots: list[Path] = list(static_node_modules_roots())
+    roots.extend(global_node_modules_roots())
     # 只在 PATH（增强后）确实存在 npm 时才探测，避免菜单里点击卡住 15 秒。
     # 使用绝对路径并传入增强环境，Finder 启动时 npm 的 env-node shebang
     # 才能继续找到 Homebrew Node（Issue #67）。
@@ -219,7 +217,14 @@ def _npm_global_roots() -> list[Path]:
                 roots.append(Path(result.stdout.strip()))
         except Exception:
             pass
-    return roots
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        key = str(root)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(root)
+    return deduped
 
 
 def _find_launch_command(port: int = DEFAULT_PORT) -> list[str] | None:

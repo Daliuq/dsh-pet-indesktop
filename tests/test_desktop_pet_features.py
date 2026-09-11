@@ -1459,10 +1459,12 @@ def test_modern_settings_panel_uses_sidebar_and_includes_ai_settings(tmp_path, m
     expression_row = dialog.findChild(settings_mod.SettingRow, "settingRow_dialogue_mode")
     assert expression_row is not None
     assert expression_row.findChild(settings_mod.QLabel, "settingLabel").text() == "表达风格"
-    assert "Agent 联动相关提示气泡" in expression_row.findChild(settings_mod.QLabel, "settingHint").text()
-    assert "自言自语" in expression_row.findChild(settings_mod.QLabel, "settingHint").text()  # 明确说明不受本项影响
+    # 产品 hint 文案（modern_settings_dialog.py）以「自言自语、候选内容和主动气泡」起句，
+    # 并显式说明同时覆盖 Agent 状态/审批/提问/错误等联动气泡。
+    assert "自言自语" in expression_row.findChild(settings_mod.QLabel, "settingHint").text()
+    assert "Agent 状态" in expression_row.findChild(settings_mod.QLabel, "settingHint").text()
     # 表达风格（dialogue_*）已按 spec（agent-dialogue-per-agent）全量迁入 automation 域
-    # 「Agent 联动文案风格」组；互动域不再持有 dialogue 行（见 test_express_style_rows_move_to_agent_domain）。
+    # 「文案风格与模板」组；互动域不再持有 dialogue 行（见 test_express_style_rows_move_to_agent_domain）。
     assert page_index(expression_row) == sidebar_index("自动化与联动")
     dialog.show()
     dialogue_page_index = next(
@@ -2824,6 +2826,69 @@ def test_pet_app_binds_about_to_quit_once_to_current_window(tmp_path, monkeypatc
     # 不停掉会跨测试存活，在后续用例泵事件时继续发起探测，
     # 是全量套件原生崩溃的帮凶之一。
     owner._dsh_state_tracker.stop()
+
+
+def test_dsh_state_tracker_wiring_drives_thinking(tmp_path):
+    """AppShell 恢复对 DshStateTracker 的订阅：thinking/真人消息 → 联动管线。
+
+    回归（本次调查结论）：d04fc10 曾接线 state_changed/user_message，post-merge
+    重构时丢失 → DSH 的 THINKING 气泡结构性不触发、对话开始不稳定。本用例钉住
+    两条信号都接了、thinking/真人消息会调 notify_dsh_state、offline 收交互，
+    且无窗/无联动管理器时绝不崩。
+    """
+    from PySide6.QtWidgets import QApplication
+
+    from pet.app import AppShell
+    from pet.config import Config
+
+    QApplication.instance() or QApplication([])
+    owner = AppShell(QApplication.instance(), Config(tmp_path))
+    owner._dsh_state_tracker.stop()  # 断真实轮询，手动驱动信号
+
+    class FakeAlm:
+        def __init__(self):
+            self.notified = []
+            self.dismissed = False
+
+        def notify_dsh_state(self, state):
+            self.notified.append(state)
+
+        def dismiss_all_interactions(self):
+            self.dismissed = True
+
+    try:
+        # 无窗/无联动管理器：两个处理器都必须静默 no-op
+        owner._on_dsh_user_message("s1", "hi")
+        owner._on_dsh_state_changed("working", "thinking")
+
+        alm = FakeAlm()
+
+        class FakeWin:
+            pass
+
+        win = FakeWin()
+        win.agent_link_manager = alm
+        owner.instance.win = win
+
+        # 真人消息 = 对话开始：与状态边沿竞态解耦的稳定触发
+        owner._on_dsh_user_message("s1", "hi")
+        assert alm.notified == ["thinking"]
+
+        # thinking 状态也触发（turn/start 路径）；同轮重复由呈现管线去重
+        alm.notified.clear()
+        owner._on_dsh_state_changed("working", "thinking")
+        assert alm.notified == ["thinking"]
+
+        # offline：收掉失效的常驻审批/问题气泡（d04fc10 原行为）
+        owner._on_dsh_state_changed("thinking", "offline")
+        assert alm.dismissed is True
+
+        # 非 thinking/offline 状态不动作
+        alm.notified.clear()
+        owner._on_dsh_state_changed("thinking", "working")
+        assert alm.notified == []
+    finally:
+        owner._dsh_state_tracker.stop()
 
 
 def test_external_character_dirs_uses_variant_then_legacy_fallback(tmp_path, monkeypatch):

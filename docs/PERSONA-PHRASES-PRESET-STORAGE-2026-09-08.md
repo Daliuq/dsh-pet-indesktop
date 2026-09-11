@@ -19,7 +19,7 @@
 
 - 数据：`pet/persona_presets/legacy.json`（默认模式/正式口吻）、
   `whale_maid.json`（鲸鱼娘女仆模式）。均为扁平
-  `{event_key: [文案…]}`，35 个事件 key，每 key ≤8 条、每条 ≤240 字
+  `{event_key: [文案…]}`，36 个事件 key，每 key ≤8 条、每条 ≤240 字
   （载入时清洗）。键集合即事件词表（无独立硬编码词表）。
 - 加载：`pet/persona_phrases.py`
   - `load_builtin_presets()`：模块导入（启动）时读盘全部内置预设 →
@@ -70,7 +70,7 @@ mode ∈ {legacy, whale_maid} : 内置预设[key] → 调用方原文案
 - 专属层覆盖范围：只有渲染点把 `agent_key` 传给 `_dialogue()` 的事件才走
   per-Agent 专属层，且**专属层只在 custom 模式读**。当前带路由的转述事件：
   `start / thinking / activity.* / done.success / done.attention /
-  agent.attention / agent.error`。审批/提问/失败/限流/卡住/模式等「对你说」
+  agent.attention / agent.error`。审批/提问/失败/模型访问失败/卡住/模式等「对你说」
   的事件与 `bridge.*`、`agent.missing` 只走 global。
   （2026-09-08 用户确认：**不做**「内置风格 + per-Agent 覆盖」叠加，保持现状。）
 - 结构引导不随台词覆盖：自由文本问题/含文本分支的「请到 DSH 界面输入文本

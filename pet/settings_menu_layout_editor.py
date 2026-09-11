@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import shiboken6
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
@@ -201,6 +202,16 @@ class MenuLayoutEditor(QWidget):
         box.addWidget(self.split, 1)
 
         self._preview_refresh_pending = False
+        # 预览刷新合并用「父对象为 self 的成员单次 timer」，不能用静态
+        # QTimer.singleShot(0, bound_method)：静态调用无法取消，也不随编辑器销毁，
+        # 编辑器 C++ 对象已删除后回调仍会触发，_on_changed 里的 self.tree 已失效
+        # → RuntimeError: Internal C++ object (QTreeWidget) already deleted，
+        # 且在共享 QApplication 里会由后续无关测试的 processEvents 引爆。
+        # 成员 timer 是 self 的子对象，随编辑器销毁一起消失。
+        self._preview_refresh_timer = QTimer(self)
+        self._preview_refresh_timer.setSingleShot(True)
+        self._preview_refresh_timer.setInterval(0)
+        self._preview_refresh_timer.timeout.connect(self._flush_preview_refresh)
         self._pending_empty_submenus: list[QTreeWidgetItem] = []
         self.tree.itemChanged.connect(self._on_changed)
         tree_model = self.tree.model()
@@ -327,7 +338,8 @@ class MenuLayoutEditor(QWidget):
         if self._preview_refresh_pending:
             return
         self._preview_refresh_pending = True
-        QTimer.singleShot(0, self._flush_preview_refresh)
+        # 成员 timer：可取消，且随编辑器 C++ 对象一起销毁（见 __init__ 说明）。
+        self._preview_refresh_timer.start()
 
     def _on_tree_rows_removed(self, parent_index, *_args) -> None:
         if parent_index.isValid():
@@ -339,6 +351,9 @@ class MenuLayoutEditor(QWidget):
 
     def _flush_preview_refresh(self) -> None:
         self._preview_refresh_pending = False
+        if not shiboken6.isValid(self):
+            # C++ 侧已销毁（窗口已关闭/被析构）：回调不得再触碰 self.tree 等子控件。
+            return
         for submenu in self._pending_empty_submenus:
             self._remove_empty_submenu(submenu)
         self._pending_empty_submenus.clear()

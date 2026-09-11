@@ -21,6 +21,7 @@ from pet.config_domains import (
     MenuConfig,
     ProactiveConfig,
 )
+from pet.report_gates import REPORT_GATE_KEYS
 
 
 class _UnavailableSecretStore:
@@ -65,7 +66,8 @@ CHAT_DIRTY = {
 }
 AGENT_LINK_DIRTY = {
     "dsh": "yes",                        # bool("yes") → True
-    "notify_done": 0,                    # bool(0) → False
+    # 事件汇报概率门：越界收敛、无法解析回落该门默认（activity 默认 0.6，不是 1.0）。
+    "report_gates": {"activity": 1.5, "done": "abc", "nope": 0.5},
     "sound_volume": 5.0,                 # clamp → 1.0
     "sound_cooldown_seconds": -1,        # clamp → 0.0
     "custom_agents": "bad",              # → []
@@ -240,6 +242,45 @@ def test_agent_link_extension_keys_and_custom_agent_key_preserved():
     assert normalized["thinking_texts"] == {"gemini": "大脑飞速运转", "dsh": "思考中"}
     assert normalized["thinking_text"] == "旧版全局文案"
     assert normalized["future_ext"] == {"keep": 1}
+
+
+def test_agent_link_legacy_report_keys_migrate_to_gates_and_are_dropped():
+    """旧事件汇报键一次性迁移到 report_gates，且迁移后**不再留在结果里**。
+
+    旧模型是 5 个 notify_* 布尔开关 + 一个 0-100 的 report_probability 百分比；
+    新模型是 report_gates 概率门。这里验证 facade 与 Config 加载路径同规则：
+    迁移出对应的门值，且结果里不留兼容别名（不做双写）。
+    """
+    migrated = AgentLinkConfig.normalize({
+        "notify_state": True,          # 开 → 1.0
+        "notify_activity": False,      # 关 → 0.0
+        "notify_done": 0,              # 假值 → 0.0
+        "report_probability": 60,      # 0-100 → activity 0.0-1.0
+    })
+    legacy = ("notify_state", "notify_activity", "notify_approval",
+              "notify_done", "notify_exec_failed", "report_probability")
+    for key in legacy:
+        assert key not in migrated, f"{key} 迁移后不得留在配置里"
+
+    gates = migrated["report_gates"]
+    assert float(gates["state"]) == pytest.approx(1.0)
+    assert float(gates["done"]) == pytest.approx(0.0)
+    # report_probability 晚于 notify_activity 迁移 → 百分比赢（60 → 0.6）
+    assert float(gates["activity"]) == pytest.approx(0.6)
+    # 未被旧键覆盖的门保持默认，且门集合完整
+    assert set(gates) == set(REPORT_GATE_KEYS)
+    assert float(gates["stuck"]) == pytest.approx(1.0)
+
+
+def test_agent_link_new_gate_shape_wins_over_legacy_keys():
+    """新旧键并存时以新形状 report_gates 为准，不被旧键覆盖。"""
+    normalized = AgentLinkConfig.normalize({
+        "report_gates": {"activity": 0.25},
+        "report_probability": 100,
+        "notify_activity": True,
+    })
+    assert float(normalized["report_gates"]["activity"]) == pytest.approx(0.25)
+    assert "report_probability" not in normalized
 
 
 def test_chat_extension_keys_preserved():

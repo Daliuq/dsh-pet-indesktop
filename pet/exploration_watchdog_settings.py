@@ -12,6 +12,15 @@ Configuration keys live under the `agent_link` sub-dict:
     agent_link.exploration_watchdog_early_grace_minutes
     agent_link.exploration_watchdog_long_run_minutes
     agent_link.exploration_watchdog_long_think_seconds
+
+同时承载「卡住检测」（stuck_detector）配置：
+
+    agent_link.stuck_detect
+    agent_link.stuck_worried_threshold
+    agent_link.stuck_intervene_threshold
+    agent_link.stuck_window_seconds
+    agent_link.stuck_cooldown_seconds
+    agent_link.stuck_reminder_text
 """
 from __future__ import annotations
 
@@ -19,6 +28,7 @@ import logging
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
+    QLineEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -76,6 +86,33 @@ class WatchdogSettingsPage(QWidget):
         self.long_run_spin.setRange(2, 240)
         self.long_run_spin.setSuffix(" 分钟")
         self.long_run_spin.setValue(int(self._agent_cfg.get("exploration_watchdog_long_run_minutes", 10)))
+        self.long_think_spin = BrowserSpinBox(self)
+        self.long_think_spin.setRange(10, 1800)
+        self.long_think_spin.setSuffix(" 秒")
+        self.long_think_spin.setValue(int(self._agent_cfg.get("exploration_watchdog_long_think_seconds", 120)))
+
+        # ---- 卡住检测（stuck_detector：失败评分式人工介入建议，原仅右键菜单可配）----
+        self.stuck_enabled_check = ToggleSwitch(self)
+        self.stuck_enabled_check.setChecked(bool(self._agent_cfg.get("stuck_detect", False)))
+        self.stuck_worried_spin = BrowserSpinBox(self)
+        self.stuck_worried_spin.setRange(1, 20)
+        self.stuck_worried_spin.setSuffix(" 分")
+        self.stuck_worried_spin.setValue(int(self._agent_cfg.get("stuck_worried_threshold", 3)))
+        self.stuck_intervene_spin = BrowserSpinBox(self)
+        self.stuck_intervene_spin.setRange(2, 50)
+        self.stuck_intervene_spin.setSuffix(" 分")
+        self.stuck_intervene_spin.setValue(int(self._agent_cfg.get("stuck_intervene_threshold", 5)))
+        self.stuck_window_spin = BrowserSpinBox(self)
+        self.stuck_window_spin.setRange(10, 3600)
+        self.stuck_window_spin.setSuffix(" 秒")
+        self.stuck_window_spin.setValue(int(self._agent_cfg.get("stuck_window_seconds", 90)))
+        self.stuck_cooldown_spin = BrowserSpinBox(self)
+        self.stuck_cooldown_spin.setRange(10, 7200)
+        self.stuck_cooldown_spin.setSuffix(" 秒")
+        self.stuck_cooldown_spin.setValue(int(self._agent_cfg.get("stuck_cooldown_seconds", 300)))
+        self.stuck_reminder_edit = QLineEdit(self)
+        self.stuck_reminder_edit.setText(str(self._agent_cfg.get("stuck_reminder_text", "") or ""))
+        self.stuck_reminder_edit.setPlaceholderText("留空使用默认提醒文案")
 
         # ---- Layout ----
         root = QVBoxLayout(self)
@@ -102,6 +139,24 @@ class WatchdogSettingsPage(QWidget):
                         "Agent 启动后的前 N 分钟提高风险阈值，允许更多探索空间。", self.grace_spin),
             SettingRow("long_run_minutes", "长运行降阈值",
                         "连续运行超过 N 分钟后，风险阈值自动降低 1，提高敏感度。", self.long_run_spin),
+            SettingRow("long_think_seconds", "单次超长 Think",
+                        "单次思考超过该时长（秒）后降低风险阈值。", self.long_think_spin),
+        ], self))
+
+        root.addWidget(SettingsSection("卡住检测", [
+            SettingRow("stuck_detect", "启用卡住检测",
+                        "DSH 联动时识别工具失败/超时/反复重试等钻牛角尖行为，建议人工介入。",
+                        self.stuck_enabled_check),
+            SettingRow("stuck_worried_threshold", "担忧动画阈值",
+                        "卡住评分达到该分值时播放担忧动画。", self.stuck_worried_spin),
+            SettingRow("stuck_intervene_threshold", "介入提醒阈值",
+                        "卡住评分达到该分值时持续提醒人工介入。", self.stuck_intervene_spin),
+            SettingRow("stuck_window_seconds", "滑动窗口",
+                        "卡住评分统计的时间窗口。", self.stuck_window_spin),
+            SettingRow("stuck_cooldown_seconds", "提醒冷却",
+                        "两次介入提醒之间的最小间隔。", self.stuck_cooldown_spin),
+            SettingRow("stuck_reminder_text", "自定义提醒文案",
+                        "留空使用默认文案。", self.stuck_reminder_edit, stacked=True),
         ], self))
 
         root.addStretch(1)
@@ -118,6 +173,13 @@ class WatchdogSettingsPage(QWidget):
         updated["exploration_watchdog_cooldown_steps"] = self.cooldown_spin.value()
         updated["exploration_watchdog_early_grace_minutes"] = self.grace_spin.value()
         updated["exploration_watchdog_long_run_minutes"] = self.long_run_spin.value()
+        updated["exploration_watchdog_long_think_seconds"] = self.long_think_spin.value()
+        updated["stuck_detect"] = self.stuck_enabled_check.isChecked()
+        updated["stuck_worried_threshold"] = self.stuck_worried_spin.value()
+        updated["stuck_intervene_threshold"] = self.stuck_intervene_spin.value()
+        updated["stuck_window_seconds"] = self.stuck_window_spin.value()
+        updated["stuck_cooldown_seconds"] = self.stuck_cooldown_spin.value()
+        updated["stuck_reminder_text"] = self.stuck_reminder_edit.text().strip()
         return updated
 
     def refresh_from_config(self, agent_link_cfg: dict) -> None:
@@ -129,4 +191,11 @@ class WatchdogSettingsPage(QWidget):
         self.cooldown_spin.setValue(int(self._agent_cfg.get("exploration_watchdog_cooldown_steps", 3)))
         self.grace_spin.setValue(int(self._agent_cfg.get("exploration_watchdog_early_grace_minutes", 5)))
         self.long_run_spin.setValue(int(self._agent_cfg.get("exploration_watchdog_long_run_minutes", 10)))
+        self.long_think_spin.setValue(int(self._agent_cfg.get("exploration_watchdog_long_think_seconds", 120)))
+        self.stuck_enabled_check.setChecked(bool(self._agent_cfg.get("stuck_detect", False)))
+        self.stuck_worried_spin.setValue(int(self._agent_cfg.get("stuck_worried_threshold", 3)))
+        self.stuck_intervene_spin.setValue(int(self._agent_cfg.get("stuck_intervene_threshold", 5)))
+        self.stuck_window_spin.setValue(int(self._agent_cfg.get("stuck_window_seconds", 90)))
+        self.stuck_cooldown_spin.setValue(int(self._agent_cfg.get("stuck_cooldown_seconds", 300)))
+        self.stuck_reminder_edit.setText(str(self._agent_cfg.get("stuck_reminder_text", "") or ""))
 

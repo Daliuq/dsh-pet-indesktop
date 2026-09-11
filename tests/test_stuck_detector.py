@@ -46,12 +46,13 @@ class _FakeClock:
 
 def _result(tool: str, ok: bool, *, error_text: str = "", error_code: str = "",
             args_key: str = "", duration_ms: int | None = None, timeout: bool = False) -> dict:
+    # tool/result 错误正文统一 errorMessage（与 llm/retry 等一致）
     return {
         "event": "tool/result",
         "tool": tool,
         "argsKey": args_key,
         "ok": ok,
-        "errorText": error_text,
+        "errorMessage": error_text,
         "errorCode": error_code,
         "durationMs": duration_ms,
         "timeout": timeout,

@@ -2069,3 +2069,28 @@ def test_custom_file_icon_is_validated_persisted_and_supports_fit_modes(tmp_path
     editor.close()
     menu.close()
     app.processEvents()
+
+
+def test_pending_preview_refresh_is_cancelled_when_editor_destroyed():
+    """回归：编辑器 C++ 对象销毁后，遗留的预览刷新不得再触碰已销毁的子控件。
+
+    原实现用静态 ``QTimer.singleShot(0, self._flush_preview_refresh)``：它无法
+    取消、也不随编辑器一起销毁；窗口关闭（C++ 对象已删除）后回调仍会执行
+    ``_on_changed``，并在 ``self.tree.blockSignals(True)`` 抛
+    ``RuntimeError: Internal C++ object (QTreeWidget) already deleted``。
+    全量套件里这个残留回调由后续无关测试的 ``processEvents()`` 引爆
+    （test_agent_link_threads / test_webm_clip_broker_feed 观测到）。
+
+    owner 侧修法：改成父对象为自身的成员单次 timer（随对象销毁）+ 有效性闸门。
+    """
+    import shiboken6
+    from PySide6.QtWidgets import QApplication
+
+    from pet.modern_settings_dialog import MenuLayoutEditor
+
+    app = QApplication.instance() or QApplication([])
+    editor = MenuLayoutEditor(None)
+    editor._schedule_preview_refresh()
+    assert editor._preview_refresh_pending is True
+    shiboken6.delete(editor)  # 同步销毁：等价于窗口关闭后 C++ 对象消失
+    app.processEvents()  # 不得抛 RuntimeError（旧实现此处必红）

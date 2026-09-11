@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import weakref
 
 from PySide6.QtCore import QObject, Signal
 
@@ -31,6 +32,12 @@ from .agent_link import AgentLinkManager
 from .proactive import ProactiveScreenWatcher
 
 log = logging.getLogger("dsh-pet-standalone")
+
+# 存活共享子系统注册表（测试收口用，与 agent_link._LIVE_* 同纪律）。共享
+# proactive 的 QTimer / bridge 在多窗代理下 parent 为 None，其 timeout/frame
+# 连接从 Qt C++ 侧强引用住 shell 对象图，Python gc 回收不掉，解释器退出 GC
+# 才最终化 → 原生访问违规。WeakSet 只弱引用子系统本身。
+_LIVE_SHARED_SUBSYSTEMS: "weakref.WeakSet[SharedSubsystems]" = weakref.WeakSet()
 
 
 class MultiWindowProxy:
@@ -262,8 +269,14 @@ class SharedAgentLinkManager(AgentLinkManager):
         pass
 
     def shutdown(self) -> None:
-        # 单窗关闭/切换角色不动共享监视器；全部退出由 stop_all() 收口
-        pass
+        # 单窗关闭/切换角色不动共享监视器；全部退出由 stop_all() 收口。
+        # 但基类的「过继给 QApplication」GC 安全收口必须继承：多窗代理 parent
+        # 为 None 时 C++ 对象为 Python 持有，wrapper 经信号连接/闭包成环只能等
+        # 循环 GC，跨线程析构带 QTimer/信号连接的 QObject 会腐化 Qt 事件队列
+        # （interpreter 退出 access violation，见 AgentLinkManager 注释）。
+        # 这里只接管生命周期、不关停监视器——嘲笑/直连测试退出时（conftest
+        # _shutdown_live_for_tests 每测收口路径）同样要走该收口。
+        AgentLinkManager._adopt_to_app_for_gc(self)
 
     def stop_all(self) -> None:
         """进程级收口：幂等，只真正关停监视器一次。"""
@@ -319,7 +332,6 @@ class SharedFullscreenWatcher(QObject):
         self._thread: threading.Thread | None = None
         self._fs_last = False
         self._fs_polls = 0
-
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
@@ -411,11 +423,57 @@ class SharedSubsystems:
         self.fs = SharedFullscreenWatcher(shell)
         self.fs.fullscreen_changed.connect(shell._on_shared_fullscreen)
         self.fs.cursor_visibility_changed.connect(shell._on_shared_cursor)
+        _LIVE_SHARED_SUBSYSTEMS.add(self)
 
     def start(self) -> None:
         self.fs.start()
 
     def stop_all(self) -> None:
+        """进程级收口：停共享定时器/探测线程 + 释放 Qt 生命周期引用。
+
+        生产路径由 ``AppShell._on_about_to_quit`` 在「全部退出」时调用；测试
+        （conftest ``_close_qt_top_level_widgets`` → ``_shutdown_live_for_tests``）
+        亦经本方法收口。除停表外还必须把 parent 为 None 的 Qt 对象过继给
+        QApplication：否则 Qt C++ 侧连接强引用住整个对象图，Python gc 回收
+        不掉，解释器退出 GC 才最终化 → 原生访问违规（见 _LIVE_SHARED_SUBSYSTEMS
+        注释）。
+        """
         self.proactive.stop_all()
         self.agent_link.stop_all()
         self.fs.stop()
+        _release_qt_lifetimes(self)
+
+    @classmethod
+    def _shutdown_live_for_tests(cls) -> None:
+        """收口未由测试显式 stop 的共享子系统（对齐 agent_link 同族防线）。"""
+        for subs in tuple(_LIVE_SHARED_SUBSYSTEMS):
+            try:
+                subs.stop_all()
+            except Exception:
+                log.debug("测试收口共享子系统失败", exc_info=True)
+
+
+def _release_qt_lifetimes(subs: "SharedSubsystems") -> None:
+    """把共享子系统里 parent 为 None 的 Qt 对象过继给 QApplication。
+
+    仅接管 Python/C++ 生命周期，不改变业务状态（与
+    ``AgentLinkManager._adopt_to_app_for_gc`` 同治）。多窗代理下这些对象的
+    parent 是伪装成窗口的 ``MultiWindowProxy``（无 ``winId``），构造时退化为
+    None；其 ``timeout`` / ``frame_ready`` 连接从 Qt C++ 侧强引用住 shell
+    对象图，Python gc 回收不掉。过继给与进程同寿的 QApplication 后，wrapper
+    在任何线程被回收都只是空壳析构，不会跨线程删除带 QTimer/信号连接的
+    QObject（interpreter 退出 access violation 根因）。
+    """
+    try:
+        from PySide6.QtCore import QCoreApplication
+        app = QCoreApplication.instance()
+        if app is None:
+            return
+        for obj in (subs.proactive._bridge, subs.proactive._timer, subs.fs):
+            try:
+                if obj.parent() is None and obj.thread() is app.thread():
+                    obj.setParent(app)
+            except RuntimeError:
+                pass
+    except Exception:
+        log.debug("共享子系统 Qt 生命周期过继失败", exc_info=True)

@@ -1234,8 +1234,8 @@ class TestProactiveBudgetPerRequest:
         state = limiter._load_state()
         assert state["count"] == 3
 
-    def test_vision_consumes_budget_each_attempt_and_429_retries_once(self, monkeypatch):
-        """497 回归：429 最多重试 1 次；每一次真实 HTTP 请求前都消耗预算。"""
+    def test_vision_consumes_budget_each_attempt_and_model_access_retries_once(self, monkeypatch):
+        """497 回归：模型访问失败最多重试 1 次；每一次真实 HTTP 请求前都消耗预算。"""
         import urllib.error
         from pet import vision
         from pet.chat.models import ProviderConfig
@@ -1257,7 +1257,7 @@ class TestProactiveBudgetPerRequest:
                 b"fake-jpeg", "code.exe | t", "sys", p,
                 consume_budget=lambda: (consumed.append(1) or True),
             )
-        # 429 只重试 1 次：总共发起 2 次请求
+        # 模型访问失败只重试 1 次：总共发起 2 次请求
         assert len(attempts) == 2
         # 每次真实请求前都消耗一次预算
         assert len(consumed) == 2

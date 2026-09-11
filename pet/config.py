@@ -13,6 +13,12 @@ from pathlib import Path
 from typing import Any
 
 from . import catalog
+from .report_gates import (
+    LEGACY_PERCENT_GATES,
+    LEGACY_SWITCH_GATES,
+    REPORT_GATE_DEFAULTS,
+    clean_report_gates,
+)
 
 
 DEFAULT_ANIMATION_GAP_SECONDS = 0.0
@@ -197,17 +203,13 @@ def _default_agent_link_data() -> dict:
         # 自定义联动 Agent（协议见 docs/AGENT_LINK_PROTOCOL.md §4）：只读监听
         # 用户指定的事件文件，不写外部配置、无需授权弹窗，默认空
         "custom_agents": [],
-        # 联动气泡：开始干活提醒（可选，默认关）、任务完成通知（默认开）
-        "notify_state": False,
-        "notify_done": True,
-        # 过程汇报（可选，默认关）：Agent 干活中报「正在读文件/跑命令/改代码…」
-        "notify_activity": False,
-        # 硬失败提醒（默认开）：DSH 已决定本轮不再继续（重试耗尽/工具最终失败）
-        # 时直接提醒，不经行为分析。与审批/问题（notify_approval）同级。
-        "notify_exec_failed": True,
-        # 卡住检测（建议介入，默认关）：DSH 联动开启时，根据工具成败/超时/错误
+        # 事件气泡触发概率（默认值见 pet/report_gates.py）：设置页把它们收进
+        # 「自动化与联动 → 事件气泡触发概率」下的可折叠框，按事件聚合类别逐类调。
+        # 值是**通过概率** 0.00–1.00（0 = 该类完全不汇报，1 = 全部汇报），没有布尔开关。
+        "report_gates": dict(REPORT_GATE_DEFAULTS),
+        # 卡住检测（默认开）：DSH 联动开启时，根据工具成败/超时/错误
         # 推断「Agent 钻牛角尖了」，档位 1 播焦急动画、档位 2 弹持续提醒气泡。
-        "stuck_detect": False,
+        "stuck_detect": True,
         "stuck_worried_threshold": 3,
         "stuck_intervene_threshold": 5,
         "stuck_window_seconds": 90,
@@ -220,12 +222,12 @@ def _default_agent_link_data() -> dict:
         "exploration_watchdog_early_grace_minutes": 5,
         "exploration_watchdog_long_run_minutes": 10,
         "exploration_watchdog_long_think_seconds": 120,
-        # 行为模式检测（默认关）：双窗口规则识别慢性循环 / 短时爆发 / 纯探索无产出。
+        # 行为模式检测（默认开）：双窗口规则识别慢性循环 / 短时爆发 / 纯探索无产出。
         # 细分类：W10 同类 >= 3 → warning；W10 >= 4 → control；W6 >= 3 → control。
         # 大类：W6 EXPLORATION >= 5 且 ACTION == 0 → control；W10 EXPLORATION >= 7 且
         # ACTION <= 1 → warning。触发后至少新增 pattern_min_steps_between 个 step
         # 且间隔 pattern_cooldown_seconds 秒才允许再次触发（step 去重防止误杀并行调用）。
-        "pattern_detect": False,
+        "pattern_detect": True,
         "pattern_w6_control": 3,
         "pattern_w10_warn": 3,
         "pattern_w10_control": 4,
@@ -314,7 +316,7 @@ def _clean_agent_link_data(raw: Any) -> dict:
     result.update(raw)
     result["custom_agents"] = _clean_custom_agents(raw.get("custom_agents"))
     for key in (
-        "dsh", "claude", "cursor", "opencode", "notify_state", "notify_done", "notify_activity",
+        "dsh", "claude", "cursor", "opencode",
         "sound_enabled", "sound_start_enabled", "sound_done_enabled", "sound_error_enabled",
     ):
         if key in raw:
@@ -329,6 +331,25 @@ def _clean_agent_link_data(raw: Any) -> dict:
         result["sound_cooldown_seconds"] = _float_or_default(
             raw.get("sound_cooldown_seconds"), defaults["sound_cooldown_seconds"], 0.0, 30.0
         )
+    # 事件汇报概率门：新形状（report_gates 字典）优先；旧键一次性迁移——
+    # 布尔开关 → 1.0/0.0，旧百分比 report_probability(0-100) → activity 概率。
+    # 迁移后**不再写出旧键**，配置里不留兼容别名（用户可编辑文案的键名另见
+    # docs/PERSONA-PHRASES-PRESET-STORAGE-2026-09-08.md）。
+    raw_gates = raw.get("report_gates")
+    gates = clean_report_gates(raw_gates)
+    if not isinstance(raw_gates, dict):
+        for legacy_key, gate in LEGACY_SWITCH_GATES.items():
+            if legacy_key in raw:
+                gates[gate] = 1.0 if bool(raw[legacy_key]) else 0.0
+        for legacy_key, gate in LEGACY_PERCENT_GATES.items():
+            if legacy_key in raw:
+                percent = _float_or_default(
+                    raw.get(legacy_key), REPORT_GATE_DEFAULTS[gate] * 100.0, 0.0, 100.0
+                )
+                gates[gate] = min(1.0, max(0.0, percent / 100.0))
+    result["report_gates"] = gates
+    for legacy_key in (*LEGACY_SWITCH_GATES, *LEGACY_PERCENT_GATES):
+        result.pop(legacy_key, None)
     return result
 
 
@@ -585,6 +606,7 @@ class Config:
             # Existing event wording: legacy is deliberately the default.
             "dialogue_mode": "legacy",
             "dialogue_phrases": dict(DEFAULT_DIALOGUE_PHRASES),
+            "dialogue_last_scope": "",  # 台词编辑上次打开的层（""=全局；设置页专属文案入口记忆）
             "mouse_through": False,
             "cursor_hidden_passthrough": True,
             "drag_physics": False,
@@ -604,6 +626,7 @@ class Config:
             "throw_strength": "standard",  # gentle / standard / strong / crazy
             "idle_low_fps_enabled": False,  # 闲置降帧（灰度默认关）：长时间无交互时动画隔帧呈现
             "idle_low_fps_threshold": 30.0,  # 闲置阈值（秒）：超过该时长无交互且窗口可见才降帧
+            "animation_prewarm_enabled": True,  # 动画素材后台预热开关
             "click_show_balance": False,   # 点击显示 DeepSeek 余额
             "click_show_self_talk": False, # 点击随机显示自定义自言自语
             "balance_refresh_minutes": 0,  # DeepSeek 余额自动刷新间隔（分钟，0=关闭）
@@ -617,6 +640,10 @@ class Config:
             "edge_probe_enabled": False,   # 拖到屏幕左右边缘后自动进入探头姿态
             "autostart_wanted": False,     # 用户曾开启过开机自启（用于启动自检：被安全软件清理时提醒）
             "harness_autostart": False,    # 随桌宠启动自动拉起 dsh web 服务（只起服务，不开浏览器）
+            # 手动指定 pnpm 入口（文件 / 目录 / 包装脚本都行，语义同 DSH_PNPM_BIN）。
+            # 默认空 = 走内置的自动发现（PATH/注册表/各版本管理器/多布局）；
+            # 面向"环境特殊又不想改环境变量"的用户，属于开发者向高级键，不进设置页。
+            "pnpm_bin": "",
             "stream_capture_mode": False,  # 直播捕获兼容模式（Windows：Tool 窗口直播姬/OBS 枚举不到）
             "chat_background": "",  # 肥鱼牌小手机背景：空=纯色；builtin:* = 内置主题；否则为图片路径
             "modern_chat_background": "",  # 肥鱼版 DeepSeek 背景：空=纯色；否则为自定义图片路径
@@ -783,6 +810,7 @@ class Config:
             "mouse_through", "cursor_hidden_passthrough", "drag_physics", "context_menu_template",
             "dialogue_mode",
             "dialogue_phrases",
+            "dialogue_last_scope",
             "context_menu_layout",
             "lock_position", "shift_drag", "pet_opacity",
             "context_menu_appearance", "quick_launch_apps",
@@ -793,6 +821,7 @@ class Config:
             "idle_low_fps_enabled", "idle_low_fps_threshold",
             "click_show_balance", "click_show_self_talk",
             "balance_refresh_minutes", "autostart_wanted", "harness_autostart", "stream_capture_mode",
+            "pnpm_bin",
             "music_sing_enabled", "golden_spin_on_click", "golden_spin_direct", "edge_probe_enabled",
             "balance_tier_labels_mode", "balance_tier_label_peak",
             "balance_tier_label_idle", "balance_tier_color_enabled",
@@ -813,6 +842,7 @@ class Config:
             "collision_mass_scale", "collision_impulse_cap",
             "collision_sound_enabled", "collision_sound_volume",
             "media_prewarm",
+            "animation_prewarm_enabled",
             "first_frame_cache_max_mb",
             "predict_prewarm_lead_ms",
             "ffmpeg_recycle_minutes",
@@ -921,6 +951,63 @@ class Config:
                 cleaned[str(key)] = value.strip()[:240]
         return cleaned
 
+    # dialogue 文案占位符迁移表：旧字段名（链路语义曾错位/曾与协议保留字段撞名）
+    # → 新字段名。加载时幂等替换（新文案不含旧占位符即 no-op），只在用户
+    # 自定义 dialogue_phrases 上执行；内置 preset JSON 直接改源文件。
+    _DIALOGUE_PLACEHOLDER_MIGRATIONS = (
+        ("{source}", "{failureType}"),
+        ("{errorText}", "{errorMessage}"),
+    )
+
+    # 事件键改名表：旧事件键（曾按状态码命名）→ 新语义键。内置 preset JSON 直接
+    # 改源文件；用户自定义 dialogue_phrases 里的旧键在加载时迁移一次（幂等）。
+    # 新键已存在时以新配置为准，丢弃旧键（不合并、不留别名）。
+    _DIALOGUE_EVENT_KEY_MIGRATIONS = (
+        ("rate_limit.one", "model_access.one"),
+        ("rate_limit.many", "model_access.many"),
+    )
+
+    @classmethod
+    def _migrate_dialogue_phrase_fields(cls, phrases) -> None:
+        """迁移 dialogue_phrases（global/agents 各层文案）里的旧事件键与旧占位符。
+
+        先按 ``_DIALOGUE_EVENT_KEY_MIGRATIONS`` 改键，再把 list/str 值里的旧占位符
+        替换为新名（``_DIALOGUE_PLACEHOLDER_MIGRATIONS``）。原地修改；对新配置
+        （无旧键、无旧占位符）幂等无副作用。
+        """
+        if not isinstance(phrases, dict):
+            return
+        stack = [phrases]
+        while stack:
+            node = stack.pop()
+            if not isinstance(node, dict):
+                continue
+            for old_key, new_key in cls._DIALOGUE_EVENT_KEY_MIGRATIONS:
+                if old_key not in node:
+                    continue
+                if new_key in node:
+                    node.pop(old_key)  # 新配置优先：同名新键已在，丢弃旧键
+                else:
+                    node[new_key] = node.pop(old_key)
+            for key, value in node.items():
+                if isinstance(value, str):
+                    replaced = value
+                    for old, new in cls._DIALOGUE_PLACEHOLDER_MIGRATIONS:
+                        replaced = replaced.replace(old, new)
+                    if replaced != value:
+                        node[key] = replaced
+                elif isinstance(value, list):
+                    for i, item in enumerate(value):
+                        if not isinstance(item, str):
+                            continue
+                        replaced = item
+                        for old, new in cls._DIALOGUE_PLACEHOLDER_MIGRATIONS:
+                            replaced = replaced.replace(old, new)
+                        if replaced != item:
+                            value[i] = replaced
+                elif isinstance(value, dict):
+                    stack.append(value)
+
     def _normalize_pet_settings(self):
         dialogue_mode = str(self.data.get("dialogue_mode") or "legacy").lower()
         self.data["dialogue_mode"] = dialogue_mode if dialogue_mode in {"legacy", "whale_maid", "custom"} else "legacy"
@@ -942,6 +1029,8 @@ class Config:
         else:
             # 旧单层 {event: [...]}：视为 global
             self.data["dialogue_phrases"] = self._clean_phrase_events(raw_phrases)
+        # 旧占位符迁移（{source}→{failureType} 等；新配置幂等 no-op）
+        self._migrate_dialogue_phrase_fields(self.data.get("dialogue_phrases"))
         from . import physics as physics_mod
 
         self.data["playback_speed"] = _float_or_default(self.data.get("playback_speed"), 1.0, 0.1, 8.0)

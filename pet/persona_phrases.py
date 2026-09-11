@@ -259,10 +259,16 @@ class PhrasePicker:
             return fallback
 
     def custom(self, custom_phrases: dict, key: str, fallback: str, autohide=None, **values) -> str:
-        """Render a custom phrase, rotating through all configured variants."""
-        if not isinstance(custom_phrases, dict):
+        """Render a custom phrase, rotating through all configured variants.
+
+        统一走 ``phrase_for_agent`` 解析（route="" 只读 global 层）：兼容
+        旧扁平 ``{key: [...]}`` 与统一预设双层 ``{global: {key: [...]},
+        agents: …}`` 两种存档结构——后者若只按顶层 ``custom_phrases.get(key)``
+        查会漏掉 global 层文案，让余额气泡等应用级事件误落 fallback。
+        """
+        raw = phrase_for_agent(custom_phrases, "", key)
+        if raw is None:
             return fallback
-        raw = custom_phrases.get(key)
         if isinstance(raw, list):
             variants = [str(item).strip() for item in raw if isinstance(item, str) and item.strip()]
         else:
@@ -302,6 +308,25 @@ class PhrasePicker:
 def phrase_keys() -> tuple[str, ...]:
     """事件词表 = 全部内置预设文案键的并集（按数据文件驱动，无硬编码词表）。"""
     return tuple(sorted({key for phrases in _presets.values() for key in phrases}))
+
+
+# Pet/桥接级「公共事件」：不随具体 Agent 归属，编辑某 Agent 专属文案层时隐藏。
+# dsh.writeback.failed（写回 DSH 失败）属 Agent 操作回写，运行时按 agent_key 路由，
+# 归入 Agent 专属层，不在此集合。
+PUBLIC_DIALOGUE_EVENTS: frozenset[str] = frozenset({
+    "balance.loading", "balance.result",
+    "bridge.install.pending", "bridge.install.success", "bridge.install.failed",
+    "bridge.uninstall.failed", "bridge.unknown",
+})
+
+
+def agent_scoped_event_keys(keys=None):
+    """某 Agent 专属文案层可定制的事件 = 给定事件减去 Pet/桥接级公共事件。
+
+    keys 缺省取全部预设事件；只用于设置页编辑层的事件范围（运行时不受影响）。
+    """
+    base = phrase_keys() if keys is None else list(keys)
+    return [key for key in base if key not in PUBLIC_DIALOGUE_EVENTS]
 
 
 def default_phrases() -> dict[str, str]:

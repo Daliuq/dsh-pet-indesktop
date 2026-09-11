@@ -122,6 +122,12 @@ _MAX_RETIRED_READERS = 1
 # 强制回收最旧退役 reader 时的有界 join 时长（秒）；真实 reader 的 ffmpeg 已被
 # terminate，join 通常在毫秒级返回，此值只作为病态场景（卡死）的上限。
 _RECLAIM_JOIN_TIMEOUT = 0.5
+# cleanup（终结路径）在首次有界 reap 后仍剩存活退役 reader 时的额外总宽限
+# （秒，10ms 步进轮询）：reap 的 0.5s join 在极慢/满载 CI 上偶发不足——reader
+# 的 ffmpeg 已被 terminate、只差线程自身收尾调度，常几十 ms 内退出；这里只给
+# 终结点一个短窗口吸收尾差，仍存活者再交给模块级孤儿注册表持续回收。
+# 只在 cleanup() 生效，stop()/sweep 等热路径不动（GUI 阻塞纪律不变）。
+_CLEANUP_RETIRE_GRACE_S = 2.0
 # 定时 sweep（模块级 _reap_orphaned_clips → _reap_retired 消费）对仍存活退役
 # reader 的 join 时长（秒）。退役 reader 本就 ≤1s 自灭，
 # join 只是加速确认，不该让 GUI 每趟最多垫 0.2s×N（圈末 churn 批量慢死 reader
@@ -949,6 +955,10 @@ class WebMClip(QObject):
         except RuntimeError:
             pass  # QTimer 等 Qt 子对象已随 C++ 侧销毁
         self._reap_retired(join_timeout=_RECLAIM_JOIN_TIMEOUT)
+        if self._retired:
+            # 终端短宽限：吸收「进程已 terminate、线程收尾仅差调度」的尾差，
+            # 降低 cleanup 后仍有存活退役 reader 的偶发概率（满载 CI/macOS）。
+            self._retire_grace_wait()
         if self._retired or self._has_unconfirmed_procs():
             # 仍存活 reader 或未确认退出的首帧进程：保持模块级持有，由管理器
             # 继续回收/补杀（批 6-8b 收尾：_unconfirmed_procs 非空也必须留
@@ -956,6 +966,23 @@ class WebMClip(QObject):
             _register_orphan(self)
         else:
             _unregister_orphan(self)
+
+    def _retire_grace_wait(self, grace: float = _CLEANUP_RETIRE_GRACE_S) -> None:
+        """cleanup 终结路径专用：短步进轮询等存活退役 reader 收尾。
+
+        非热路径（stop()/sweep 已退出的 reader 本就 ≤1s 自灭，不需要也不应
+        为此垫 GUI 阻塞）。仅在 cleanup 首次 reap 后仍有存活者时调用：
+        每轮 join(0.05) 唤醒调度 + reap(0) 清已退出记录，直到退役池清空或
+        总宽限耗尽；仍存活者由调用方继续交给孤儿注册表 sweep 回收。
+        """
+        deadline = time.monotonic() + grace
+        while self._retired and time.monotonic() < deadline:
+            for r in list(self._retired):
+                try:
+                    r.thread.join(timeout=0.05)
+                except Exception:
+                    pass
+            self._reap_retired(join_timeout=0)
 
     def _reap_retired(self, join_timeout: float) -> None:
         """回收退役池：丢弃已确认退出的记录；对仍存活者有界 join；仍不退出

@@ -306,6 +306,11 @@ class ExplorationWatchdog(QObject):
                     state["current"].think_active = False
             return
         if event == "user/message":
+            # agent.inject() 注入上下文（sourceKind=plugin）不是真人目标：
+            # 忽略，否则每轮 4-5 条 system-reminder/技能目录记录会把 goal 冲成
+            # 注入文案，探索看门狗据此误判「对话目标」。
+            if str(record.get("sourceKind") or "") == "plugin":
+                return
             goal = _text(record.get("text") or record.get("content") or record.get("summary"), 1200)
             now = time.monotonic()
             with self._lock:
@@ -352,7 +357,7 @@ class ExplorationWatchdog(QObject):
             current.details.append({k: _text(record.get(k), 500) for k in (
                 "event", "tool", "toolName", "argsKey", "target", "filePath",
                 "path", "pattern", "query", "command", "text", "summary",
-                "resultSummary", "evidence", "errorText", "ok", "timeout",
+                "resultSummary", "evidence", "errorMessage", "ok", "timeout",
             ) if record.get(k) is not None})
             if cls in _EXPLORATION and event in {"tool/call", "command/run", "tool-workflow/run-start",
                          "exec_command_begin", "mcp_tool_call_begin"}:
@@ -374,7 +379,7 @@ class ExplorationWatchdog(QObject):
             else:
                 current.think_active = False
             if event.endswith("result") or event.endswith("end"):
-                current.evidence = _text(record.get("evidence") or record.get("resultSummary") or record.get("errorText"), 200)
+                current.evidence = _text(record.get("evidence") or record.get("resultSummary") or record.get("errorMessage"), 200)
                 current.evidence_new = str(record.get("evidenceStatus") or "") == "new"
             if len(state["steps"]) > 20:
                 state["steps"].popitem(last=False)

@@ -182,7 +182,7 @@ sessionId, sessionName, turn?, step?, event, data, callId?, requestId?
 | `tool/result` | `tool/result` | `tool`, `target`, `ok`, `callId` | 工具结果 |
 | `assistant/message` | `assistant/message` | `text`, `sessionId` | 消息和行为分析 |
 | `agent/request-error` | `agent/request-error` | 错误字段、`sessionId` | 模型请求错误 |
-| 限流 / LLM 错误 | `rate_limit` / `llm_error` | `errorCode`, `sessionId` | Pet 错误提醒 |
+| 模型访问失败（429）/ LLM 错误 | `model_access` / `llm_error` | `errorCode`, `sessionId` | Pet 错误提醒 |
 | `execution/failed` | `execution/failed` | `errorCode`, `sessionId` | 硬失败提醒 |
 
 当前尚未映射：`cordis/request-run`、`cordis/request-run-resolved`。这是动态 Cordis
@@ -250,7 +250,7 @@ raw_record = Signal(str, object)       # agent_key, raw record
 normalized_event = Signal(object)       # SemanticEvent
 execution_failed = Signal(str, object)
 session_meta = Signal(str, object)
-rate_limit = Signal(str, object)
+model_access = Signal(str, object)
 llm_error = Signal(str, object)
 user_action = Signal(str, object)
 ```

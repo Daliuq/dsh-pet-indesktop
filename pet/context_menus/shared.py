@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QMenu
 from .. import autostart as autostart_mod
 from .. import catalog
 from ..harness_launcher import launch_harness_gui
+from ..report_gates import REPORT_GATE_DEFAULTS
 from ..updater import QUARK_PAN_URL, REPO_URL
 from .icons import fitted_pet_pixmap_icon, pet_avatar_menu_icon, vector_menu_icon
 from .menu_styles.common import inherit_menu_style
@@ -351,83 +352,25 @@ def add_agent_link_menu(menu: QMenu, pet) -> None:
         act.setChecked(bool(agent_cfg.get(key, False)))
         act.toggled.connect(lambda on, k=key, a=act: pet.toggle_agent_link(k, on, a))
     sub.addSeparator()
-    for opt_key, opt_label in (
-        ('notify_state', '开始干活气泡提醒'),
-        ('notify_done', '任务完成气泡提醒'),
-        ('notify_activity', '过程汇报气泡（正在读文件/跑命令…）'),
+    # 事件气泡触发概率：与设置页「事件气泡触发概率」同一份数据（agent_link.report_gates）。
+    # 菜单只做 0/1 两端快捷入口（勾选=1.0 全报，取消=0.0 静音），细粒度概率
+    # 由设置页滑块决定；勾选态按当前概率是否 > 0 呈现，并提示当前值。
+    gate_cfg = agent_cfg.get('report_gates')
+    if not isinstance(gate_cfg, dict):
+        gate_cfg = {}
+    for gate_key, opt_label in (
+        ('state', '开始干活气泡提醒'),
+        ('done', '任务完成气泡提醒'),
+        ('activity', '过程汇报气泡（正在读文件/跑命令…）'),
     ):
+        probability = float(gate_cfg.get(gate_key, REPORT_GATE_DEFAULTS[gate_key]) or 0.0)
         act = sub.addAction(opt_label)
         act.setCheckable(True)
-        act.setChecked(bool(agent_cfg.get(opt_key, opt_key == 'notify_done')))
-        act.toggled.connect(lambda on, k=opt_key: pet.set_agent_link_option(k, on))
-
-    # ---- 卡住检测配置子菜单（开关 + 阈值/窗口/冷却/文案）----
-    sub.addSeparator()
-    stuck = add_submenu(sub, "卡住检测", None)
-    act = stuck.addAction("启用卡住检测（钻牛角尖时建议人工介入）")
-    act.setCheckable(True)
-    act.setChecked(bool(agent_cfg.get('stuck_detect', False)))
-    act.toggled.connect(lambda on: pet.set_agent_link_option('stuck_detect', on))
-    stuck.addSeparator()
-    _add_stuck_config_rows(stuck, pet, agent_cfg)
-
-    # ---- Exploration Loop Watchdog（开关 + 模式 + 风险/冷却参数）----
-    sub.addSeparator()
-    pattern = add_submenu(sub, "循环检测", None)
-    act = pattern.addAction("启用循环检测（识别重复 Search/Read/Think）")
-    act.setCheckable(True)
-    act.setChecked(bool(agent_cfg.get('exploration_watchdog_enabled', True)))
-    act.toggled.connect(lambda on: pet.set_agent_link_option('exploration_watchdog_enabled', on))
-    pattern.addSeparator()
-    _add_pattern_config_rows(pattern, pet, agent_cfg)
-
-
-def _add_stuck_config_rows(stuck: QMenu, pet, agent_cfg: dict) -> None:
-    """卡住检测参数行：显示当前值，点击弹输入框编辑（阈值/窗口/冷却/文案）。"""
-    def _int_row(key: str, label: str, unit: str, default: int, minimum: int, maximum: int) -> None:
-        current = agent_cfg.get(key, default)
-        try:
-            current = int(current)
-        except (TypeError, ValueError):
-            current = default
-        act = stuck.addAction(f"{label}：{current} {unit}")
-        act.triggered.connect(
-            lambda _=False, k=key, lb=label, un=unit, df=default, mn=minimum, mx=maximum:
-            pet.edit_agent_link_int(k, lb, un, df, mn, mx)
+        act.setChecked(probability > 0.0)
+        act.setToolTip(
+            f"当前通过概率 {probability:.2f}；设置页「事件气泡触发概率」可逐类调 0.00–1.00"
         )
-
-    def _text_row(key: str, label: str) -> None:
-        act = stuck.addAction(label)
-        act.triggered.connect(lambda _=False, k=key, lb=label: pet.edit_agent_link_text(k, lb))
-
-    _int_row('stuck_worried_threshold', '担忧动画阈值', '分', 3, 1, 20)
-    _int_row('stuck_intervene_threshold', '介入提醒阈值', '分', 5, 2, 50)
-    _int_row('stuck_window_seconds', '滑动窗口', '秒', 90, 10, 3600)
-    _int_row('stuck_cooldown_seconds', '提醒冷却', '秒', 300, 10, 7200)
-    stuck.addSeparator()
-    _text_row('stuck_reminder_text', '自定义提醒文案…')
-
-
-def _add_pattern_config_rows(pattern: QMenu, pet, agent_cfg: dict) -> None:
-    """行为模式检测参数行：显示当前值，点击弹输入框编辑（双窗口阈值/step/冷却）。"""
-    def _int_row(key: str, label: str, unit: str, default: int, minimum: int, maximum: int) -> None:
-        current = agent_cfg.get(key, default)
-        try:
-            current = int(current)
-        except (TypeError, ValueError):
-            current = default
-        act = pattern.addAction(f"{label}：{current} {unit}")
-        act.triggered.connect(
-            lambda _=False, k=key, lb=label, un=unit, df=default, mn=minimum, mx=maximum:
-            pet.edit_agent_link_int(k, lb, un, df, mn, mx)
-        )
-
-    _int_row('exploration_watchdog_warning_threshold', 'Warning threshold', '分', 3, 1, 20)
-    _int_row('exploration_watchdog_control_threshold', 'Control threshold', '分', 5, 1, 30)
-    _int_row('exploration_watchdog_cooldown_steps', 'Cooldown steps', '步', 3, 1, 20)
-    _int_row('exploration_watchdog_early_grace_minutes', '早期宽限', '分钟', 5, 1, 30)
-    _int_row('exploration_watchdog_long_run_minutes', '长时间运行', '分钟', 10, 2, 240)
-    _int_row('exploration_watchdog_long_think_seconds', '单次超长 Think', '秒', 120, 10, 1800)
+        act.toggled.connect(lambda on, k=gate_key: pet.set_agent_link_option(k, on))
 
 
 def build_size_menu(menu: QMenu, pet, *, icons: bool = True) -> QMenu:

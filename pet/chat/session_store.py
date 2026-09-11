@@ -25,6 +25,7 @@ import os
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from pathlib import Path
 
 from .models import ChatSession, utc_now
@@ -35,8 +36,19 @@ log = logging.getLogger("dsh-pet-standalone")
 class _AsyncWriter:
     """每个会话目录一个串行写盘 worker（同目录的多个 SessionStore 共享）。"""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self, root: Path, *, write: Callable[[Path, bytes], None] | None = None,
+    ) -> None:
+        """write = 落盘实现（默认 `_atomic_write`），构造时注入。
+
+        为什么要有这个参数：worker 一旦被唤醒就**立刻**落盘，没有批延迟。
+        因此「先提交、后替换模块全局 `_atomic_write`」的测试写法本身有竞态——
+        高负载下 worker 可能先用原函数写完并清空待写项，测试再也等不到自己
+        那一次写盘（CI 上表现为「卡住的写盘未在时限内开始」）。构造时注入
+        则保证 worker 的**第一次**写盘就是注入的那一次，无时序假设。
+        """
         self.root = root
+        self._write = write or _atomic_write
         self._cond = threading.Condition()
         self._pending: OrderedDict[Path, bytes | None] = OrderedDict()  # None = 删除
         self._submitted = 0
@@ -141,7 +153,7 @@ class _AsyncWriter:
                     path.unlink(missing_ok=True)
                     _fsync_dir(path.parent)
                 else:
-                    _atomic_write(path, payload)
+                    self._write(path, payload)
             except Exception:
                 log.exception("会话写盘失败: %s", path)
                 with self._cond:
@@ -226,7 +238,17 @@ class _WriterRegistry:
     实际落盘仍由 `_AsyncWriter` 的串行 worker 线程执行。
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self, writer_factory: Callable[[Path], _AsyncWriter] | None = None,
+    ) -> None:
+        """writer_factory = writer 构造器（默认 `_AsyncWriter`，即生产路径）。
+
+        留这个参数是为了让测试**构造期**注入写盘实现（见 `_AsyncWriter.__init__`
+        的 write 参数）：注册表是 per-root 共享 writer 的唯一入口，只有在这里
+        注入才能保证「第一次写盘就是被控制的那一次」，避免事后替换模块全局
+        带来的时序竞态。生产默认值不变。
+        """
+        self._writer_factory = writer_factory or _AsyncWriter
         self._writers: dict[Path, _AsyncWriter] = {}
         self._lock = threading.Lock()
         self._shutdown = False
@@ -271,7 +293,7 @@ class _WriterRegistry:
             # 不复活正在关闭的 writer：让 submit 走「拒绝可观测」路径；
             # 测试/重开场景先 close_all() 清注册表，下一次提交自然建新实例。
             if w is None:
-                w = _AsyncWriter(root)
+                w = self._writer_factory(root)
                 self._writers[root] = w
             return w
 

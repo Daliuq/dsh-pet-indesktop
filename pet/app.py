@@ -59,6 +59,15 @@ from .persona_phrases import PhrasePicker
 
 _persona_pickers = weakref.WeakKeyDictionary()
 
+# 存活 AppShell 注册表（测试收口用，与 collision_ipc._live_sessions /
+# agent_link._LIVE_AGENT_LINK_MANAGERS 同一纪律）。多窗共享子系统与待办服务
+# 持有无主 QTimer（`QTimer()` + timeout.connect），其连接从 Qt C++ 侧强引用
+# 住整个 shell 对象图，Python 的 gc.collect() 回收不掉；解释器退出时的 GC
+# 才最终化这些 Qt 对象 → 原生访问违规（Windows 0xC0000005，崩溃点落在
+# "Garbage-collecting / <no Python frame>"）。WeakSet 只弱引用 shell 本身，
+# 测试收口时逐对象停表并释放反向引用。
+_LIVE_SHELLS: "weakref.WeakSet" = weakref.WeakSet()
+
 
 class _BackgroundResult(QObject):
     done = Signal(bool, object)
@@ -106,7 +115,10 @@ def _persona_text(win, key: str, fallback: str, **values) -> str:
     mode = str(cfg.get("dialogue_mode", "legacy") or "legacy")
     picker = _persona_picker(win)
     if mode == "custom":
-        return picker.custom(cfg.get("dialogue_phrases", {}), key, fallback, **values)
+        text = picker.custom(cfg.get("dialogue_phrases", {}), key, fallback, **values)
+        # 与内置模式同语义：未命中自定义文案时回退并填充占位符（含 {text} 等）。
+        # 此前直接 return 会把未格式化的 fallback 露出字面量 {…}。
+        return fallback.format(**values) if text is fallback else text
     # legacy / whale_maid：命中内置 JSON 预设即渲染，未命中回退调用方原文案
     text = picker.get(mode, key, fallback, **values)
     return fallback.format(**values) if text is fallback else text
@@ -927,6 +939,12 @@ class AppShell:
         self._balance_bridge = None
         self._on_about_to_quit_connected = False
         self._dsh_state_tracker = DshStateTracker(config.dir)
+        # 订阅 DSH 统一状态（d04fc10 曾接线，post-merge 重构时丢失，本分支恢复）：
+        # 收敛出的 thinking → 联动管线补 legacy 没有的思考气泡/对话开始反应；
+        # offline → 收掉已失效的常驻审批/问题气泡。真人消息经 user_message
+        # 信号做与状态边沿竞态解耦的稳定触发。
+        self._dsh_state_tracker.state_changed.connect(self._on_dsh_state_changed)
+        self._dsh_state_tracker.user_message.connect(self._on_dsh_user_message)
         self._balance_timer = QTimer()
         self._balance_timer.timeout.connect(self.show_balance)
         self._update_bridge = None
@@ -972,6 +990,7 @@ class AppShell:
             from .multi_window_shared import SharedSubsystems
 
             self._shared = SharedSubsystems(self)
+        _LIVE_SHELLS.add(self)
 
     @property
     def enable_chat(self) -> bool:
@@ -1109,6 +1128,42 @@ class AppShell:
 
         threading.Thread(target=_run, daemon=True, name="pet-harness-autostart").start()
 
+    # ------------------------------------------------------------ DSH 状态接线
+    def _dsh_link_manager(self):
+        """当前主窗的 Agent 联动管理器（无窗/未创建时为 None）。"""
+        win = self.win
+        if win is None:
+            return None
+        return getattr(win, "agent_link_manager", None)
+
+    def _on_dsh_state_changed(self, from_state: str, to_state: str) -> None:
+        """订阅 DSH 统一状态变化（d04fc10 原设计，post-merge 丢失后恢复）。
+
+        - offline：DSH 断开/重启，审批/问题等阻塞交互必然失效，收掉常驻气泡；
+        - thinking：legacy AgentStatus 基线只有 working/idle（bridge 设计），
+          thinking 由 dsh_state 收敛后经联动管线补思考气泡/动画——对话开始的
+          稳定触发点之一（与真人消息双保险，呈现管线自带同态去重）。
+        """
+        if to_state == "offline":
+            alm = self._dsh_link_manager()
+            if alm is not None and hasattr(alm, "dismiss_all_interactions"):
+                alm.dismiss_all_interactions()
+            return
+        if to_state == "thinking":
+            alm = self._dsh_link_manager()
+            if alm is not None:
+                alm.notify_dsh_state("thinking")
+
+    def _on_dsh_user_message(self, session_id: str, text: str) -> None:
+        """真人消息 = 对话开始：与状态边沿竞态解耦的稳定触发点。
+
+        sourceKind 过滤已在 dsh_state 完成——只有真人输入（含旧版桥接记录
+        无字段的兼容）发本信号；agent.inject() 注入上下文不会到这里。
+        """
+        alm = self._dsh_link_manager()
+        if alm is not None:
+            alm.notify_dsh_state("thinking")
+
     # ------------------------------------------------------------ 退出收口
     def _on_about_to_quit(self) -> None:
         """退出前保存各窗位置并释放资源（全进程「全部退出」语义，R5 切分）。
@@ -1192,6 +1247,45 @@ class AppShell:
             self._decode_hub.stop_all()
         except Exception:
             logging.exception("退出时关闭共享解码 hub 失败")
+
+    @classmethod
+    def _shutdown_live_for_tests(cls) -> None:
+        """收口测试直接创建、未走 aboutToQuit 的 AppShell（对齐 agent_link 同族防线）。
+
+        只做 Qt 生命周期释放，不改业务状态：
+        - 停待办提醒服务定时器（其 ``_app`` 反向强引用 shell，且无主 QTimer 的
+          timeout 连接从 Qt C++ 侧强引用住整个对象图，Python gc 回收不掉）；
+        - 共享子系统经 ``SharedSubsystems._shutdown_live_for_tests`` 收口；
+        - 断开 shell → app 的 aboutToQuit 连接并释放反向引用。
+
+        不做 ``_on_about_to_quit`` 的退出语义（保存位置/永久关闭写盘 worker）：
+        那是「全部退出」，测试收口不得触发。
+        """
+        for shell in tuple(_LIVE_SHELLS):
+            try:
+                service = getattr(shell, "todo_service", None)
+                if service is not None:
+                    try:
+                        service.stop()
+                    except Exception:
+                        logging.debug("测试收口待办服务失败", exc_info=True)
+                    shell.todo_service = None
+                if getattr(shell, "_shared", None) is not None:
+                    shell._shared.stop_all()
+                if getattr(shell, "instance", None) is not None:
+                    win = getattr(shell.instance, "win", None)
+                    lib = getattr(win, "lib", None)
+                    if lib is not None:
+                        lib.pause_warm()
+                if getattr(shell, "_on_about_to_quit_connected", False):
+                    try:
+                        shell.app.aboutToQuit.disconnect(shell._on_about_to_quit)
+                    except (RuntimeError, TypeError):
+                        pass
+                    shell._on_about_to_quit_connected = False
+                shell._instances = []
+            except Exception:
+                logging.debug("测试收口 AppShell 失败", exc_info=True)
 
     def _on_shared_fullscreen(self, hit: bool) -> None:
         """批5.2a：共享全屏 watcher 广播 → 扇出到各窗的 _on_fullscreen_changed。

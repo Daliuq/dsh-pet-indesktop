@@ -144,7 +144,8 @@ def _is_timeout(record: dict) -> bool:
     """判断一条事件是否涉及超时。"""
     if record.get("timeout"):
         return True
-    for key in ("errorText", "errorMessage", "errorCode"):
+    # 错误正文统一在 errorMessage（tool/result 与 llm/retry 等一致）
+    for key in ("errorMessage", "errorCode"):
         val = str(record.get(key, "") or "")
         if _TIMEOUT_RE.search(val):
             return True
@@ -157,17 +158,12 @@ def _error_code_fingerprint(record: dict) -> str:
     if ec:
         return ec
     # 从错误文本中提取常见错误码模式
-    et = str(record.get("errorText", "") or "")
+    et = str(record.get("errorMessage", "") or "")
     m = re.search(r"\b(ECONNREFUSED|ECONNRESET|EAI_AGAIN|ETIMEDOUT|"
                   r"ESOCKETTIMEDOUT|ENOTFOUND|EACCES|EPERM|ENOENT|"
                   r"HTTP_4\d{2}|HTTP_5\d{2}|4\d{2}|5\d{2})\b", et, re.IGNORECASE)
     if m:
         return m.group(1).upper()
-    for key in ("errorMessage",):
-        val = str(record.get(key, "") or "")
-        m = re.search(r"\b(4\d{2}|5\d{2})\b", val)
-        if m:
-            return m.group(1)
     return ""
 
 
@@ -188,8 +184,8 @@ class ToolEvent:
         self.ok = bool(record.get("ok", True))
         self.duration_ms = record.get("durationMs")  # may be None
         self.error_code = str(record.get("errorCode", "") or "")
-        # errorText（tool/result）或 errorMessage（agent/request-error / llm/retry）
-        self.error_text = str(record.get("errorText") or record.get("errorMessage") or "")
+        # 错误正文统一在 errorMessage（tool/result 与 agent/request-error / llm/retry 一致）
+        self.error_text = str(record.get("errorMessage") or "")
         self.is_timeout = _is_timeout(record)
         self.event_type = str(record.get("event", "") or "")
 
@@ -419,7 +415,7 @@ class StuckDetector(QObject):
         # 检查最近的失败是否共享同一错误码指纹，且无成功间隔
         if len(failures) >= 3:
             recent_fails = failures[-3:]
-            fps = [_error_code_fingerprint({"errorCode": e.error_code, "errorText": e.error_text})
+            fps = [_error_code_fingerprint({"errorCode": e.error_code, "errorMessage": e.error_text})
                    for e in recent_fails]
             # 检查是否有至少 3 个相同的非空指纹
             from collections import Counter

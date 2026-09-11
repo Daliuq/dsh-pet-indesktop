@@ -220,7 +220,7 @@ def test_dialogue_key_params_match_runtime_call_sites():
     assert "target" not in DIALOGUE_KEY_PARAMS["activity.read"]
     assert "ok" not in DIALOGUE_KEY_PARAMS["activity.read"]
     assert {"errorCode", "errorMessage", "consecutiveRetryCount", "retry"} <= set(
-        DIALOGUE_KEY_PARAMS["rate_limit.one"])
+        DIALOGUE_KEY_PARAMS["model_access.one"])
     assert DIALOGUE_KEY_PARAMS["dsh.writeback.failed"] == ()
 
 
@@ -289,7 +289,7 @@ def test_automation_domain_name_stays_stable(qapp, tmp_path):
     """automation 域顶层导航保持「自动化与联动」；域内非 Agent 组保留。
 
     ticket 03（撤销改名）：旧设置回归测试锁定侧边栏文案，域名不改为
-    「Agent 联动」——迁移只作用于域内组名（Agent 联动文案风格）。
+    「Agent 联动」——迁移只作用于域内组名（文案风格与模板 / 事件气泡触发概率）。
     """
     from pet.settings_widgets import SETTINGS_DOMAIN_NAV
 
@@ -420,6 +420,40 @@ def test_import_dialogue_template_with_agents_populates_scopes(qapp, tmp_path, m
         dialog.deleteLater()
 
 
+def test_dialogue_agent_scope_restore_and_public_rows_hidden(qapp, tmp_path):
+    """设置页：记住上次编辑层并在 Agent 层隐藏公共事件行。
+
+    回归（ticket 08 UX）：打开设置默认停在 global、用户已配的 Agent 专属文案
+    看不到（显得“设置无效”）；切到 Agent 层时仍列出余额/桥接等公共事件，
+    而这些事件运行时并不走 agents 层。
+    """
+    from pet.modern_settings_dialog import ModernSettingsDialog, SettingRow
+
+    cfg = Config(tmp_path / "appdata08")
+    cfg.set("dialogue_mode", "custom")
+    cfg.set("dialogue_phrases", {
+        "global": {"start": ["全局 start"]},
+        "agents": {"dsh": {"start": ["DSH start"], "thinking": ["DSH thinking"]}},
+    })
+    cfg.set("dialogue_last_scope", "dsh")
+    dialog = ModernSettingsDialog(cfg, include_ai=False)
+    try:
+        # 恢复上次编辑层：下拉停在 dsh，编辑框载入该层专属文案
+        assert dialog.dialogue_scope_select.currentData() == "dsh"
+        assert dialog.dialogue_phrase_edits["start"].toPlainText() == "DSH start"
+        # Agent 层隐藏公共事件行；Agent 事件行可见
+        public_row = dialog.findChild(SettingRow, "settingRow_dialogue_balance.result")
+        agent_row = dialog.findChild(SettingRow, "settingRow_dialogue_start")
+        assert public_row is not None and public_row.isHidden()
+        assert agent_row is not None and not agent_row.isHidden()
+        # 切回全局：载入全局文案且公共事件行恢复显示
+        dialog.dialogue_scope_select.setCurrentData("")
+        assert dialog.dialogue_phrase_edits["start"].toPlainText() == "全局 start"
+        assert public_row.isHidden() is False
+    finally:
+        dialog.deleteLater()
+
+
 def test_export_dialogue_template_mentions_agents_separator(qapp, tmp_path):
     """导出模板结构：顶层 phrases 为 global 参考，新增 agents 占位说明不影响导出。"""
     import json as json_mod
@@ -428,10 +462,20 @@ def test_export_dialogue_template_mentions_agents_separator(qapp, tmp_path):
     dialog = ModernSettingsDialog(cfg, include_ai=False)
     try:
         data = dialog._current_dialogue_template()
-        # 导出仍是纯字段参考模板：phrases 留空；不强制含 agents（既有导出契约）
+        # 导出仍是纯字段参考模板：phrases 留空；含 agents 专属配置脚手架
         assert all(not v for v in data["phrases"].values())
         text = json_mod.dumps(data, ensure_ascii=False)
         assert "persona-phrases/v1" in text
+        agents = data.get("agents", {})
+        assert agents, "导出模板应含 agents 专属配置脚手架"
+        for agent_events in agents.values():
+            assert set(agent_events) == set(data["phrases"])
+            assert all(not v for v in agent_events.values())
+        # entries.description 给出一句话语义，不再是 key 占位（AI 可读）
+        assert any(
+            entry["description"] and entry["description"] != entry["key"]
+            for entry in data["entries"]
+        )
     finally:
         dialog.deleteLater()
 

@@ -76,6 +76,10 @@
 - **「随桌宠启动 dsh 服务」开关**：配置键 `harness_autostart`（默认关）——开机自启场景下主窗就绪即后台拉起 dsh web（只起服务、不开浏览器、不弹窗口）；设置 → 常规 → 应用启动新增开关，仅主桌宠可设置，slot 落种不继承。
 - **dsh 启动链路静默化（#82）**：所有探测子进程隐藏窗口（`CREATE_NO_WINDOW`，去掉 `cmd /c start /b` 与 `DETACHED_PROCESS` 组合——实测会弹常驻终端）；`--no-open` 能力探测三级缓存（进程内 dict → 落盘 `harness_probe_cache.json`，按 `dsh --version` 匹配 → 慢探测），超时放宽到 30s——修复开机高负载下误判导致 dsh 自弹浏览器（issue #10 根因）。
 - **macOS Node 解析**：新增桌面安全 Node 解析器（`pet/node_runtime.py`），Harness 与 Agent bridge 共用，增强 PATH 传播给 npm/pnpm——修复 Finder 双击启动绕过 Homebrew Node 发现（issue #67）。
+- **Windows Node/pnpm 解析不再写死**（issue：桌宠报「需要 pnpm，自动安装失败」）：
+  - 增强 PATH 补上 Windows 分支：进程 PATH 优先 → 注册表里**最新**的 PATH（GUI 进程继承的是登录时缓存的环境块）→ 各版本管理器真实目录（nvm-windows `%NVM_HOME%\v*` / `%NVM_SYMLINK%`、`%PNPM_HOME%`、`%APPDATA%\npm`、Volta/fnm/scoop/choco/bun/yarn、`%ProgramFiles%\nodejs`）；POSIX 侧补 `PNPM_HOME`、`$NVM_DIR`、fnm/volta/asdf/linuxbrew。
+  - 桥接安装的 pnpm 入口从「只认 `node_modules/pnpm/bin/pnpm.mjs`」改为多布局发现：解析 `.cmd/.ps1`/shell 包装脚本里的真实 JS 入口（`pnpm ≤10` 的 `bin/pnpm.cjs`、`lib/node_modules/...`、nvm 版本目录）、独立安装的 `pnpm.exe` 直接执行、`DSH_PNPM_BIN` 支持指向目录/可执行文件；`npm-cli.js` 同样复用这套根目录。
+  - 一键启动 DSH 的全局包根目录（`@deepseek-ai/dsh/lib/bin.js`）在 Windows 上补上 nvm-windows 等目录，不再只认 `%APPDATA%\npm`。
 
 ### 2.7 待办提醒（#72）
 
@@ -164,6 +168,8 @@
 - 架构红线机器化（`tests/test_architecture.py`）：纯逻辑层不依赖 Qt、解码链单向依赖、`PetWindow` 私有面冻结、window.py/设置对话框行数预算；孤儿簇守卫（存在且零引用 = 红）。
 - 配置键纪律：普通顶层键三处登记（默认值 + reload 白名单 + schema 快照）；特例键走迁移路径。
 - PR 门禁 CI（`pr-test.yml`）：三平台 pytest offscreen + ruff（此前 PR 无门禁）；时序 flake 家族隔离（webm 生命周期族、rapid_start_stop、低优预热让路族）并按需一次重跑；CI 成本纪律写入 AGENTS.md。
+- 时序用例确定性（09-10）：`session_store` 的写盘实现改为**构造期注入**（`_AsyncWriter(root, *, write=...)` / `_WriterRegistry(writer_factory=...)`，生产默认不变），`test_close_total_blocking_time_bounded_by_timeout` 不再事后替换模块全局——worker 被唤醒即落盘，事后替换在高负载下会让「等它进入卡住的写盘」永远等不到（CI 曾以「卡住的写盘未在时限内开始」误报）。
+- 环境发现补完（09-10，issue 双现场）：nvm 自定义根 `~/nvm`（无点号；GUI 启动拿不到 shell 的 `NVM_DIR`）与 nvm-windows 默认 `%APPDATA%\nvm` 兜底；package.json 坏依赖路径**实修**（能唯一确定的坏 spec 自动改写 + 备份 `package.json.bak-*` + pnpm 重试一次，lockfile 由 pnpm 重生成）；新增 `pnpm_bin` 配置键（优先级 config → `DSH_PNPM_BIN` → 自动发现，配错只回落不致命，面向"环境特殊又不想改环境变量"的开发者）。
 - 死代码清理（-1300+ 行）：孤儿簇整删（settings_widgets 等 715 行文件、3 个 QSS）、零引用符号、旧 onefile 缓存清理脚本等。
 - docs 体系：HANDOVER_2026-09、WINDOW_PY_SPLIT_GUIDE、SETTINGS 系列、PHASE3 调研稿、内存测量档案。
 
