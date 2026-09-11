@@ -23,10 +23,12 @@ test.before(async () => {
 
 test.beforeEach(() => {
   q.pendingQuestionCallIds.clear();
+  q.pendingQuestionRpcPairs.clear();
+  q.pendingQuestionOrder.clear();
 });
 
-test("mux question/requested 帧按会话反查补写 callId", () => {
-  q.pendingQuestionCallIds.add(q.questionCallIdentity("call-9", "sess-1"));
+test("mux question/requested 帧按会话 FIFO 补写 callId", () => {
+  q.registerQuestionCall("call-9", "sess-1");
   const rec = q.muxQuestionRequestedRecord("rpc-7", {
     sessionId: "sess-1",
     questions: [{ id: "q1", question: "选择？" }],
@@ -42,7 +44,8 @@ test("mux question/requested 帧按会话反查补写 callId", () => {
 });
 
 test("mux question/resolved 帧同样补写 callId", () => {
-  q.pendingQuestionCallIds.add(q.questionCallIdentity("call-9", "sess-1"));
+  q.registerQuestionCall("call-9", "sess-1");
+  q.muxQuestionRequestedRecord("rpc-7", { sessionId: "sess-1", questions: [] });
   const rec = q.muxQuestionResolvedRecord("rpc-7", { sessionId: "sess-1", outcome: "answered" });
   assert.equal(rec.event, "question/resolved");
   assert.equal(rec.rpcId, "rpc-7");
@@ -50,9 +53,33 @@ test("mux question/resolved 帧同样补写 callId", () => {
 });
 
 test("反查限定同一会话，不把别的会话的 callId 串到本帧", () => {
-  q.pendingQuestionCallIds.add(q.questionCallIdentity("call-9", "sess-1"));
+  q.registerQuestionCall("call-9", "sess-1");
   const rec = q.muxQuestionRequestedRecord("rpc-8", { sessionId: "sess-2", questions: [] });
   assert.equal(rec.callId, "", "不得跨会话挂 callId");
+});
+
+test("同会话多问题按 FIFO 配对：每帧拿到自己那份 callId", () => {
+  q.registerQuestionCall("call-a", "sess-1");
+  q.registerQuestionCall("call-b", "sess-1");
+  const recA = q.muxQuestionRequestedRecord("rpc-a", { sessionId: "sess-1", questions: [] });
+  const recB = q.muxQuestionRequestedRecord("rpc-b", { sessionId: "sess-1", questions: [] });
+  assert.equal(recA.callId, "call-a");
+  assert.equal(recB.callId, "call-b", "第二个帧不得再拿到最旧的 call-a（C3）");
+  const resA = q.muxQuestionResolvedRecord("rpc-a", { sessionId: "sess-1", outcome: "answered" });
+  const resB = q.muxQuestionResolvedRecord("rpc-b", { sessionId: "sess-1", outcome: "answered" });
+  assert.equal(resA.callId, "call-a");
+  assert.equal(resB.callId, "call-b", "resolved 帧按 rpcId 取回各自的 callId");
+});
+
+test("resolved 取回配对后即清理；forget 同步清出队条目", () => {
+  q.registerQuestionCall("call-a", "sess-1");
+  q.muxQuestionRequestedRecord("rpc-a", { sessionId: "sess-1", questions: [] });
+  q.muxQuestionResolvedRecord("rpc-a", { sessionId: "sess-1", outcome: "answered" });
+  assert.equal(q.pendingQuestionRpcPairs.size, 0, "resolved 是终态，配对取回即清");
+  q.registerQuestionCall("call-c", "sess-1");
+  q.forgetQuestionCall("call-c", "sess-1");
+  const queue = q.pendingQuestionOrder.get("sess-1") || [];
+  assert.ok(!queue.includes("call-c"), "resolveQuestion 经 forget 同步清出队条目");
 });
 
 test("帧自带 callId 时原样保留", () => {

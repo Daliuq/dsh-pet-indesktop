@@ -506,6 +506,22 @@ def _manifest_set_bundle(pkg: dict, profile_dir: Path, present: bool) -> bool:
     return True
 
 
+def _prune_manifest_backups(profile_dir: Path, keep: int = 5) -> None:
+    """package.json.bak-* 只保留最近 N 份（文件名含时间戳，按名排序即按时间）。
+
+    备份是安全网、清旧是卫生——清理失败只记日志，绝不能反噬主流程。
+    """
+    try:
+        backups = sorted(profile_dir.glob("package.json.bak-*"))
+    except OSError:
+        return
+    for stale in backups[:-keep] if len(backups) > keep else []:
+        try:
+            stale.unlink()
+        except OSError:
+            log.debug("清理过期 manifest 备份失败: %s", stale)
+
+
 def _uninstall_manifest_without_pnpm(profile_dir: Path, pkg: dict) -> dict | None:
     """没有 pnpm 时的纯 JSON 卸载：备份 → 删依赖条目 → 清 bundles → 写回。
 
@@ -520,6 +536,7 @@ def _uninstall_manifest_without_pnpm(profile_dir: Path, pkg: dict) -> dict | Non
     except OSError:
         log.exception("卸载桥接插件前备份失败，保留原 package.json: %s", profile_dir)
         return None
+    _prune_manifest_backups(profile_dir)
     deps = pkg.get("dependencies")
     if isinstance(deps, dict):
         deps.pop(DSH_PLUGIN_NAME, None)
@@ -766,6 +783,7 @@ def _repair_missing_dependency_specs(profile_dir: Path, pkg: dict) -> list[str]:
     except OSError:
         log.exception("依赖路径修正前备份失败，放弃修正: %s", profile_dir)
         return []
+    _prune_manifest_backups(profile_dir)
     for name, _old, new in changes:
         deps[name] = new
     try:
@@ -4437,9 +4455,9 @@ class AgentLinkManager(QObject):
         self._model_access_cache.clear()
         # tracker 内部按 (source, sessionId) 留存的连续 streak 也要清：只清外部
         # 镜像的话，重新开启联动后同一会话的新失败会接着旧计数，提醒里出现
-        # 「已连续 N 次」虚高（镜像键与 tracker 键同为 (source, sessionId)）。
-        for source, session_id in list(self._model_access_retry_counts):
-            self._model_access_tracker.reset(source, session_id)
+        # 「已连续 N 次」虚高。全量 clear 比按镜像键逐个 reset 更稳——镜像键
+        # 未必覆盖 tracker 的全部键。
+        self._model_access_tracker.clear()
         self._model_access_retry_counts.clear()
         for session_key in list(self._model_access_timers):
             self._cancel_model_access_timer(session_key)

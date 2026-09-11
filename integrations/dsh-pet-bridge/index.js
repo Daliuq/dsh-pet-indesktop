@@ -1,5 +1,6 @@
 // dsh-pet 桌宠桥接插件（仅使用 DSH 提供的 LLM 服务，不主动联网）
-// 订阅 DSH 的 agent 生命周期事件，追加写入共享桥目录的 dsh.jsonl，
+// 订阅 DSH 的 agent 生命周期事件，追加写入共享桥目录的 dsh-{pid}.jsonl
+//（多实例分区；消费端 glob dsh*.jsonl，兼容旧单文件 dsh.jsonl），
 // 桌宠侧的 DshMonitor 通过 byte-offset tail 读取（不回放历史）。
 import fs from "node:fs";
 import os from "node:os";
@@ -951,9 +952,38 @@ function extractCommand(arguments_) {
 // legacy agent_link bubble path (permanent question popup).
 const QUESTION_TOOL = "ask_user_question";
 const pendingQuestionCallIds = new Set();
+// mux rpcId ↔ callId 按到达顺序 FIFO 配对（C3）：tool/call 注册把 callId
+// 排进会话队列；mux question/requested 帧出队一个并记住 rpcId→callId，
+// 后续 question/resolved 按 rpcId 取回。同会话多问题并发时，每个帧拿到
+// 的是自己那份 callId，而不是反复取到最旧的一个。
+const pendingQuestionRpcPairs = new Map(); // rpcId → callId（resolved 取回后即删）
+const pendingQuestionOrder = new Map();    // sessionId → callId[]（FIFO，待 mux 帧出队）
 
 function questionCallIdentity(callId, sessionId) {
   return `${String(sessionId || "")}|${String(callId || "")}`;
+}
+
+function registerQuestionCall(callId, sessionId) {
+  const id = String(callId || "");
+  if (!id || pendingQuestionCallIds.has(questionCallIdentity(id, sessionId))) return false;
+  pendingQuestionCallIds.add(questionCallIdentity(id, sessionId));
+  const session = String(sessionId || "");
+  const queue = pendingQuestionOrder.get(session) || [];
+  queue.push(id);
+  pendingQuestionOrder.set(session, queue);
+  return true;
+}
+
+function forgetQuestionCall(callId, sessionId) {
+  const id = String(callId || "");
+  pendingQuestionCallIds.delete(questionCallIdentity(id, sessionId));
+  const session = String(sessionId || "");
+  const queue = pendingQuestionOrder.get(session);
+  if (queue) {
+    const idx = queue.indexOf(id);
+    if (idx >= 0) queue.splice(idx, 1);
+    if (!queue.length) pendingQuestionOrder.delete(session);
+  }
 }
 
 function extractQuestions(arguments_) {
@@ -976,16 +1006,13 @@ function extractQuestions(arguments_) {
 }
 
 function writeQuestionRequest(callId, questions, sessionId) {
-  const id = String(callId || "");
-  const key = questionCallIdentity(id, sessionId);
-  if (!id || pendingQuestionCallIds.has(key)) return; // 已写过，去重
-  pendingQuestionCallIds.add(key);
+  if (!registerQuestionCall(callId, sessionId)) return; // 已写过，去重
   // 两个路径（tool/call + mux）都无条件写，由 writeRecordDedup 去重：
   // mux 正常时保留 rpcId 版本（可交互）；mux 不可用/连接失败时兜底写提示
   // （无按钮但至少弹窗出现，不会丢问题）。
   writeRecordDedup({
     event: "question/requested",
-    callId: id,
+    callId: String(callId || ""),
     sessionId: String(sessionId || ""),
     questions,
   });
@@ -993,9 +1020,8 @@ function writeQuestionRequest(callId, questions, sessionId) {
 
 function resolveQuestion(callId, sessionId) {
   const id = String(callId || "");
-  const key = questionCallIdentity(id, sessionId);
-  if (!id || !pendingQuestionCallIds.has(key)) return;
-  pendingQuestionCallIds.delete(key);
+  if (!id || !pendingQuestionCallIds.has(questionCallIdentity(id, sessionId))) return;
+  forgetQuestionCall(callId, sessionId);
   // 收尾记录不 gate mux：重复的 question/resolved 无害（桌宠幂等），
   // 但若 mux 在问题中途才连上、丢了对应的 resolved 帧，这里必须兜底写，
   // 否则桌宠会卡死在 waiting_question。
@@ -1007,21 +1033,34 @@ function resolveQuestion(callId, sessionId) {
 }
 
 // mux question 帧只带 rpcId，callId 只有 tool/call 兜底路径才登记（复合键
-// sessionId|callId）。桌宠端升级重建后靠 callId 与兜底 question/resolved 配对，
-// 帧里缺 callId 时 mux 断线后的兜底关闭就失效，气泡永久挂住——按会话反查补上。
-// 局限（已知）：同会话多个未答问题时按插入序取最旧一个的 callId——pet 侧
-// resolved 优先按 rpcId 精确配对，此反查仅为兜底路径补身份，误配风险有限。
-function pendingCallIdForSession(sessionId) {
-  const prefix = `${String(sessionId || "")}|`;
-  for (const key of pendingQuestionCallIds) {
-    if (key.startsWith(prefix)) return key.slice(prefix.length);
+// sessionId|callId，FIFO 队列见 pendingQuestionOrder）。桌宠端升级重建后靠
+// callId 与兜底 question/resolved 配对，帧里缺 callId 时 mux 断线后的兜底
+// 关闭就失效，气泡永久挂住——按 FIFO 出队补上并记住 rpcId→callId。
+function muxQuestionCallId(payload, rpcId) {
+  const fromFrame = String(payload.callId || "");
+  if (fromFrame) return fromFrame;
+  const rpc = String(rpcId || "");
+  const paired = pendingQuestionRpcPairs.get(rpc);
+  if (paired) return paired;
+  const queue = pendingQuestionOrder.get(String(payload.sessionId || ""));
+  const next = queue ? queue.shift() : undefined;
+  if (next) {
+    if (rpc) pendingQuestionRpcPairs.set(rpc, next);
+    return next;
   }
   return "";
 }
 
-// 帧自带 callId 时以它为准（DSH 后续版本可能补上）；否则按会话反查。
-function muxQuestionCallId(payload) {
-  return String(payload.callId || "") || pendingCallIdForSession(payload.sessionId);
+function muxQuestionCallIdForResolved(payload, rpcId) {
+  const fromFrame = String(payload.callId || "");
+  if (fromFrame) return fromFrame;
+  const rpc = String(rpcId || "");
+  const paired = pendingQuestionRpcPairs.get(rpc);
+  if (paired) {
+    pendingQuestionRpcPairs.delete(rpc); // resolved 是终态，取回即清
+    return paired;
+  }
+  return "";
 }
 
 function muxQuestionRequestedRecord(rpcId, payload) {
@@ -1030,7 +1069,7 @@ function muxQuestionRequestedRecord(rpcId, payload) {
     rpcId,
     sessionId: payload.sessionId,
     questions: payload.questions,
-    callId: muxQuestionCallId(payload),
+    callId: muxQuestionCallId(payload, rpcId),
   };
 }
 
@@ -1040,7 +1079,7 @@ function muxQuestionResolvedRecord(rpcId, payload) {
     rpcId,
     sessionId: payload.sessionId,
     outcome: payload.outcome,
-    callId: muxQuestionCallId(payload),
+    callId: muxQuestionCallIdForResolved(payload, rpcId),
   };
 }
 
@@ -1747,7 +1786,10 @@ export const __hardFailureTest = {
 export const __questionTest = {
   questionCallIdentity,
   pendingQuestionCallIds,
-  pendingCallIdForSession,
+  pendingQuestionRpcPairs,
+  pendingQuestionOrder,
+  registerQuestionCall,
+  forgetQuestionCall,
   muxQuestionRequestedRecord,
   muxQuestionResolvedRecord,
 };

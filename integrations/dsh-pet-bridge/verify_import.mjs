@@ -45,18 +45,19 @@ try {
     if (existsSync(src)) cpSync(src, path.join(tmp, name));
   }
 
-  // 静态禁令：源码里不允许出现外部动态 import / require（惰性加载可以逃过
-  // 上面的 import 检查——apply() 里的 import() 只有在 DSH host 调用时才执行）。
+  // 静态禁令：源码里不允许任何动态 import / require——惰性加载可以逃过
+  // 上面的 import 检查（apply() 里的 import() 只有在 DSH host 调用时才执行），
+  // 计算型说明符也能逃过字面扫描，因此一律禁止（当前代码为零动态 import）。
   const source = readFileSync(path.join(tmp, "index.js"), "utf8");
   assert.ok(!/createRequire|[^.\w]require\s*\(/.test(source),
     "index.js 不得使用 require/createRequire（CommonJS 逃逸口）");
-  const dynamicImports = [...source.matchAll(/\bimport\s*\(\s*["']([^"']+)["']\s*\)/g)]
-    .map((m) => m[1]);
-  assert.deepEqual(
-    dynamicImports.filter((spec) => !spec.startsWith("node:")),
-    [],
-    `index.js 不得动态 import 外部包: ${dynamicImports.filter((s) => !s.startsWith("node:")).join(", ") || "(无)"}`,
-  );
+  assert.ok(!/\bimport\s*\(/.test(source),
+    "index.js 不得使用动态 import（含计算型说明符：惰性加载可绕过清单与门禁）");
+
+  // cordis.patch.yml 最低限度 sanity：必须声明桥接 bundle 挂载点。
+  const patch = readFileSync(path.join(tmp, "cordis.patch.yml"), "utf8");
+  assert.ok(patch.includes("@dsh-pet/bridge") && patch.includes("dsh-pet-bridge"),
+    "cordis.patch.yml 必须声明桥接 bundle 挂载点");
 
   const bridge = await import(pathToFileURL(path.join(tmp, "index.js")).href);
 

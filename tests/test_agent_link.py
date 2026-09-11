@@ -1488,6 +1488,29 @@ class TestUninstallBridgeWithoutPnpm:
         assert DshMonitor.uninstall_bridge() is True
         assert not list(profile.glob("package.json.bak-*"))
 
+    def test_backups_pruned_to_recent_five(self, tmp_path, monkeypatch):
+        """manifest 备份只保留最近 5 份：卸载/修复都会持续产 bak，需有清理。"""
+        profile = self._profile(
+            tmp_path,
+            deps={agent_link.DSH_PLUGIN_NAME: "link:W:/gone/bridge"},
+            bundles=[agent_link.DSH_PLUGIN_NAME],
+        )
+        fakes = {profile / f"package.json.bak-2026090{i}-12000{i}" for i in range(7)}
+        for fake in fakes:
+            fake.write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(agent_link, "DSH_PROFILE_HOME", tmp_path)
+        monkeypatch.setattr(agent_link, "_pnpm_command", lambda: None)
+
+        assert DshMonitor.uninstall_bridge() is True
+
+        backups = sorted(profile.glob("package.json.bak-*"))
+        assert len(backups) == 5, f"备份应清理到最近 5 份，现有 {len(backups)}"
+        kept = {b.name for b in backups}
+        fake_names = {fake.name for fake in fakes}
+        assert kept & fake_names, "应保留 7 份旧备份中最新的 4 份"
+        assert len(kept - fake_names) == 1, "本次卸载新建的备份必须在其中"
+        assert not any(n < "package.json.bak-20260903" for n in kept), "最旧的 3 份必须被清掉"
+
     def test_with_pnpm_still_uses_pnpm_remove(self, tmp_path, monkeypatch):
         """有 pnpm 时保持现状：走 pnpm remove，再清 bundles，不做 JSON 手改备份。"""
         plugin = tmp_path / "current-build" / "dsh-pet-bridge"
