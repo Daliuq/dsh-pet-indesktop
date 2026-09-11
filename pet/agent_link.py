@@ -4139,6 +4139,12 @@ class AgentLinkManager(QObject):
     def _on_exploration_control_result(self, session_key: str, operation: str,
                                        ok: bool, detail: str) -> None:
         """后台线程信号回主线程：把控制成功/失败结果弹成气泡。"""
+        if ok:
+            # 用户已经让目标会话换方向/停下：给探索看门狗记一段宽限（宽限期内两个
+            # 阈值各 +1，并跳过对旧历史的立即复评）。否则控制回执刚落，同一段
+            # 重复探索历史会立刻再触发一次 control 级告警，用户刚点的按钮看起来
+            # 完全没生效。失败回执不给宽限——问题没解决就该继续提醒。
+            self._exploration_watchdog.grant_grace(session_key)
         self._show_exploration_control_result(session_key, operation, ok, detail)
 
     def _show_exploration_control_result(self, session_key: str, operation: str,

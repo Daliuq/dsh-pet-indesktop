@@ -469,6 +469,49 @@ class TestControlResultSubagentEcho:
         assert "已终止本次运行" in text
 
 
+class TestControlSuccessGrantsWatchdogGrace:
+    """F12：控制成功后必须给目标 session 宽限，否则按旧历史立即重评会再弹控制告警。"""
+
+    def _watchdog(self, mgr):
+        wd = mgr._exploration_watchdog
+        wd.configure({
+            "exploration_watchdog_enabled": True,
+            "exploration_watchdog_warning_threshold": 2,
+            "exploration_watchdog_control_threshold": 3,
+            "exploration_watchdog_cooldown_steps": 0,
+        })
+        wd.feed_record("sess-1", {"event": "user/message", "text": "目标"})
+        wd.feed_record("sess-1", {"event": "command/run", "step": "s1", "command": "ls"})
+        with wd._lock:
+            state = wd._states["sess-1"]
+        # 启动默认 5 分钟宽限会抬高阈值，先关掉它让 control 档位可复现。
+        state["grace_until"] = 0.0
+        state["last_inspected_seq"] = 0
+        wd._score = lambda w6, w10: (3, ["重复探索"])
+        return wd, state
+
+    def test_control_success_downgrades_immediate_repeat(self, mgr):
+        wd, state = self._watchdog(mgr)
+        first = wd._evaluate_locked("sess-1", state)
+        assert first is not None and first["level"] == "control"
+        # 用户点「自动优化」，后台 worker 成功回执回主线程。
+        mgr._on_exploration_control_result(
+            "sess-1", "replan", True, '{"ok": true, "phase": "replanned"}')
+        with wd._lock:
+            assert wd._states["sess-1"]["grace_until"] > time.monotonic(), \
+                "控制成功必须给目标 session 宽限"
+        repeat = wd._evaluate_locked("sess-1", state)
+        assert repeat is None or repeat["level"] == "warning", \
+            f"宽限期内不得再弹 control 级告警：{repeat}"
+
+    def test_control_failure_does_not_grant_grace(self, mgr):
+        wd, state = self._watchdog(mgr)
+        mgr._on_exploration_control_result(
+            "sess-1", "replan", False, "bridge-control-timeout")
+        with wd._lock:
+            assert wd._states["sess-1"]["grace_until"] == 0.0, "失败回执不该给宽限"
+
+
 class TestWatchdogDisabledIsZeroOverhead:
     def test_disabled_watchdog_never_warns_or_starts_threads(self, app, mgr, monkeypatch):
         calls = []
