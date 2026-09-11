@@ -1579,12 +1579,19 @@ class DshMonitor(BaseAgentMonitor):
         for profile in _real_profiles():
             if profile.name not in stale_names:
                 continue
-            rc, out = _run_pnpm(profile, "add", str(plugin))
+            # 与安装路径同源：manifest 里可能存在指向不存在路径的依赖（旧构建目录 /
+            # 版本号变更的 tgz），裸 pnpm 会一直失败。先按探测结果修正再重试一次，
+            # 否则启动自检每次都在同一处静默失败，link 永远刷不新。
+            rc, out, repaired = _run_pnpm_repairing_specs(profile, "add", str(plugin))
             if rc != 0:
                 log.warning(
                     "桥接 link 刷新失败 %s: %s", profile.name, (out or "")[-200:],
                 )
                 continue
+            if repaired:
+                log.info(
+                    "桥接 link 刷新前修正依赖路径 %s: %s", profile.name, "；".join(repaired),
+                )
             pkg = _read_manifest(profile)
             if pkg is not None:
                 try:
