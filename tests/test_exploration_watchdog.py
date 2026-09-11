@@ -105,7 +105,9 @@ def test_pause_does_not_latch_long_think_and_resume_reanchors(app, monkeypatch):
     """方案A：隐藏时长不计入任何时长判定，计时锚点整体后移暂停时长。
 
     已超阈值的长思考在暂停期间手动轮询也不得发射或置位已上报标志；
-    恢复后可见期积累仍然有效——提醒延迟到恢复时发出，而不是永久丢失。
+    恢复后思考被保守解除武装，真实继续的 Think（下一条 reasoning 重新
+    武装）按恢复后的可见时长重新积累到阈值即提醒——推迟而非丢失，
+    也不对隐藏期间已结束的思考补发过期提醒。
     """
     import pet.exploration_watchdog as watchdog_mod
 
@@ -136,11 +138,48 @@ def test_pause_does_not_latch_long_think_and_resume_reanchors(app, monkeypatch):
             assert state["started_at"] == started_before + 600, "隐藏时长不得计入累计"
             assert abs((state["grace_until"] - state["started_at"]) - grace_delta_before) < 1e-6, \
                 "宽限期与起始时间的相对关系必须保持不变"
-            assert state["current"].think_started_at == clock.now - wd.long_think_seconds - 5
+            # 恢复即保守解除武装：暂停期丢弃了 step/end，无法判断思考是否已结束
+            assert state["current"].think_active is False
+            assert state["current"].think_started_at is None
 
         wd._poll_long_think()
-        assert len(seen) == 1, "可见期积累的超阈值提醒应在恢复后补发（延迟而非丢失）"
+        assert not seen, "解除武装的旧思考不得在恢复后立即补发"
+
+        # 思考真实继续：下一条 reasoning 重新武装，按恢复后的可见时长重新积累
+        wd.feed_record("agent", {"event": "reasoning", "step": "s1", "text": "还在思考"})
+        clock.now += wd.long_think_seconds
+        wd._poll_long_think()
+        assert len(seen) == 1, "恢复后继续的思考达到阈值应提醒（推迟而非丢失）"
         assert seen[0]["threshold_phase"] == "long-think"
+    finally:
+        wd.close()
+
+
+def test_resume_does_not_replay_ended_think(app, monkeypatch):
+    """X1 回归：思考在隐藏期内结束（step/end 记录被暂停丢弃），恢复后不得补发。
+
+    旧实现（隐藏期照常检测）对该场景不补发；若暂停实现只丢记录不解除
+    武装，恢复后会对已结束的思考补发过期长思考告警。
+    """
+    import pet.exploration_watchdog as watchdog_mod
+
+    clock = _FakeClock()
+    monkeypatch.setattr(watchdog_mod, "time", clock)
+    wd = ExplorationWatchdog()
+    seen = []
+    wd.warning.connect(lambda session, payload: seen.append(payload))
+    try:
+        wd.feed_record("agent", {"event": "reasoning", "step": "s1", "text": "思考"})
+        with wd._lock:
+            wd._states["agent"]["current"].think_started_at = clock.now - wd.long_think_seconds - 5
+        wd.pause()
+        clock.now += 60
+        wd.feed_record("agent", {"event": "step/end", "step": "s1"})  # 被暂停丢弃
+        wd.resume()
+        wd._poll_long_think()
+        assert not seen, "隐藏期间已结束的思考不得在恢复后补发过期提醒"
+        with wd._lock:
+            assert wd._states["agent"]["current"].think_active is False
     finally:
         wd.close()
 
@@ -171,9 +210,41 @@ def test_turn_reset_preserves_time_anchors(app, monkeypatch):
             wd.feed_record("agent", {"event": "command/run", "step": "s2", "command": "ls"})
         with wd._lock:
             state2 = wd._states["agent"]
-            assert state2["steps"] == {} or state2["current"] is not None, "重复窗口应照常清空"
+            assert state2["steps"] == {}, "重复窗口应随重建清空（旧 step 不得残留）"
             assert state2["started_at"] == started_at, "turn 重置不得刷新 started_at（任务级计时）"
             assert state2["grace_until"] == grace_until, "turn 重置不得刷新 grace_until（启动宽限只送一次）"
+    finally:
+        wd.close()
+
+
+def test_user_message_does_not_refresh_time_anchors(app, monkeypatch):
+    """C1 回归：user/message 每轮必发，其建状态路径也必须沿用锚点记忆。
+
+    真实事件顺序 turn/end → user/message → tool/call：若 user/message 分支
+    用新时钟建状态，锚点会被刷新，任务级语义被绕过（每轮宽限续期）。
+    """
+    import pet.exploration_watchdog as watchdog_mod
+
+    clock = _FakeClock()
+    monkeypatch.setattr(watchdog_mod, "time", clock)
+    wd = ExplorationWatchdog()
+    try:
+        for _ in range(5):
+            wd.feed_record("agent", {"event": "command/run", "step": "s1", "command": "ls"})
+        with wd._lock:
+            started_at = wd._states["agent"]["started_at"]
+            grace_until = wd._states["agent"]["grace_until"]
+        clock.now += 30
+        wd.feed_record("agent", {"event": "turn/end", "step": "s1"})
+        clock.now += 5
+        wd.feed_record("agent", {"event": "user/message", "text": "继续，顺便看看 src"})
+        clock.now += 5
+        wd.feed_record("agent", {"event": "tool/call", "step": "s2", "tool": "read", "filePath": "src/a.py"})
+        with wd._lock:
+            state = wd._states["agent"]
+            assert state["goal"] == "继续，顺便看看 src", "目标提取不受影响"
+            assert state["started_at"] == started_at, "user/message 建状态不得刷新 started_at"
+            assert state["grace_until"] == grace_until, "user/message 建状态不得刷新 grace_until"
     finally:
         wd.close()
 

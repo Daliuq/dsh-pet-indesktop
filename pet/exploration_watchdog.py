@@ -239,6 +239,24 @@ class ExplorationWatchdog(QObject):
     def close(self):
         self._think_timer.stop()
 
+    def _new_state(self, session: str, agent_key: str, record: dict, now: float) -> dict:
+        """创建会话状态；reset 重建时（锚点记忆命中）沿用旧的计时锚点。
+
+        方案A1（任务级语义）：turn/idle 等边界重建状态不刷新 started_at/
+        grace_until，否则 30 秒一轮的 workload 下启动宽限永久生效、长运行
+        降阈值永不触发（设置页文案是任务级承诺）。重复行为窗口（steps）
+        照常从空开始——那是另一回事。
+        所有创建状态的路径（user/message 目标提取、分类事件）都必须走这里，
+        绕过本方法直接 setdefault 会重新引入锚点被刷新的缺陷。
+        """
+        anchors = self._anchor_memory.get(session)
+        return {"steps": OrderedDict(), "current": None,
+                "last_inspected_seq": 0, "seq": 0, "goal": "",
+                "started_at": anchors[0] if anchors else now,
+                "grace_until": anchors[1] if anchors else now + self.early_grace_seconds,
+                "agent_name": _text(record.get("agentName") or record.get("agent") or agent_key),
+                "agent_key": agent_key}
+
     def pause(self) -> None:
         """桌宠隐藏时暂停（产品决策：方案A）——停 1s 轮询并冻结全部计时锚点。
 
@@ -277,6 +295,15 @@ class ExplorationWatchdog(QObject):
             # 锚点记忆同样后移：否则隐藏时长会被后续重建的状态计入。
             for session, anchors in list(self._anchor_memory.items()):
                 self._anchor_memory[session] = (anchors[0] + shift, anchors[1] + shift)
+            # 暂停期丢弃了 step/end 等收尾记录：隐藏期间可能已经结束的 Think
+            # 仍挂着 think_active。保守解除武装——只有恢复后真实继续的 Think
+            # （下一条 reasoning 记录重新武装）才允许触发长思考告警，避免对
+            # 已结束的思考补发过期提醒。
+            for state in self._states.values():
+                current = state.get("current")
+                if current is not None and current.think_active:
+                    current.think_active = False
+                    current.think_started_at = None
             self._think_timer.start()
 
     def configure(self, config: dict):
@@ -349,11 +376,7 @@ class ExplorationWatchdog(QObject):
             goal = _text(record.get("text") or record.get("content") or record.get("summary"), 1200)
             now = time.monotonic()
             with self._lock:
-                state = self._states.setdefault(session, {"steps": OrderedDict(), "current": None,
-                    "last_inspected_seq": 0, "seq": 0, "goal": "",
-                    "started_at": now, "grace_until": now + self.early_grace_seconds,
-                    "agent_name": _text(record.get("agentName") or record.get("agent") or agent_key),
-                    "agent_key": agent_key})
+                state = self._states.setdefault(session, self._new_state(session, agent_key, record, now))
                 if goal:
                     state["goal"] = goal
             return
@@ -365,13 +388,7 @@ class ExplorationWatchdog(QObject):
         fp = make_fingerprint(record, cls, target)
         with self._lock:
             now = time.monotonic()
-            anchors = self._anchor_memory.get(session)
-            state = self._states.setdefault(session, {"steps": OrderedDict(), "current": None,
-                "last_inspected_seq": 0, "seq": 0, "goal": "",
-                "started_at": anchors[0] if anchors else now,
-                "grace_until": anchors[1] if anchors else now + self.early_grace_seconds,
-                "agent_name": _text(record.get("agentName") or record.get("agent") or agent_key),
-                "agent_key": agent_key})
+            state = self._states.setdefault(session, self._new_state(session, agent_key, record, now))
             current = state["current"]
             if current is None or current.step != step:
                 if current is not None:

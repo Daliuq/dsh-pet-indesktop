@@ -3005,9 +3005,13 @@ class TestInteractionIdentityGate:
              "payload": {"requiresApproval": "true", "requestId": "r-str"}},
             {"ts": 5, "agent": "dsh", "event": "cordis/request-run", "requestId": "r-legacy",
              "requiresApproval": True},
+            # 嵌套与顶层同时存在时以嵌套为准：嵌套 False 不得被顶层残留 True 顶掉。
+            {"ts": 6, "agent": "dsh", "event": "cordis/request-run", "requestId": "r-nested-wins",
+             "requiresApproval": True,
+             "payload": {"requiresApproval": False, "requestId": "r-nested-wins"}},
         ])
         assert got == [("dsh", "r-ok"), ("dsh", "r-legacy")], \
-            "仅严格布尔 True 且带 requestId 才触发 cordis 交互（payload 内与顶层平铺两处都认）"
+            "仅严格布尔 True 且带 requestId 才触发 cordis 交互（payload 内与顶层平铺两处都认，嵌套优先）"
 
 
     def test_cordis_without_request_id_ignored(self, tmp_path):
@@ -3327,6 +3331,16 @@ class TestModelAccessStreakCleanup:
         mgr._on_normalized_event(self._retry())
         assert self._feed_and_next_streak(mgr) == 2, \
             "重启用后不得继承旧 streak，否则提醒计数虚高"
+
+    def test_normalized_event_signal_reaches_consumer(self, tmp_path):
+        """守卫：normalized_event 信号必须直连 _on_normalized_event。
+
+        移除 AgentEventRuntime 分发层后这是该信号的唯一消费接线；其余用例
+        全部直调 handler，connect 丢失时它们照样全绿——信号级守卫不可省。
+        """
+        mgr = self._make_mgr(tmp_path)
+        mgr.monitors["dsh"].normalized_event.emit(self._retry())
+        assert self._feed_and_next_streak(mgr) == 2, "经信号发射的重试事件必须被消费记账"
 
 
 class TestSessionNameTruthfulness:

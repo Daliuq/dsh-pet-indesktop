@@ -3164,9 +3164,9 @@ class AgentLinkManager(QObject):
             rpc_id=payload.get("rpcId"),
             approval_id=payload.get("approvalId"),
             request_id=payload.get("requestId"),
-            # 审批收尾帧（mux approval/resolved、approval/decided 转发）同样带
-            # callId：登记端必须存下这个身份，_on_approval_resolved 的 callId
-            # 分支才能精确配对关闭（否则该分支永远匹配不到审批记录）。
+            # callId 是审批收尾的精确身份：登记端必须存下，_on_approval_resolved
+            # 的 callId 分支才能配对关闭。当前桥接版本的审批帧实际不带 callId
+            # （此分支面向旧版/自定义桥的防御路径，常态走 rpcId/approvalId 关闭）。
             call_id=payload.get("callId"),
             session_id=session_id,
         )

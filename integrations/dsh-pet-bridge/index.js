@@ -1009,6 +1009,8 @@ function resolveQuestion(callId, sessionId) {
 // mux question 帧只带 rpcId，callId 只有 tool/call 兜底路径才登记（复合键
 // sessionId|callId）。桌宠端升级重建后靠 callId 与兜底 question/resolved 配对，
 // 帧里缺 callId 时 mux 断线后的兜底关闭就失效，气泡永久挂住——按会话反查补上。
+// 局限（已知）：同会话多个未答问题时按插入序取最旧一个的 callId——pet 侧
+// resolved 优先按 rpcId 精确配对，此反查仅为兜底路径补身份，误配风险有限。
 function pendingCallIdForSession(sessionId) {
   const prefix = `${String(sessionId || "")}|`;
   for (const key of pendingQuestionCallIds) {
