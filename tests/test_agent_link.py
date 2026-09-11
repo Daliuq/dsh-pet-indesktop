@@ -2403,6 +2403,42 @@ class TestApprovalStickyBubble:
         assert mgr._pending_interactions == {}
         assert mgr.win.hidden_calls == 0
 
+    def test_approval_resolved_call_id_does_not_close_question(self, tmp_path):
+        """审批 resolved 帧带 callId 时不得按 callId 关闭问题交互。
+
+        `_on_approval_resolved` 的 callId 分支是从问题侧复制粘贴来的错位判定：
+        approval 与 question 的 callId 是两个独立命名空间，若该分支按
+        kind == "question" 遍历，一条无关审批的收尾帧就会把同名 callId 的
+        问题气泡误关掉（用户还没回答，问题弹窗先消失）。
+        """
+        mgr = self._make_mgr(tmp_path)
+        mgr._on_question_request(
+            "dsh", {"questions": self.QUESTIONS, "callId": "call-shared"}
+        )
+
+        mgr._on_approval_resolved("dsh", {"callId": "call-shared"})
+
+        pending = mgr.pending_interactions_for("dsh")
+        assert len(pending) == 1, "审批 resolved 不得误关同名 callId 的问题气泡"
+        assert next(iter(pending.values()))["kind"] == "question"
+        assert mgr.win.hidden_calls == 0
+
+    def test_approval_resolved_call_id_closes_approval(self, tmp_path):
+        """审批 resolved 帧带 callId 时按 callId 关闭审批交互。
+
+        登记端必须存下审批的 callId 身份，否则改判 kind 后新分支也无从匹配。
+        """
+        mgr = self._make_mgr(tmp_path)
+        mgr._on_approval_request(
+            "dsh", {"tool": "bash", "callId": "call-ap", "sessionId": "s-1"}
+        )
+        assert mgr.pending_interactions_for("dsh") != {}
+
+        mgr._on_approval_resolved("dsh", {"callId": "call-ap"})
+
+        assert mgr.pending_interactions_for("dsh") == {}
+        assert mgr.win.hidden_calls == 1
+
     # ---- 用户问题（ask_user_question）与审批同待遇 ----
     QUESTIONS = [
         {"id": "q1", "question": "要执行哪个方案？",

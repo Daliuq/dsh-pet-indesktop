@@ -3175,6 +3175,10 @@ class AgentLinkManager(QObject):
             rpc_id=payload.get("rpcId"),
             approval_id=payload.get("approvalId"),
             request_id=payload.get("requestId"),
+            # 审批收尾帧（mux approval/resolved、approval/decided 转发）同样带
+            # callId：登记端必须存下这个身份，_on_approval_resolved 的 callId
+            # 分支才能精确配对关闭（否则该分支永远匹配不到审批记录）。
+            call_id=payload.get("callId"),
             session_id=session_id,
         )
 
@@ -3385,11 +3389,11 @@ class AgentLinkManager(QObject):
         if call_id:
             call_id = str(call_id)
             for iid, item in self._pending_interactions.items():
-                if (item.get("kind") == "question"
+                if (item.get("kind") == "approval"
                         and str(item.get("call_id") or "") == call_id):
                     self._resolve_interaction(iid)
                     return
-            return  # 带 callId 但未匹配：陈旧已解决帧，不动其他问题
+            return  # 带 callId 但未匹配：陈旧已解决帧，不动其他审批
         rpc_id = payload.get("rpcId")
         approval_id = payload.get("approvalId")
         if rpc_id:
