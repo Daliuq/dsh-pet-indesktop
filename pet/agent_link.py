@@ -79,6 +79,21 @@ _RAW_BRIDGE_KNOWN_EVENTS: frozenset[str] = frozenset({
 })
 
 
+def _cordis_requires_approval(data: dict) -> bool:
+    """cordis 审批门禁：requiresApproval 是否严格布尔 True。
+
+    桥接写盘把原始 cordis request 整体嵌在 payload 下（index.js：
+    ``writeRecord({event: "cordis/request-run", ..., payload: request, requestId})``），
+    顶层只有 requestId/agentId/sessionId 等身份字段；旧版桥与手写桩则可能把
+    字段平铺在顶层。两处都认，payload 内存在该键时以它为准（避免嵌套 False
+    被顶层残留 True 顶掉）。
+    """
+    nested = data.get("payload")
+    if isinstance(nested, dict) and "requiresApproval" in nested:
+        return nested.get("requiresApproval") is True
+    return data.get("requiresApproval") is True
+
+
 def _which(name: str) -> str | None:
     """Node runtime lookup with the historical ``shutil.which`` seam retained."""
     try:
@@ -1351,7 +1366,7 @@ class BaseAgentMonitor(QObject):
                     self._emit(self.question_requested, (self.agent_key, data))
                 if ev == "question/resolved":
                     self._emit(self.question_resolved, (self.agent_key, data))
-                if ev == "cordis/request-run" and data.get("requiresApproval") is True:
+                if ev == "cordis/request-run" and _cordis_requires_approval(data):
                     self._emit(self.cordis_requested, (self.agent_key, data))
                 if ev == "cordis/request-run-resolved":
                     self._emit(self.cordis_resolved, (self.agent_key, data))
@@ -3108,15 +3123,25 @@ class AgentLinkManager(QObject):
         return text
 
     def _on_cordis_request(self, agent_key: str, payload: dict) -> None:
-        payload = payload if isinstance(payload, dict) else {}
+        record = payload if isinstance(payload, dict) else {}
+        # 字段来源以桥接写盘形状为准：原始 cordis request 整体在 payload 下，
+        # 顶层只有 requestId/agentId/sessionId 等身份字段；旧版/手写桩把字段
+        # 平铺在顶层。两处都取，payload 内的非 None 字段优先。
+        nested = record.get("payload")
+        fields = dict(record)
+        if isinstance(nested, dict):
+            for key, value in nested.items():
+                if value is not None:
+                    fields[key] = value
         # 可关联身份门禁：cordis 交互靠 requestId 与 request-run-resolved 配对关闭。
         # 无 requestId 的记录无法关闭，直接忽略（requiresApproval 严格布尔检查在 _poll）。
-        if not payload.get("requestId"):
-            log.debug("cordis/request-run 缺 requestId，忽略（不弹窗）: %s", str(payload)[:200])
+        request_id = fields.get("requestId")
+        if not request_id:
+            log.debug("cordis/request-run 缺 requestId，忽略（不弹窗）: %s", str(record)[:200])
             return
-        name = str(payload.get("name") or "Cordis 插件")
-        purpose = str(payload.get("purpose") or "需要你的确认")
-        self._register_interaction(agent_key, kind="cordis", text=f"{name} 请求运行：{purpose}", interactive=False, request_id=payload.get("requestId"), session_id=payload.get("agentId") or payload.get("sessionId"))
+        name = str(fields.get("name") or "Cordis 插件")
+        purpose = str(fields.get("purpose") or "需要你的确认")
+        self._register_interaction(agent_key, kind="cordis", text=f"{name} 请求运行：{purpose}", interactive=False, request_id=request_id, session_id=fields.get("agentId") or fields.get("sessionId"))
 
     def _on_cordis_resolved(self, agent_key: str, payload: dict) -> None:
         payload = payload if isinstance(payload, dict) else {}

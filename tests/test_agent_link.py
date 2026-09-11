@@ -2865,17 +2865,32 @@ class TestInteractionIdentityGate:
         assert mgr.pending_interactions_for("dsh") == {}
 
     def test_cordis_requires_strict_true_and_request_id(self, tmp_path):
-        """monitor 层：cordis/request-run 只有 requiresApproval 严格布尔 True 且带 requestId 才触发。"""
+        """monitor 层：cordis/request-run 只有 requiresApproval 严格布尔 True 且带 requestId 才触发。
+
+        记录形状以桥接真实写盘为准（index.js 的 cordis/request-run 分支：
+        `writeRecord({event, agentId, sessionId, kind, payload: request, requestId})`
+        ——原始 request 整体嵌在 payload 下，requiresApproval 只在 payload 内，
+        顶层只有 requestId/agentId/sessionId 等身份字段）；旧版/手写桩把字段
+        平铺在顶层的形状仍须兼容。
+        """
         mon = self._make_mon(tmp_path)
         got = []
         mon.cordis_requested.connect(lambda a, p: got.append((a, p.get("requestId"))))
         self._write_events(mon, [
-            {"ts": 1, "agent": "dsh", "event": "cordis/request-run", "requiresApproval": True, "requestId": "r-ok"},
-            {"ts": 2, "agent": "dsh", "event": "cordis/request-run", "requiresApproval": False, "requestId": "r-no"},
-            {"ts": 3, "agent": "dsh", "event": "cordis/request-run", "requestId": "r-miss"},
-            {"ts": 4, "agent": "dsh", "event": "cordis/request-run", "requiresApproval": "true", "requestId": "r-str"},
+            {"ts": 1, "agent": "dsh", "event": "cordis/request-run", "requestId": "r-ok",
+             "payload": {"requiresApproval": True, "requestId": "r-ok", "name": "插件", "purpose": "运行"}},
+            {"ts": 2, "agent": "dsh", "event": "cordis/request-run", "requestId": "r-no",
+             "payload": {"requiresApproval": False, "requestId": "r-no"}},
+            {"ts": 3, "agent": "dsh", "event": "cordis/request-run", "requestId": "r-miss",
+             "payload": {"requestId": "r-miss"}},
+            {"ts": 4, "agent": "dsh", "event": "cordis/request-run", "requestId": "r-str",
+             "payload": {"requiresApproval": "true", "requestId": "r-str"}},
+            {"ts": 5, "agent": "dsh", "event": "cordis/request-run", "requestId": "r-legacy",
+             "requiresApproval": True},
         ])
-        assert got == [("dsh", "r-ok")], "仅严格布尔 True 且带 requestId 才触发 cordis 交互"
+        assert got == [("dsh", "r-ok"), ("dsh", "r-legacy")], \
+            "仅严格布尔 True 且带 requestId 才触发 cordis 交互（payload 内与顶层平铺两处都认）"
+
 
     def test_cordis_without_request_id_ignored(self, tmp_path):
         """_on_cordis_request 无 requestId：不登记 pending 交互。"""
@@ -2893,6 +2908,26 @@ class TestInteractionIdentityGate:
         assert item["request_id"] == "req-1"
         mgr._on_cordis_resolved("dsh", {"requestId": "req-1"})
         assert mgr.pending_interactions_for("dsh") == {}
+
+    def test_cordis_request_reads_nested_payload_fields(self, tmp_path):
+        """_on_cordis_request 消费桥接写盘形状：名称/用途/会话从 payload 内取。
+
+        桥接顶层不带 name/purpose，只把原始 cordis request 放进 payload；只读
+        顶层会得到占位文案（"Cordis 插件 请求运行：需要你的确认"），用户看不出
+        是哪条请求。顶层平铺的旧版/手写桩形状仍须兼容（见上一用例）。
+        """
+        mgr = self._make_mgr(tmp_path)
+        mgr._on_cordis_request("dsh", {
+            "requestId": "req-2", "agentId": "sess-9",
+            "payload": {"requestId": "req-2", "name": "构建插件", "purpose": "执行打包脚本"},
+        })
+        pending = mgr.pending_interactions_for("dsh")
+        item = next(iter(pending.values()))
+        assert item["kind"] == "cordis"
+        assert item["request_id"] == "req-2"
+        assert item["session_id"] == "sess-9"
+        assert "构建插件" in item["text"]
+        assert "执行打包脚本" in item["text"]
 
     def test_turn_end_clears_stale_pending(self, tmp_path):
         """turn 结束兜底清理：DSH 漏发 resolved 时，会话结束不再留永久弹窗。"""
