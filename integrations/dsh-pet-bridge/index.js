@@ -1551,15 +1551,10 @@ export function apply(ctx) {
         // 收不到 callId——question/resolved 写不出，桌宠端提醒队列卡死。
         const callId = d.message && (d.message.callId || (d.message.source && d.message.source.callId));
         if (callId) resolveQuestion(callId, sessionId);
-        // 用户介入信号：ask_user_question 回答后
-        if (callId && pendingQuestionCallIds.has(String(callId))) {
-          writeRecord({
-            event: "user_action",
-            action: "question_resolved",
-            callId: String(callId),
-            sessionId,
-          });
-        }
+        // 问题收尾的 question/resolved 由 resolveQuestion 内部负责写盘（桌宠按它
+        // 关闭问题气泡）。这里不再补写 user_action 兜底：resolveQuestion 的第一
+        // 动作就是删掉 pendingQuestionCallIds 里的复合键 sessionId|callId，紧随
+        // 其后的裸 callId 查询恒为 False，那段写盘永远不可达。
         const info = toolResultInfo(d);
         const pending = consumeToolCall(info.callId) || {};
         const tool = pending.tool || "";
