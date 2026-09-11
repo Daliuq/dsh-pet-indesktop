@@ -1364,10 +1364,13 @@ class ModernSettingsDialog(QDialog):
         claimed.update(proactive_rows)
         watchdog_rows = list(self.watchdog_page.findChildren(SettingRow))
         claimed.update(watchdog_rows)
-        # WatchdogSettingsPage 现同时承载「循环检测」（watchdog/long_think）与
-        # 「卡住检测」（stuck_*）两组行，按 objectName 前缀分组显示。
+        # WatchdogSettingsPage 现同时承载「循环检测」（watchdog/long_think）、
+        # 「卡住检测」（stuck_*）与「行为重复检测」（pattern_*）三组行，
+        # 按 objectName 前缀分组显示。
         stuck_rows = [r for r in watchdog_rows if r.objectName().startswith("settingRow_stuck_")]
-        loop_rows = [r for r in watchdog_rows if not r.objectName().startswith("settingRow_stuck_")]
+        pattern_rows = [r for r in watchdog_rows if r.objectName().startswith("settingRow_pattern_")]
+        loop_rows = [r for r in watchdog_rows
+                     if not r.objectName().startswith(("settingRow_stuck_", "settingRow_pattern_"))]
         dialogue_rows = claim_prefix("dialogue_")
         gate_rows = claim_prefix("report_gate_")
         automation = page_content([
@@ -1376,6 +1379,7 @@ class ModernSettingsDialog(QDialog):
             ("主动感知", proactive_rows),
             ("循环检测", loop_rows),
             ("卡住检测", stuck_rows),
+            ("行为重复检测", pattern_rows),
         ])
         # 「事件气泡触发概率」＝一个可折叠框：按**事件聚合类别**分组，每组是
         # 「该类触发概率滑块 + 该类气泡文案行」，让设置位置与真正控制的位置绑定。

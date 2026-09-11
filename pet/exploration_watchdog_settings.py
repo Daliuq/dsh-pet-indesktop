@@ -21,6 +21,19 @@ Configuration keys live under the `agent_link` sub-dict:
     agent_link.stuck_window_seconds
     agent_link.stuck_cooldown_seconds
     agent_link.stuck_reminder_text
+
+以及「行为重复检测」（behavior_detector）配置：
+
+    agent_link.pattern_detect
+    agent_link.pattern_w6_control
+    agent_link.pattern_w10_warn
+    agent_link.pattern_w10_control
+    agent_link.pattern_macro_w6_explore
+    agent_link.pattern_macro_w6_action
+    agent_link.pattern_macro_w10_explore
+    agent_link.pattern_macro_w10_action
+    agent_link.pattern_min_steps_between
+    agent_link.pattern_cooldown_seconds
 """
 from __future__ import annotations
 
@@ -46,10 +59,12 @@ log = logging.getLogger("dsh-pet-standalone")
 class WatchdogSettingsPage(QWidget):
     """Self-contained settings page for Agent Exploration Loop Watchdog.
 
-    Organised in three sections:
+    Organised in five sections:
       1. 基础设置 (enable toggle)
       2. 风险评分 (warning / control thresholds)
       3. Think 风控 (cooldown, grace, long-run)
+      4. 卡住检测 (stuck_detector)
+      5. 行为重复检测 (behavior_detector)
     """
 
     settings_saved = Signal()
@@ -114,6 +129,46 @@ class WatchdogSettingsPage(QWidget):
         self.stuck_reminder_edit.setText(str(self._agent_cfg.get("stuck_reminder_text", "") or ""))
         self.stuck_reminder_edit.setPlaceholderText("留空使用默认提醒文案")
 
+        # ---- 行为重复检测（behavior_detector：双窗口慢性循环 / 短时爆发 / 纯探索无产出）----
+        self.pattern_enabled_check = ToggleSwitch(self)
+        self.pattern_enabled_check.setChecked(bool(self._agent_cfg.get("pattern_detect", True)))
+        self.pattern_w6_control_spin = BrowserSpinBox(self)
+        self.pattern_w6_control_spin.setRange(1, 20)
+        self.pattern_w6_control_spin.setSuffix(" 次")
+        self.pattern_w6_control_spin.setValue(int(self._agent_cfg.get("pattern_w6_control", 3)))
+        self.pattern_w10_warn_spin = BrowserSpinBox(self)
+        self.pattern_w10_warn_spin.setRange(1, 20)
+        self.pattern_w10_warn_spin.setSuffix(" 次")
+        self.pattern_w10_warn_spin.setValue(int(self._agent_cfg.get("pattern_w10_warn", 3)))
+        self.pattern_w10_control_spin = BrowserSpinBox(self)
+        self.pattern_w10_control_spin.setRange(1, 30)
+        self.pattern_w10_control_spin.setSuffix(" 次")
+        self.pattern_w10_control_spin.setValue(int(self._agent_cfg.get("pattern_w10_control", 4)))
+        self.pattern_macro_w6_explore_spin = BrowserSpinBox(self)
+        self.pattern_macro_w6_explore_spin.setRange(1, 50)
+        self.pattern_macro_w6_explore_spin.setSuffix(" 步")
+        self.pattern_macro_w6_explore_spin.setValue(int(self._agent_cfg.get("pattern_macro_w6_explore", 5)))
+        self.pattern_macro_w6_action_spin = BrowserSpinBox(self)
+        self.pattern_macro_w6_action_spin.setRange(0, 50)
+        self.pattern_macro_w6_action_spin.setSuffix(" 步")
+        self.pattern_macro_w6_action_spin.setValue(int(self._agent_cfg.get("pattern_macro_w6_action", 0)))
+        self.pattern_macro_w10_explore_spin = BrowserSpinBox(self)
+        self.pattern_macro_w10_explore_spin.setRange(1, 50)
+        self.pattern_macro_w10_explore_spin.setSuffix(" 步")
+        self.pattern_macro_w10_explore_spin.setValue(int(self._agent_cfg.get("pattern_macro_w10_explore", 7)))
+        self.pattern_macro_w10_action_spin = BrowserSpinBox(self)
+        self.pattern_macro_w10_action_spin.setRange(0, 50)
+        self.pattern_macro_w10_action_spin.setSuffix(" 步")
+        self.pattern_macro_w10_action_spin.setValue(int(self._agent_cfg.get("pattern_macro_w10_action", 1)))
+        self.pattern_min_steps_between_spin = BrowserSpinBox(self)
+        self.pattern_min_steps_between_spin.setRange(1, 50)
+        self.pattern_min_steps_between_spin.setSuffix(" 步")
+        self.pattern_min_steps_between_spin.setValue(int(self._agent_cfg.get("pattern_min_steps_between", 3)))
+        self.pattern_cooldown_seconds_spin = BrowserSpinBox(self)
+        self.pattern_cooldown_seconds_spin.setRange(5, 3600)
+        self.pattern_cooldown_seconds_spin.setSuffix(" 秒")
+        self.pattern_cooldown_seconds_spin.setValue(int(self._agent_cfg.get("pattern_cooldown_seconds", 60)))
+
         # ---- Layout ----
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -159,6 +214,39 @@ class WatchdogSettingsPage(QWidget):
                         "留空使用默认文案。", self.stuck_reminder_edit, stacked=True),
         ], self))
 
+        root.addWidget(SettingsSection("行为重复检测", [
+            SettingRow("pattern_detect", "启用行为重复检测",
+                        "DSH 联动时用 W6/W10 双窗口识别慢性循环、短时爆发与纯探索无产出。",
+                        self.pattern_enabled_check),
+            SettingRow("pattern_w6_control", "W6 同类重复（控制）",
+                        "短窗口内同一行为类别重复达到该次数即控制级提醒。",
+                        self.pattern_w6_control_spin),
+            SettingRow("pattern_w10_warn", "W10 同类重复（警告）",
+                        "长窗口内同一行为类别重复达到该次数即警告。",
+                        self.pattern_w10_warn_spin),
+            SettingRow("pattern_w10_control", "W10 同类重复（控制）",
+                        "长窗口内同一行为类别重复达到该次数即控制级提醒。",
+                        self.pattern_w10_control_spin),
+            SettingRow("pattern_macro_w6_explore", "W6 大类探索步数",
+                        "短窗口内探索类步骤数达到该值时参与「纯探索无产出」判定。",
+                        self.pattern_macro_w6_explore_spin),
+            SettingRow("pattern_macro_w6_action", "W6 大类行动步数上限",
+                        "短窗口内行动（编辑/运行/测试）步骤数不超过该值时才算无产出。",
+                        self.pattern_macro_w6_action_spin),
+            SettingRow("pattern_macro_w10_explore", "W10 大类探索步数",
+                        "长窗口内探索类步骤数达到该值时参与「纯探索无产出」判定。",
+                        self.pattern_macro_w10_explore_spin),
+            SettingRow("pattern_macro_w10_action", "W10 大类行动步数上限",
+                        "长窗口内行动步骤数不超过该值时才算无产出。",
+                        self.pattern_macro_w10_action_spin),
+            SettingRow("pattern_min_steps_between", "最小触发步数间隔",
+                        "两次行为重复提醒之间至少新增的 step 数。",
+                        self.pattern_min_steps_between_spin),
+            SettingRow("pattern_cooldown_seconds", "提醒冷却",
+                        "两次行为重复提醒之间的最小间隔。",
+                        self.pattern_cooldown_seconds_spin),
+        ], self))
+
         root.addStretch(1)
 
     def apply_to_config(self, agent_link_cfg: dict) -> dict:
@@ -180,6 +268,16 @@ class WatchdogSettingsPage(QWidget):
         updated["stuck_window_seconds"] = self.stuck_window_spin.value()
         updated["stuck_cooldown_seconds"] = self.stuck_cooldown_spin.value()
         updated["stuck_reminder_text"] = self.stuck_reminder_edit.text().strip()
+        updated["pattern_detect"] = self.pattern_enabled_check.isChecked()
+        updated["pattern_w6_control"] = self.pattern_w6_control_spin.value()
+        updated["pattern_w10_warn"] = self.pattern_w10_warn_spin.value()
+        updated["pattern_w10_control"] = self.pattern_w10_control_spin.value()
+        updated["pattern_macro_w6_explore"] = self.pattern_macro_w6_explore_spin.value()
+        updated["pattern_macro_w6_action"] = self.pattern_macro_w6_action_spin.value()
+        updated["pattern_macro_w10_explore"] = self.pattern_macro_w10_explore_spin.value()
+        updated["pattern_macro_w10_action"] = self.pattern_macro_w10_action_spin.value()
+        updated["pattern_min_steps_between"] = self.pattern_min_steps_between_spin.value()
+        updated["pattern_cooldown_seconds"] = self.pattern_cooldown_seconds_spin.value()
         return updated
 
     def refresh_from_config(self, agent_link_cfg: dict) -> None:
@@ -198,4 +296,14 @@ class WatchdogSettingsPage(QWidget):
         self.stuck_window_spin.setValue(int(self._agent_cfg.get("stuck_window_seconds", 90)))
         self.stuck_cooldown_spin.setValue(int(self._agent_cfg.get("stuck_cooldown_seconds", 300)))
         self.stuck_reminder_edit.setText(str(self._agent_cfg.get("stuck_reminder_text", "") or ""))
+        self.pattern_enabled_check.setChecked(bool(self._agent_cfg.get("pattern_detect", True)))
+        self.pattern_w6_control_spin.setValue(int(self._agent_cfg.get("pattern_w6_control", 3)))
+        self.pattern_w10_warn_spin.setValue(int(self._agent_cfg.get("pattern_w10_warn", 3)))
+        self.pattern_w10_control_spin.setValue(int(self._agent_cfg.get("pattern_w10_control", 4)))
+        self.pattern_macro_w6_explore_spin.setValue(int(self._agent_cfg.get("pattern_macro_w6_explore", 5)))
+        self.pattern_macro_w6_action_spin.setValue(int(self._agent_cfg.get("pattern_macro_w6_action", 0)))
+        self.pattern_macro_w10_explore_spin.setValue(int(self._agent_cfg.get("pattern_macro_w10_explore", 7)))
+        self.pattern_macro_w10_action_spin.setValue(int(self._agent_cfg.get("pattern_macro_w10_action", 1)))
+        self.pattern_min_steps_between_spin.setValue(int(self._agent_cfg.get("pattern_min_steps_between", 3)))
+        self.pattern_cooldown_seconds_spin.setValue(int(self._agent_cfg.get("pattern_cooldown_seconds", 60)))
 
