@@ -414,8 +414,9 @@ def test_control_and_diagnostic_events_reach_a_consumer(tmp_path):
 def test_first_install_success_prompts_restart(tmp_path):
     """首次安装成功必须提示重启 DSH（运行中的 DSH 不自动加载新装插件）。
 
-    安装只写盘（profile 依赖 + bundles），DST 插件加载器在启动时扫描——运行中
-    新增依赖不生效。首次安装的唯一一次重启提示必须显示（不走 persona 模板，
+    安装只写盘（profile 依赖 + bundles），DshMonitor.install_bridge 返回
+    first_install 标志：首次安装提示重启（仅这一次）；已安装刷新不提示
+    （壳已在跑、热重载接手）。提示必须直接 show_bubble（不走 persona 模板，
     模板会覆盖掉它）。"""
     _qapp()
     bubbles = []
@@ -429,8 +430,15 @@ def test_first_install_success_prompts_restart(tmp_path):
 
     cfg = Config(base=tmp_path)
     manager = AgentLinkManager(DummyWindow(), cfg, min_interval=0)
-    manager._on_install_finished("dsh", True, "已安装到 1 个 dsh 实例")
+    # 首次安装（first_install=True）：必须提示动作（重启 或 启动，取决于 DSH 是否在跑）
+    manager._on_install_finished("dsh", True, "已安装到 1 个 dsh 实例", first_install=True)
     assert bubbles, "首次安装成功必须弹气泡"
-    assert any("重启" in b and "生效" in b for b in bubbles), \
-        f"首次安装气泡必须提示重启 DSH: {bubbles}"
+    assert any("请重启" in b or "请启动" in b for b in bubbles), \
+        f"首次安装气泡必须提示重启/启动 DSH: {bubbles}"
+    # 已安装刷新（first_install=False）：不得提示重启
+    bubbles.clear()
+    manager._on_install_finished("dsh", True, "已更新", first_install=False)
+    assert bubbles, "刷新成功也应弹气泡"
+    assert not any("请重启" in b or "请启动" in b for b in bubbles), \
+        f"刷新成功不得提示重启/启动（热重载已接手）: {bubbles}"
     manager.shutdown()

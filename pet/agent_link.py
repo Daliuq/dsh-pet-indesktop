@@ -1813,6 +1813,10 @@ class DshMonitor(BaseAgentMonitor):
         failed = []
         succeeded = []
         repaired_notes: list[str] = []
+        # 是否发生过「首次安装」（装之前 profile 没有该插件）。已安装的刷新
+        # 不算——那不需要重启 DSH（壳已在跑，热重载接手）。返回给 UI 决定
+        # 是否提示「请重启 DSH」（仅首次安装需要）。
+        saw_first_install = False
         for profile in profiles:
             pkg = _read_manifest(profile)
             if pkg is None:
@@ -1843,6 +1847,8 @@ class DshMonitor(BaseAgentMonitor):
                     continue
                 succeeded.append(profile.name)
                 continue
+            # 首次安装：此前 profile manifest 没有该插件（L1846 之前无插件分支）
+            saw_first_install = True
             rc, out, repaired = _run_pnpm_repairing_specs(profile, "add", str(plugin))
             if rc != 0:
                 failed.append(
@@ -1864,14 +1870,14 @@ class DshMonitor(BaseAgentMonitor):
             succeeded.append(profile.name)
         if failed:
             # 不做整批回滚：已装成功的保持不动（旧版回滚会把刚装好的反而卸掉）
-            return False, "部分实例安装失败（已装成功的保持不动）——" + "；".join(failed)
+            return False, "部分实例安装失败（已装成功的保持不动）——" + "；".join(failed), saw_first_install
         note = ""
         if repaired_notes:
             note = (
                 "；已自动修正失效的依赖路径（原文件备份为 package.json.bak-*）："
                 + "；".join(repaired_notes)
             )
-        return True, f"桥接插件已安装到 {len(succeeded)} 个 dsh 实例（{', '.join(succeeded)}）{note}"
+        return True, f"桥接插件已安装到 {len(succeeded)} 个 dsh 实例（{', '.join(succeeded)}）{note}", saw_first_install
 
     @classmethod
     def uninstall_bridge(cls) -> bool:
@@ -2359,7 +2365,7 @@ class AgentLinkManager(QObject):
     挂载于 PetWindow，持有 4 个 Agent 的监视器，并根据状态驱动桌宠动作与气泡。
     """
 
-    install_finished = Signal(str, bool, str, int)  # (agent_key, ok, message, install_token)
+    install_finished = Signal(str, bool, str, int, bool)  # (agent_key, ok, message, install_token, first_install)
     # DSH 回写结果（后台线程 emit，队列投递回主线程）：(ok, detail)
     _respond_result = Signal(bool, str)
     # 探索 Watchdog 控制结果（后台线程 emit，队列投递回主线程）：
@@ -2609,12 +2615,12 @@ class AgentLinkManager(QObject):
 
     def _install_dsh_worker(self, token: int) -> None:
         """后台线程：安装 DSH 桥接插件，完成后信号回主线程。"""
-        ok, msg = DshMonitor.install_bridge()
+        ok, msg, first_install = DshMonitor.install_bridge()
         if token != self._install_token:
             log.info("DSH 桥接安装结果已过期，丢弃")
             return
         try:
-            self.install_finished.emit("dsh", ok, msg, token)
+            self.install_finished.emit("dsh", ok, msg, token, first_install)
         except RuntimeError:
             log.debug("DSH 桥接安装完成但管理器已销毁，丢弃结果")
 
@@ -2645,9 +2651,39 @@ class AgentLinkManager(QObject):
                 duration_ms=6000,
             )
 
+    def _dsh_online_now(self) -> bool:
+        """此刻 DSH 是否在运行（同步探测，用于首次安装提示区分「重启/启动」）。
+
+        探测 127.0.0.1 的候选端口（3080 / 38080 / DSH_PORT）任一有监听即在线；
+        与 dsh_state 的在线基线同一判据。异常绝不外抛（提示降级为「重启」）。
+        """
+        try:
+            from . import harness_launcher
+            ports: set[int] = set()
+            env_port = __import__("os").environ.get("DSH_PORT")
+            if env_port:
+                try:
+                    ports.add(int(env_port))
+                except (TypeError, ValueError):
+                    pass
+            ports.update((3080, 38080))
+            return any(
+                harness_launcher.is_running(p) for p in sorted(ports)
+            )
+        except Exception:
+            log.debug("DSH 在线探测异常（按重启提示）", exc_info=True)
+            # 探测失败保守提示「重启」（若 DSH 真没跑，用户启动即可，无歧义）
+            return True
+
     def _on_install_finished(self, agent_key: str, ok: bool, msg: str,
-                             token: int | None = None) -> None:
-        """安装完成：成功则正式开启联动，失败则提示。"""
+                             token: int | None = None,
+                             first_install: bool = False) -> None:
+        """安装完成：成功则正式开启联动，失败则提示。
+
+        first_install=True（装之前 profile 没有该插件）才提示重启 DSH——
+        运行中的 DSH（cordis 启动时扫描 profile）不会自动加载新装插件；
+        已安装的刷新不算（壳已在跑，热重载接手，无需重启）。
+        """
         if self._shutdown:
             return
         if token is not None and self._install_pending.get(agent_key) != token:
@@ -2664,16 +2700,27 @@ class AgentLinkManager(QObject):
             if hasattr(self.win, "show_bubble"):
                 name = self.AGENT_NAMES.get(agent_key, agent_key)
                 if self._report_allowed(self.cfg.get("agent_link", {}), "bridge.install.success"):
-                    # 安装只写盘（profile 依赖 + bundles），运行中的 DSH 不会
-                    # 自动加载**新装的**插件——首次安装必须重启 DSH 才挂载壳；
-                    # 之后的一切升级/修复走壳的热重载（≤2s 生效），无需再重启。
-                    # 直接 show_bubble（不用 _dialogue：persona 模板会覆盖掉
-                    # 重启提示，而这个提示是首次安装的必要说明，必须显示）。
-                    self.win.show_bubble(
-                        f"{name} 桥接插件已装好，联动开启～\n"
-                        "首次安装需要重启 DSH 生效（仅这一次；之后升级都自动生效）",
-                        duration_ms=7000,
-                    )
+                    if first_install:
+                        # 首次安装：运行中的 DSH（cordis 启动时扫描 profile）
+                        # 不会自动加载新装插件——DSH 正在跑要**重启**才挂载壳；
+                        # DSH 还没启动（全新机器）则直接**启动**即可。之后的一切
+                        # 升级/修复走壳热重载（≤2s 生效），无需再重启。直接
+                        # show_bubble（不用 _dialogue：persona 模板会覆盖掉提示，
+                        # 而这是首次安装的必要说明）。
+                        action = self._dsh_online_now() and "重启" or "启动"
+                        self.win.show_bubble(
+                            f"{name} 桥接插件已装好，联动开启～\n"
+                            f"首次安装请{action} DSH 生效（仅这一次；之后升级都自动生效）",
+                            duration_ms=7000,
+                        )
+                    else:
+                        # 非首次（刷新）：壳已在 DSH 里跑、热重载接手，无需重启。
+                        # 同样直接 show_bubble（_dialogue 会被 persona 模板覆盖，
+                        # 且这里要保留「无需重启」的关键说明）。
+                        self.win.show_bubble(
+                            f"{name} 桥接插件已安装完成，联动保持开启（无需重启）",
+                            duration_ms=4000,
+                        )
         else:
             log.warning("DSH 桥接插件安装失败: %s", msg)
             if hasattr(self.win, "show_bubble"):

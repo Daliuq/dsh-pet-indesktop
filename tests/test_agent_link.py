@@ -1492,7 +1492,7 @@ class TestInstallErrorSummary:
 
         monkeypatch.setattr(agent_link.subprocess, "run", fake_run)
 
-        ok, message = DshMonitor.install_bridge()
+        ok, message, _ = DshMonitor.install_bridge()
 
         assert ok is True
         assert "1 个 dsh 实例" in message
@@ -3640,7 +3640,7 @@ class TestInstallFinishedGuard:
 
         def fake_install():
             assert release.wait(timeout=5.0), "测试释放信号未到达"
-            return (True, "ok")
+            return (True, "ok", False)
 
         monkeypatch.setattr(
             DshMonitor, "install_bridge", classmethod(lambda cls: fake_install()),
@@ -3748,7 +3748,7 @@ class TestInstallFinishedGuard:
         def fake_install():
             ev = queue.pop(0)
             assert ev.wait(timeout=5.0), "测试释放信号未到达"
-            return (True, "ok")
+            return (True, "ok", False)
 
         monkeypatch.setattr(
             DshMonitor, "install_bridge", classmethod(lambda cls: fake_install()),
