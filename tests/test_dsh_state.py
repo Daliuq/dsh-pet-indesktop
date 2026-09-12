@@ -213,7 +213,7 @@ def test_recovery_after_restart(tmp_path, monkeypatch):
 
     _write(bridge_dir, *(_records_for("turn/start")))
     tracker._poll_events()
-    assert tracker.current_state is DshState.THINKING
+    assert tracker.current_state is DshState.WORKING
 
 
 def test_user_message_plugin_source_ignored(tmp_path, monkeypatch):

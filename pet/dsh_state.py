@@ -85,9 +85,16 @@ _AGENT_STATUS_STATE = {
 # 桥接「简单事件」（DSH 原始 session/event 类型）→ 统一状态。
 # 事件名来自 DSH dsh-session/known-event-types.js 的真实词汇。
 _EVENT_TO_STATE = {
-    # 用户提交 / turn 开始 → 思考
+# 用户提交 / 流式生成 → 思考（真人提问与模型推理是"思考"语义）
     "user/message": DshState.THINKING,
-    "turn/start": DshState.THINKING,
+    "assistant/chunk": DshState.THINKING,
+    "plan/mode": DshState.THINKING,
+    # turn/start：回合**开始执行**，属 working，不是思考。
+    # 启动/新回合瞬间 DSH 会先发 AgentStatus working 再发 turn/start（间隔
+    # ~2ms），若 turn/start 标 thinking 会把刚亮的 working 顶掉——用户看到
+    # 「启动事件被 think 覆盖」（working 存活仅 1-2ms，约 1.2s 后又回 working）。
+    # 思考语义由 user/message（真人消息）与 assistant/chunk（流式推理）表达。
+    "turn/start": DshState.WORKING,
     # 工具 / 步骤 / 命令执行 → working
     "assistant/message": DshState.WORKING,
     "tool/call": DshState.WORKING,
