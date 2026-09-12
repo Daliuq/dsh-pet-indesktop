@@ -2700,27 +2700,24 @@ class AgentLinkManager(QObject):
             if hasattr(self.win, "show_bubble"):
                 name = self.AGENT_NAMES.get(agent_key, agent_key)
                 if self._report_allowed(self.cfg.get("agent_link", {}), "bridge.install.success"):
+                    # 走 _dialogue（保证 persona 模板与 name 注入对齐——AST 契约
+                    # 测试 test_all_advertised_fields... 锁死 install.success 宣称
+                    # name 必须注入）。重启/启动提示作为**追加行**跟在模板文案后：
+                    # 不绕过 _dialogue（避免模板契约失配），又保留首次安装的必要
+                    # 说明（运行中的 DSH 不自动加载新装插件）。
+                    base = self._dialogue(
+                        "bridge.install.success",
+                        "DSH 桥接插件已装好，联动开启～",
+                        name=name,
+                    )
                     if first_install:
-                        # 首次安装：运行中的 DSH（cordis 启动时扫描 profile）
-                        # 不会自动加载新装插件——DSH 正在跑要**重启**才挂载壳；
-                        # DSH 还没启动（全新机器）则直接**启动**即可。之后的一切
-                        # 升级/修复走壳热重载（≤2s 生效），无需再重启。直接
-                        # show_bubble（不用 _dialogue：persona 模板会覆盖掉提示，
-                        # 而这是首次安装的必要说明）。
                         action = self._dsh_online_now() and "重启" or "启动"
-                        self.win.show_bubble(
-                            f"{name} 桥接插件已装好，联动开启～\n"
-                            f"首次安装请{action} DSH 生效（仅这一次；之后升级都自动生效）",
-                            duration_ms=7000,
-                        )
+                        text = f"{base}\n首次安装请{action} DSH 生效（仅这一次；之后升级都自动生效）"
+                        duration = 7000
                     else:
-                        # 非首次（刷新）：壳已在 DSH 里跑、热重载接手，无需重启。
-                        # 同样直接 show_bubble（_dialogue 会被 persona 模板覆盖，
-                        # 且这里要保留「无需重启」的关键说明）。
-                        self.win.show_bubble(
-                            f"{name} 桥接插件已安装完成，联动保持开启（无需重启）",
-                            duration_ms=4000,
-                        )
+                        text = f"{base}（无需重启）"
+                        duration = 4000
+                    self.win.show_bubble(text, duration_ms=duration)
         else:
             log.warning("DSH 桥接插件安装失败: %s", msg)
             if hasattr(self.win, "show_bubble"):
