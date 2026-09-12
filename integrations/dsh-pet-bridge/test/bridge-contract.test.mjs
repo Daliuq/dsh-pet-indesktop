@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import {
   apply,
   BRIDGE_CAPABILITIES,
@@ -14,9 +15,17 @@ import {
 
 const source = fs.readFileSync(new URL("../index.js", import.meta.url), "utf8");
 const packageJson = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+// 事件字面量（event: "..."）与 STATE_EVENT_TYPES/WATCHDOG_EVENT_TYPES 集合
+// 全部住在 impl/<version>/ 实现层；壳只剩协议常量与热重载逻辑。扫描必须
+// 覆盖「壳 + 当前版本实现」，否则测试只扫壳会空转（壳内 event 字面量为 0）。
+const bridgeRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const implSourcePath = path.join(bridgeRoot, "impl", String(packageJson.version || ""), "index.js");
+assert.ok(fs.existsSync(implSourcePath), `impl/${packageJson.version}/index.js 应存在（与 package.json.version 对应）`);
+const implSource = fs.readFileSync(implSourcePath, "utf8");
+const producerSource = `${source}\n${implSource}`;
 
 function setValues(name) {
-  const bodyMatch = source.match(new RegExp(`const ${name} = new Set\\(\\[([\\s\\S]*?)\\]\\);`));
+  const bodyMatch = implSource.match(new RegExp(`const ${name} = new Set\\(\\[([\\s\\S]*?)\\]\\);`));
   if (!bodyMatch) return [];
   // Restrict extraction to entries occupying their own source line, so quoted
   // examples in comments do not look like producer events.
@@ -25,7 +34,7 @@ function setValues(name) {
 
 test("the exported inventory covers every literal and dynamic producer event", () => {
   const inventory = new Set(BRIDGE_EVENT_INVENTORY);
-  const literalEvents = [...source.matchAll(/\bevent:\s*"([^"]+)"/g)].map((match) => match[1]);
+  const literalEvents = [...producerSource.matchAll(/\bevent:\s*"([^"]+)"/g)].map((match) => match[1]);
   for (const event of literalEvents) assert.ok(inventory.has(event), `missing literal event: ${event}`);
   for (const name of ["STATE_EVENT_TYPES", "WATCHDOG_EVENT_TYPES"]) {
     for (const event of setValues(name)) assert.ok(inventory.has(event), `missing ${name} event: ${event}`);

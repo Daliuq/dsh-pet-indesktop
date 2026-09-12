@@ -168,23 +168,59 @@ def _exported_js_strings(source: str, name: str) -> set[str]:
     return set(re.findall(r'\"([^\"]+)\"', match.group(1)))
 
 
+def _impl_const_js_strings(source: str, name: str) -> set[str]:
+    # impl 层的清单不是 `export const X = Object.freeze(...)`，而是
+    # `const X = Object.freeze(...)` + 底部 `export { X }`（壳/实现双副本）。
+    # 热重载后新实现若改动契约，Pet 侧会拒绝 hello——但测试必须在事前抓住
+    # 双副本漂移（否则壳副本与 Pet 一致、impl 副本却已跑偏，测试全绿）。
+    match = re.search(
+        rf"const {name} = Object\.freeze\(\[(.*?)\]\);", source, re.S,
+    )
+    assert match is not None, f"missing impl const: {name}"
+    return set(re.findall(r'\"([^\"]+)\"', match.group(1)))
+
+
 def test_bundled_bridge_and_pet_contracts_are_identical():
-    """The two runtimes may not add an event/capability/version independently."""
+    """The two runtimes may not add an event/capability/version independently.
+
+    The bridge is now a stable shell (index.js) plus impl/<version>/index.js.
+    The impl layer carries its own copy of the protocol constants and the
+    hello record is written by the impl layer, so this test must check BOTH
+    the shell export AND the impl-layer copy against Pet.  Only reading the
+    shell would leave the runtime-emitting impl copy unverified.
+    """
     root = Path(__file__).resolve().parents[1]
     bridge_root = root / "integrations" / "dsh-pet-bridge"
     source = (bridge_root / "index.js").read_text(encoding="utf-8")
     package = json.loads((bridge_root / "package.json").read_text(encoding="utf-8"))
 
-    assert _exported_js_strings(source, "BRIDGE_EVENT_INVENTORY") == set(
-        BRIDGE_EVENT_INVENTORY
+    # 当前激活版本的实现层（与 package.json.version 精确对应，不扫全部历史
+    # 版本——与壳 probeDisk 的选中语义一致）。
+    impl_dir = bridge_root / "impl" / str(package.get("version", ""))
+    impl_source = (impl_dir / "index.js").read_text(encoding="utf-8")
+
+    shell_inventory = _exported_js_strings(source, "BRIDGE_EVENT_INVENTORY")
+    impl_inventory = _impl_const_js_strings(impl_source, "BRIDGE_EVENT_INVENTORY")
+    assert shell_inventory == impl_inventory == set(BRIDGE_EVENT_INVENTORY), (
+        "shell/impl/Pet event inventory drifted: "
+        f"shell-only={sorted(shell_inventory - set(BRIDGE_EVENT_INVENTORY))} "
+        f"impl-only={sorted(impl_inventory - set(BRIDGE_EVENT_INVENTORY))} "
+        f"pet-only={sorted(set(BRIDGE_EVENT_INVENTORY) - shell_inventory)}"
     )
-    assert _exported_js_strings(source, "BRIDGE_CAPABILITIES") == set(
-        BRIDGE_CAPABILITIES
+    shell_capabilities = _exported_js_strings(source, "BRIDGE_CAPABILITIES")
+    impl_capabilities = _impl_const_js_strings(impl_source, "BRIDGE_CAPABILITIES")
+    assert shell_capabilities == impl_capabilities == set(BRIDGE_CAPABILITIES), (
+        "shell/impl/Pet capability inventory drifted: "
+        f"shell-only={sorted(shell_capabilities - set(BRIDGE_CAPABILITIES))} "
+        f"impl-only={sorted(impl_capabilities - set(BRIDGE_CAPABILITIES))} "
+        f"pet-only={sorted(set(BRIDGE_CAPABILITIES) - shell_capabilities)}"
     )
     assert package["version"] == BRIDGE_VERSION
     protocol = re.search(r"export const BRIDGE_PROTOCOL_VERSION = (\d+);", source)
     assert protocol is not None
-    assert int(protocol.group(1)) == BRIDGE_PROTOCOL_VERSION
+    impl_protocol = re.search(r"const BRIDGE_PROTOCOL_VERSION = (\d+);", impl_source)
+    assert impl_protocol is not None
+    assert int(protocol.group(1)) == int(impl_protocol.group(1)) == BRIDGE_PROTOCOL_VERSION
 
 
 def test_hello_requires_the_exact_capability_inventory():
