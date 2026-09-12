@@ -799,6 +799,9 @@ class WebMClip(QObject):
         self._queue: queue.Queue = queue.Queue(maxsize=8)
         self._stop_evt = threading.Event()
         self._thread: threading.Thread | None = None
+        # 播放真实时间锚点（B3）：start() 时置 time.monotonic()，stop/未启动为 0
+        # （currentTimeSeconds 据此返回真实耗时，替代帧索引推导的假时间）。
+        self._play_started_at = 0.0
         # 当前 active reader 持有的 ffmpeg 进程句柄（_reader_lock 保护，reader 线程
         # 注册、GUI 线程 stop 时读取/清空并 terminate）。
         self._reader_proc: subprocess.Popen | None = None
@@ -1264,6 +1267,12 @@ class WebMClip(QObject):
         return self._current_frame_index
 
     def currentTimeSeconds(self) -> float:
+        # B3 修复：用真实时间（播放启动锚点 + monotonic），不再按帧索引 ÷
+        # (fps × speed) 推导——解码丢帧/背压/变速会让帧计数与真实时间脱钩，
+        # 帧率不同的机器上同一次播放会得出不同的"时长"（用户实测 <4s 失真）。
+        # 播放未启动（_play_started_at ≤ 0）时返回 0，与旧语义一致。
+        if self._play_started_at > 0:
+            return max(0.0, time.monotonic() - self._play_started_at)
         if self._fps <= 0:
             return 0.0
         return self._current_frame_index / (self._fps * self.playback_speed)
@@ -1411,6 +1420,11 @@ class WebMClip(QObject):
         self._queue = queue.Queue(maxsize=8)
         self._frame_index = 0
         self._current_frame_index = 0  # 新一轮播放从头计时（P1 复审）
+        # B3 修复：播放真实时间锚点（time.monotonic 秒）。currentTimeSeconds
+        # 不再用「帧索引 ÷ (fps × speed)」推导——解码丢帧/背压/变速时帧计数
+        # 与真实时间脱钩，那个"秒"会失真（用户实测：帧率变化时计时间隔 <4s
+        # 真实秒）。改为从播放启动时刻起算的真实耗时，与消费端帧率无关。
+        self._play_started_at = time.monotonic()
         self._ended_fired = False
         self._soft_parked = False
         self._natural_end_pending = False
