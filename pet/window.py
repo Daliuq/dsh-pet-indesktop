@@ -748,7 +748,7 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
             self._arm_screen_restore_retry()
 
         self.attach_collision_session(collision_session)
-        self._install_effect_services()
+        self.sync_optional_services()
 
     @property
     def click_sound_enabled(self) -> bool:
