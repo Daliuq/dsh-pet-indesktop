@@ -495,9 +495,12 @@ class TestRealFileTailEndToEnd:
 
         cfg = Config(base=tmp_path)
         # 本用例验的是「状态 → 桌宠动作 + 完成提醒」的映射，所以显式开 done 门
-        # （基线其它门全关；见文件头 _AGENT_GATE_BASELINE）。
+        # （基线其它门全关；见文件头 _AGENT_GATE_BASELINE），并关掉状态气泡
+        # 时间门（=0）——动画/气泡限频由 test_throttled_within_interval 单独覆盖，
+        # 这里聚焦映射本身不受限频干扰。
         ag = dict(cfg.get("agent_link", {}))
         ag["report_gates"] = _agent_gates(done=1.0)
+        ag["state_bubble_min_interval"] = 0.0
         cfg.set("agent_link", ag)
         win = DummyPetWindow()
         mgr = AgentLinkManager(win, cfg, min_interval=0.0)  # 测试关闭节流，逐个验证状态映射
@@ -685,21 +688,27 @@ class TestAgentStateDebounce:
         assert switched == ["写代码"]  # 只切一次
 
     def test_throttled_within_interval(self, tmp_path):
-        """状态气泡时间门（state_bubble_min_interval）控**气泡**频率；动画动作池
-        轮换不受影响（working→thinking 各自触发动画切换）。
+        """状态气泡**时间门**（state_bubble_min_interval）对动画与气泡同频限频。
 
-        旧语义：busy↔busy 节流把 working→thinking 的动画也挡掉（用户实测
-        thinking 无表现）。新语义：thinking 照弹（气泡受时间门限频，动画轮换
-        保持），节流保护整体由 report_gates 概率门 + 时间门共同承担。"""
+        回归背景：移除 busy↔busy 节流后，working↔thinking 每 2-5s 切换让动作池
+        轮换名每次不同 → window 侧立即 _switch → 反复启停 ffmpeg 解码进程
+        （pet 性能下降，实测多个 reader 同时退出）。修复：动画与气泡共用一次
+        时间门（_state_bubble_gate），门内都不出现，到期都恢复（保轮换语义）。"""
         mgr, switched, clock = self._make_mgr(tmp_path)
         mgr._on_agent_state("claude", "working")
+        n1 = len(switched)
+        assert n1 >= 1  # working 触发动画
         clock[0] += 1.0  # 1s < 2s 时间门
         mgr._on_agent_state("claude", "thinking")
-        # thinking 照常切换动画（动作池轮换不受时间门抑制）
-        assert switched == ["写代码", "写代码"] or len(switched) >= 1
-        clock[0] += 2.0
+        assert len(switched) == n1, "时间门内 thinking 不得重复请求动画（性能回归）"
+        # 交替（working→thinking 换态）但仍在门内：也不切
+        clock[0] += 0.5  # 累计 1.5s < 2s
+        mgr._on_agent_state("claude", "working")
+        assert len(switched) == n1, "门内交替状态也不得重复请求动画"
+        # 超出门：动画按轮换序列恢复
+        clock[0] += 2.1  # 累计 3.6s > 2s
         mgr._on_agent_state("claude", "thinking")
-        assert len(switched) >= 2  # 动作池继续轮换
+        assert len(switched) > n1, "时间门到期后动画恢复轮换"
 
 
 class TestAgentMenuRebound:
