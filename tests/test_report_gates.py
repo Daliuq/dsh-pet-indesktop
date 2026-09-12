@@ -13,6 +13,9 @@
 """
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import pytest
 
 from pet.config import _clean_agent_link_data, _default_agent_link_data
@@ -129,6 +132,38 @@ def test_gate_for_event_maps_every_dialogue_key():
         else:
             assert gate in GATE_KEYS, f"{key} 映射到未知门 {gate}"
     assert unmapped == [], f"这些事件键没有归属门：{unmapped}"
+
+
+def test_bubble_dialogue_inventory_has_explicit_gate_mapping():
+    """Runtime dialogue/report keys must stay in the explicit gate inventory.
+
+    The runtime has a few keys selected conditionally (for example the
+    watchdog control result and model-access aggregation), so checking only
+    the visible settings labels can miss a new bubble path.  Parse literal
+    ``_dialogue`` and ``_report_allowed`` calls here as a contract guard; the
+    test deliberately does not modify or import the runtime implementation.
+    """
+    root = Path(__file__).resolve().parents[1]
+    tree = ast.parse((root / "pet" / "agent_link.py").read_text(encoding="utf-8"))
+    runtime_keys = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr == "_dialogue" and node.args:
+            value = node.args[0]
+        elif node.func.attr == "_report_allowed" and len(node.args) > 1:
+            value = node.args[1]
+        else:
+            continue
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            runtime_keys.add(value.value)
+
+    from pet.report_gates import REPORT_EVENT_KEYS, gate_for_event
+
+    missing_inventory = sorted(runtime_keys - set(REPORT_EVENT_KEYS))
+    assert not missing_inventory, f"运行时事件未登记：{missing_inventory}"
+    unmapped = sorted(key for key in runtime_keys if gate_for_event(key) is None)
+    assert not unmapped, f"运行时事件没有显式概率门：{unmapped}"
 
 
 @pytest.mark.parametrize("event_key,gate", [

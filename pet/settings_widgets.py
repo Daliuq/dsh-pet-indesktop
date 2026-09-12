@@ -1205,9 +1205,10 @@ class SettingsSection(QWidget):
             self.toggle.update()
 
 class ProbabilitySlider(QWidget):
-    """事件气泡触发概率滑块：0.00–1.00（步长 0.05），没有开关。
+    """事件气泡触发概率滑块：0%–100%（步长 5%），没有开关。
 
-    值即**通过概率**：``0.00`` = 该类事件完全不汇报，``1.00`` = 全部汇报。
+    持久化值仍是 0.00–1.00 的**通过概率**，界面显示为用户熟悉的百分比：
+    ``0%`` = 该类事件完全不汇报，``100%`` = 全部汇报。
     滑块是唯一控制项（用户口径：设置位置与真正控制的位置绑定）；右键菜单只
     提供 0/1 两端快捷入口，细粒度一律回到这里调。
     """
@@ -1215,7 +1216,7 @@ class ProbabilitySlider(QWidget):
     valueChanged = Signal(float)
 
     _STEPS = 20          # 20 档 × 0.05
-    _VALUE_WIDTH = 40    # 固定宽度：值文本变化不引起控件抖动
+    _VALUE_WIDTH = 46    # 固定宽度：值文本变化不引起控件抖动
 
     def __init__(self, parent=None, *, value: float = 1.0):
         super().__init__(parent)
@@ -1227,9 +1228,11 @@ class ProbabilitySlider(QWidget):
         self._slider.setPageStep(4)
         self._slider.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._slider.setMinimumWidth(140)
+        self._slider.setMinimumHeight(24)
         self._slider.setAccessibleName("通过概率")
         self._value_label = QLabel(self)
         self._value_label.setObjectName("probabilitySliderValue")
+        self._value_label.setAccessibleName("当前通过概率")
         self._value_label.setMinimumWidth(self._VALUE_WIDTH)
         self._value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         layout = QHBoxLayout(self)
@@ -1237,6 +1240,9 @@ class ProbabilitySlider(QWidget):
         layout.setSpacing(8)
         layout.addWidget(self._slider, 1)
         layout.addWidget(self._value_label, 0)
+        self.setMinimumHeight(30)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._slider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._slider.valueChanged.connect(self._sync_from_slider)
         self.setValue(value)
 
@@ -1262,7 +1268,7 @@ class ProbabilitySlider(QWidget):
 
     def _sync_from_slider(self, raw: int) -> None:
         value = raw / float(self._STEPS)
-        self._value_label.setText(f"{value:.2f}")
+        self._value_label.setText(f"{round(value * 100):.0f}%")
         self.valueChanged.emit(value)
 
 

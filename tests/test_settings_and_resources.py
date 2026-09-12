@@ -7,11 +7,13 @@ import wave
 from pathlib import Path
 
 import pytest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QLabel
 
 from pet.click_sound import resolve_builtin_sound
 from pet.config import Config
 from pet.modern_settings_dialog import ModernSettingsDialog, SettingRow
+from pet.report_gates import REPORT_GATE_HINTS, REPORT_GATE_KEYS, REPORT_GATE_LABELS
+from pet.settings_widgets import ProbabilitySlider
 
 
 @pytest.fixture(scope="session")
@@ -43,6 +45,38 @@ def test_builtin_agent_sounds_exist_and_valid_wav():
             assert num_frames > 0
             duration = num_frames / wf.getframerate()
             assert 0.1 <= duration <= 1.0
+
+
+def test_probability_slider_displays_percentages_but_keeps_unit_probability(qapp):
+    """The settings control speaks in percentages while persistence stays 0..1."""
+    slider = ProbabilitySlider(value=0.0)
+    value_label = slider.findChild(QLabel, "probabilitySliderValue")
+    assert value_label is not None
+    assert value_label.text() == "0%"
+
+    slider.setValue(0.6)
+    assert slider.value() == pytest.approx(0.6)
+    assert value_label.text() == "60%"
+
+    slider.setValue(1.0)
+    assert slider.value() == pytest.approx(1.0)
+    assert value_label.text() == "100%"
+    slider.deleteLater()
+
+
+def test_report_gate_rows_use_category_copy_and_accessible_names(qapp, tmp_path: Path):
+    """Each gate row explains its category and exposes that category to AT."""
+    dialog = ModernSettingsDialog(Config(tmp_path / "report-gates"), include_ai=False)
+    try:
+        for gate in REPORT_GATE_KEYS:
+            row = dialog.findChild(SettingRow, f"settingRow_report_gate_{gate}")
+            assert row is not None
+            assert REPORT_GATE_LABELS[gate] in row.label.text()
+            assert REPORT_GATE_HINTS[gate] in row.hint_label.text()
+            assert "0%" in row.hint_label.text() and "100%" in row.hint_label.text()
+            assert REPORT_GATE_LABELS[gate] in row.control.accessibleName()
+    finally:
+        dialog.deleteLater()
 
 
 def test_modern_settings_dialog_round_trip(qapp, tmp_path: Path):

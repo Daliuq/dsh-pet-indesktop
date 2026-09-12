@@ -42,6 +42,19 @@ REPORT_GATE_LABELS: dict[str, str] = {
     "bridge": "桥接、写回与查询",
 }
 
+#: 设置页每个门的简短说明。文案按类别写，避免八个滑块重复一段难读的
+#: 内部术语；“0% / 100%”也让控件的端点语义在不打开帮助时即可理解。
+REPORT_GATE_HINTS: dict[str, str] = {
+    "state": "开始工作、思考等状态气泡的显示频率。",
+    "activity": "读取文件、搜索、编辑和运行命令等过程气泡的显示频率。",
+    "approval": "审批和用户问题气泡的显示频率；需要你处理的提醒建议保持开启。",
+    "done": "任务完成或暂停待确认气泡的显示频率。",
+    "exec_failed": "执行失败、工具错误等气泡的显示频率。",
+    "model_access": "模型访问失败和 AI 服务错误气泡的显示频率。",
+    "stuck": "卡住、行为重复和循环检测提醒的显示频率。",
+    "bridge": "桥接安装、写回、Agent 缺失和余额查询气泡的显示频率。",
+}
+
 #: 旧布尔开关 → 新概率门（一次性迁移用；迁移后不再写回旧键）
 LEGACY_SWITCH_GATES: dict[str, str] = {
     "notify_state": "state",
@@ -56,13 +69,70 @@ LEGACY_PERCENT_GATES: dict[str, str] = {
     "report_probability": "activity",
 }
 
-#: 事件键前缀 → 门名。判定顺序：先精确表，再前缀表。
+#: 所有当前会进入 ``_dialogue`` 或 ``_report_allowed`` 的稳定事件键。
+#:
+#: 这份清单是设置页文案编辑器与运行时报告路径之间的契约：新增一个
+#: 稳定气泡事件时，必须先登记它，再为它选择所属门。带有动态后缀的
+#: 事件（例如 ``activity.<tool>``）仍由下方前缀表覆盖。
+REPORT_EVENT_KEYS: tuple[str, ...] = (
+    "start", "thinking",
+    "activity.read", "activity.search", "activity.edit", "activity.run", "activity.default",
+    "agent.attention", "agent.error", "agent.missing",
+    "bridge.install.pending", "bridge.install.success", "bridge.install.failed",
+    "bridge.uninstall.failed", "bridge.unknown", "dsh.writeback.failed",
+    "approval.command", "approval.tool", "approval.generic",
+    "question.empty", "question.one", "question.many",
+    "watchdog.warning", "watchdog.control", "watchdog.control.result",
+    "model_access.one", "model_access.many", "llm_error.api",
+    "done.success", "done.attention",
+    "failure.retry", "failure.tool", "failure.generic",
+    "stuck.reminder", "pattern.warning", "pattern.control",
+    "balance.loading", "balance.result",
+)
+
+#: 事件键 → 门名。判定顺序：先精确表，再前缀表。
+#:
+#: 稳定事件在精确表中逐项列出，避免只依赖前缀时漏掉 typo 或新增的
+#: 特殊键；前缀表则保留给工具类型等可扩展的动态事件。
 _EVENT_EXACT: dict[str, str] = {
     "start": "state",
     "thinking": "state",
+    "activity.read": "activity",
+    "activity.search": "activity",
+    "activity.edit": "activity",
+    "activity.run": "activity",
+    "activity.default": "activity",
     "agent.attention": "approval",
     "agent.error": "exec_failed",
     "agent.missing": "bridge",
+    "bridge.install.pending": "bridge",
+    "bridge.install.success": "bridge",
+    "bridge.install.failed": "bridge",
+    "bridge.uninstall.failed": "bridge",
+    "bridge.unknown": "bridge",
+    "dsh.writeback.failed": "bridge",
+    "approval.command": "approval",
+    "approval.tool": "approval",
+    "approval.generic": "approval",
+    "question.empty": "approval",
+    "question.one": "approval",
+    "question.many": "approval",
+    "watchdog.warning": "stuck",
+    "watchdog.control": "stuck",
+    "watchdog.control.result": "stuck",
+    "model_access.one": "model_access",
+    "model_access.many": "model_access",
+    "llm_error.api": "model_access",
+    "done.success": "done",
+    "done.attention": "done",
+    "failure.retry": "exec_failed",
+    "failure.tool": "exec_failed",
+    "failure.generic": "exec_failed",
+    "stuck.reminder": "stuck",
+    "pattern.warning": "stuck",
+    "pattern.control": "stuck",
+    "balance.loading": "bridge",
+    "balance.result": "bridge",
 }
 
 _EVENT_PREFIX: tuple[tuple[str, str], ...] = (

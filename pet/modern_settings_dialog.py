@@ -140,7 +140,13 @@ from .persona_template import (
     PARAMETERS,
 )
 from . import settings_pet_controls
-from .report_gates import REPORT_GATE_KEYS, REPORT_GATE_LABELS, gate_for_event
+from .report_gates import (
+    REPORT_EVENT_KEYS,
+    REPORT_GATE_HINTS,
+    REPORT_GATE_KEYS,
+    REPORT_GATE_LABELS,
+    gate_for_event,
+)
 
 
 # 语言配置页只展示用户能理解的事件名称；内部 key 仍用于保存和渲染。
@@ -151,11 +157,13 @@ DIALOGUE_LABELS = {
     "agent.attention": "需要用户处理", "agent.error": "Agent 出错",
     "agent.missing": "未找到 Agent", "bridge.install.pending": "安装桥接中",
     "bridge.install.success": "桥接安装成功", "bridge.install.failed": "桥接安装失败",
-    "bridge.uninstall.failed": "桥接卸载失败", "dsh.writeback.failed": "agent 写回失败",
+    "bridge.uninstall.failed": "桥接卸载失败", "bridge.unknown": "桥接事件不兼容",
+    "dsh.writeback.failed": "agent 写回失败",
     "approval.command": "审批命令", "approval.tool": "审批工具",
     "approval.generic": "审批提示", "question.empty": "等待选择",
     "question.one": "单个用户问题", "question.many": "多个用户问题",
-    "watchdog.warning": "循环检测警告", "model_access.one": "模型访问失败（单次）",
+    "watchdog.warning": "循环检测警告", "watchdog.control": "循环检测干预",
+    "watchdog.control.result": "循环检测干预结果", "model_access.one": "模型访问失败（单次）",
     "model_access.many": "模型访问失败（连续）", "llm_error.api": "AI 服务错误",
     "done.success": "任务完成",
     "done.attention": "任务暂停待确认", "failure.retry": "重试后失败",
@@ -164,6 +172,13 @@ DIALOGUE_LABELS = {
     "pattern.warning": "行为重复警告", "pattern.control": "行为重复干预",
     "balance.loading": "查询余额中", "balance.result": "余额结果",
 }
+
+# Keep the editable dialogue inventory aligned with the report-gate contract.
+# This cheap import-time guard prevents a new runtime event from silently
+# disappearing from the custom dialogue editor.
+if set(REPORT_EVENT_KEYS) - set(DIALOGUE_LABELS):
+    missing = sorted(set(REPORT_EVENT_KEYS) - set(DIALOGUE_LABELS))
+    raise RuntimeError(f"Missing dialogue labels for report events: {missing}")
 
 DIALOGUE_PARAMS = {
     "name": "Agent 名称", "command": "命令文本", "label": "标签（工具标签/会话标签随事件而定）",
@@ -470,19 +485,20 @@ class ModernSettingsDialog(QDialog):
             SettingRow("agent_sound_cooldown", "冷却时间", "防止短时间内频繁触发音效；0 表示无时间冷却（仍单次去重）。", self.agent_sound_cooldown_spin),
         ]
         behavior_layout.addWidget(SettingsSection("Agent 联动 · 提示音效", agent_sound_rows, behavior_content))
-        # 事件气泡触发概率：每个事件聚合类别一个 0.00–1.00 滑块（没有开关），
+        # 事件气泡触发概率：每个事件聚合类别一个 0%–100% 滑块（没有开关；
+        # 写回时仍保存 0.00–1.00 的规范化浮点数），
         # 与该类的气泡文案行同组；域导航重建时整体收进「事件气泡触发概率」
         # 下的可折叠框，让设置位置与真正控制的位置绑定。
         self.report_gate_rows = {}
         report_gate_rows = []
         for gate in REPORT_GATE_KEYS:
             gate_label = REPORT_GATE_LABELS[gate]
+            gate_hint = REPORT_GATE_HINTS[gate]
             row = SettingRow(
                 f"report_gate_{gate}",
-                "汇报概率",
-                f"{gate_label}：这一类气泡的通过概率。0.00 = 该类完全不汇报（静音），"
-                "1.00 = 每次都汇报，中间值按概率抽稀。概率只作用于「出气泡」这一步，"
-                "卡住 / 行为重复 / 循环等检测本身不受影响；右键菜单只提供 0/1 两端快捷入口。",
+                f"{gate_label} · 通过概率",
+                f"{gate_hint} 0% 表示静音，100% 表示每次显示；中间值按概率抽稀。"
+                "只影响气泡呈现，不影响检测、事件处理或交互结果。",
                 self.report_gate_sliders[gate],
                 stacked=True,
             )
@@ -1393,9 +1409,9 @@ class ModernSettingsDialog(QDialog):
             rows.extend(phrase_rows_by_gate.get(gate, []))
             if rows:
                 gates_box.add_group(REPORT_GATE_LABELS[gate], rows)
-        # 默认展开：这些文案行改造前就在该页可见，折叠框只提供"可以收起来"，
-        # 不把原有入口藏起来；搜索命中时也会自动展开（见 _search_settings）。
-        gates_box.set_expanded(True)
+        # 概率与逐事件文案数量很多，默认收起以保持页面清晰；搜索命中时会
+        # 自动展开（见 _search_settings），因此不会牺牲可发现性。
+        gates_box.set_expanded(False)
         self.report_gates_box = gates_box
         automation_layout = automation.layout()
         # dialogue_* 里有一类行**不属于任何事件门**（表达风格、专属文案对象、弹窗文案
