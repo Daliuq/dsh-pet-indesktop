@@ -269,6 +269,14 @@ export const __controlTest = new Proxy({}, {
   get: (_, key) => implExports().__controlTest?.[key],
   has: (_, key) => key in (implExports().__controlTest || {}),
 });
+export const __messageTest = new Proxy({}, {
+  get: (_, key) => implExports().__messageTest?.[key],
+  has: (_, key) => key in (implExports().__messageTest || {}),
+});
+export const __questionTest = new Proxy({}, {
+  get: (_, key) => implExports().__questionTest?.[key],
+  has: (_, key) => key in (implExports().__questionTest || {}),
+});
 export const __retryTest = new Proxy({}, {
   get: (_, key) => implExports().__retryTest?.[key],
   has: (_, key) => key in (implExports().__retryTest || {}),

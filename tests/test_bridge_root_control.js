@@ -15,7 +15,9 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const sourcePath = path.resolve(here, "../integrations/dsh-pet-bridge/index.js");
+const bridgeRoot = path.resolve(here, "../integrations/dsh-pet-bridge");
+const pkg = JSON.parse(fs.readFileSync(path.join(bridgeRoot, "package.json"), "utf8"));
+const sourcePath = path.join(bridgeRoot, "impl", String(pkg.version || ""), "index.js");
 const source = fs.readFileSync(sourcePath, "utf8");
 
 function loadResolveControlRoot() {

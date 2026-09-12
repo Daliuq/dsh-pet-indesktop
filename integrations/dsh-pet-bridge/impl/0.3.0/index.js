@@ -9,17 +9,34 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { randomUUID } from "node:crypto";
-import { createUserMessage } from "@deepseek-ai/dsh-llm";
 
-// The bridge uses DSH's canonical user-message envelope for steer/diagnosis.
+// ===== 零依赖红线（与壳 index.js 同步，来自 main 的 7f3b896） =====
+// 本插件必须保持零外部依赖：profile 经 pnpm 的 link: 协议链接到本目录，
+// pnpm 不会安装被链接包自己的依赖；而链接目标常常是打包版桌宠
+// _internal 内的副本（CI 构建不带 node_modules）。一旦此处声明运行时依赖，
+// 依赖解析失败会让 Cordis 插件树初始化整体抛错、DSH 无法启动（2026-09 事故：
+// 作者与多用户 dsh 全 profile 起不来）。因此 user-message envelope 手写，
+// 形状与 @deepseek-ai/dsh-llm 的 createUserMessage 完全对齐——
+// {...input, role: "user", id: randomUUID()}，structuredClone 后深冻结。
+// dsh 升级 envelope 形状时这里必须同步（inject 的 llm.stream / steer 消费它）。
+function deepFreezeMessage(value, seen = new WeakSet()) {
+  if (value === null || typeof value !== "object" || seen.has(value)) return value;
+  seen.add(value);
+  for (const key of Object.keys(value)) deepFreezeMessage(value[key], seen);
+  return Object.freeze(value);
+}
+
+// dsh createUserMessage 的本地等价物：补齐 role/id，返回不可变快照。
+function createUserMessage(input) {
+  const message = structuredClone({ ...input, role: "user", id: randomUUID() });
+  return deepFreezeMessage(message);
+}
 
 const MAX_BYTES = 1024 * 1024; // 事件文件超过 1MB 时轮转（保留 .1 备份，防无限增长）
 const PLUGIN_ID = "dsh-pet-bridge";
-const require = createRequire(import.meta.url);
 const BRIDGE_PROTOCOL_VERSION = 1;
 // 版本必须每个模块实例独立读取：CJS 的 require(package.json) 会命中
 // require.cache（跨热重载实例共享），重装后新实现会读到旧版本号。
@@ -1060,9 +1077,39 @@ function extractCommand(arguments_) {
 // legacy agent_link bubble path (permanent question popup).
 const QUESTION_TOOL = "ask_user_question";
 const pendingQuestionCallIds = new Set();
+// mux rpcId ↔ callId 按到达顺序 FIFO 配对（C3，合入 main 的 075d443）：
+// tool/call 注册把 callId 排进会话队列；mux question/requested 帧出队一个
+// 并记住 rpcId→callId，后续 question/resolved 按 rpcId 取回。同会话多问题
+// 并发时，每个帧拿到的是自己那份 callId，而不是反复取到最旧的一个。
+// 否则帧里缺 callId 时 mux 断线后的兜底关闭失效，桌宠气泡永久挂住。
+const pendingQuestionRpcPairs = new Map(); // rpcId → callId（resolved 取回后即删）
+const pendingQuestionOrder = new Map();    // sessionId → callId[]（FIFO，待 mux 帧出队）
 
 function questionCallIdentity(callId, sessionId) {
   return `${String(sessionId || "")}|${String(callId || "")}`;
+}
+
+function registerQuestionCall(callId, sessionId) {
+  const id = String(callId || "");
+  if (!id || pendingQuestionCallIds.has(questionCallIdentity(id, sessionId))) return false;
+  pendingQuestionCallIds.add(questionCallIdentity(id, sessionId));
+  const session = String(sessionId || "");
+  const queue = pendingQuestionOrder.get(session) || [];
+  queue.push(id);
+  pendingQuestionOrder.set(session, queue);
+  return true;
+}
+
+function forgetQuestionCall(callId, sessionId) {
+  const id = String(callId || "");
+  pendingQuestionCallIds.delete(questionCallIdentity(id, sessionId));
+  const session = String(sessionId || "");
+  const queue = pendingQuestionOrder.get(session);
+  if (queue) {
+    const idx = queue.indexOf(id);
+    if (idx >= 0) queue.splice(idx, 1);
+    if (!queue.length) pendingQuestionOrder.delete(session);
+  }
 }
 
 function extractQuestions(arguments_) {
@@ -1085,16 +1132,13 @@ function extractQuestions(arguments_) {
 }
 
 function writeQuestionRequest(callId, questions, sessionId) {
-  const id = String(callId || "");
-  const key = questionCallIdentity(id, sessionId);
-  if (!id || pendingQuestionCallIds.has(key)) return; // 已写过，去重
-  pendingQuestionCallIds.add(key);
+  if (!registerQuestionCall(callId, sessionId)) return; // 已写过，去重
   // 两个路径（tool/call + mux）都无条件写，由 writeRecordDedup 去重：
   // mux 正常时保留 rpcId 版本（可交互）；mux 不可用/连接失败时兜底写提示
   // （无按钮但至少弹窗出现，不会丢问题）。
   writeRecordDedup({
     event: "question/requested",
-    callId: id,
+    callId: String(callId || ""),
     sessionId: String(sessionId || ""),
     questions,
   });
@@ -1102,9 +1146,8 @@ function writeQuestionRequest(callId, questions, sessionId) {
 
 function resolveQuestion(callId, sessionId) {
   const id = String(callId || "");
-  const key = questionCallIdentity(id, sessionId);
-  if (!id || !pendingQuestionCallIds.has(key)) return;
-  pendingQuestionCallIds.delete(key);
+  if (!id || !pendingQuestionCallIds.has(questionCallIdentity(id, sessionId))) return;
+  forgetQuestionCall(callId, sessionId);
   // 收尾记录不 gate mux：重复的 question/resolved 无害（桌宠幂等），
   // 但若 mux 在问题中途才连上、丢了对应的 resolved 帧，这里必须兜底写，
   // 否则桌宠会卡死在 waiting_question。
@@ -1113,6 +1156,57 @@ function resolveQuestion(callId, sessionId) {
     callId: id,
     sessionId: String(sessionId || ""),
   });
+}
+
+// mux question 帧只带 rpcId，callId 只有 tool/call 兜底路径才登记（复合键
+// sessionId|callId，FIFO 队列见 pendingQuestionOrder）。桌宠端升级重建后靠
+// callId 与兜底 question/resolved 配对，帧里缺 callId 时 mux 断线后的兜底
+// 关闭就失效，气泡永久挂住——按 FIFO 出队补上并记住 rpcId→callId。
+function muxQuestionCallId(payload, rpcId) {
+  const fromFrame = String(payload.callId || "");
+  if (fromFrame) return fromFrame;
+  const rpc = String(rpcId || "");
+  const paired = pendingQuestionRpcPairs.get(rpc);
+  if (paired) return paired;
+  const queue = pendingQuestionOrder.get(String(payload.sessionId || ""));
+  const next = queue ? queue.shift() : undefined;
+  if (next) {
+    if (rpc) pendingQuestionRpcPairs.set(rpc, next);
+    return next;
+  }
+  return "";
+}
+
+function muxQuestionCallIdForResolved(payload, rpcId) {
+  const fromFrame = String(payload.callId || "");
+  if (fromFrame) return fromFrame;
+  const rpc = String(rpcId || "");
+  const paired = pendingQuestionRpcPairs.get(rpc);
+  if (paired) {
+    pendingQuestionRpcPairs.delete(rpc); // resolved 是终态，取回即清
+    return paired;
+  }
+  return "";
+}
+
+function muxQuestionRequestedRecord(rpcId, payload) {
+  return {
+    event: "question/requested",
+    rpcId,
+    sessionId: payload.sessionId,
+    questions: payload.questions,
+    callId: muxQuestionCallId(payload, rpcId),
+  };
+}
+
+function muxQuestionResolvedRecord(rpcId, payload) {
+  return {
+    event: "question/resolved",
+    rpcId,
+    sessionId: payload.sessionId,
+    outcome: payload.outcome,
+    callId: muxQuestionCallIdForResolved(payload, rpcId),
+  };
 }
 
 // ===== interactive mux relay =====
@@ -1217,11 +1311,13 @@ function muxConnect() {
           sessionId: p.sessionId,
         });
       } else if (p.type === "question/requested") {
-        writeRecordDedup({ event: "question/requested", rpcId: msg.rpcId, sessionId: p.sessionId, questions: p.questions });
+        // 用 FIFO 配对记录：mux 帧缺 callId 时按会话队列出队补上并记住
+        // rpcId→callId（合入 main 的 C3 修复），防桌宠气泡因缺 callId 挂住。
+        writeRecordDedup(muxQuestionRequestedRecord(msg.rpcId, p));
       } else if (p.type === "question/resolved") {
         const questionRpcId = p.questionRpcId || msg.rpcId;
-        writeRecord({ event: "question/resolved", rpcId: questionRpcId, sessionId: p.sessionId, outcome: p.outcome });
-        writeInteractionResolved("question", p.sessionId, { rpcId: questionRpcId }, p.outcome || "answered");
+        writeRecord(muxQuestionResolvedRecord(questionRpcId, p));
+        writeInteractionResolved("question", p.sessionId, { rpcId: questionRpcId, callId: muxQuestionCallIdForResolved(p, questionRpcId) }, p.outcome || "answered");
         // 用户介入信号
         writeRecord({
           event: "user_action",
@@ -1717,15 +1813,9 @@ export function apply(ctx, inheritedAgents = null, opts = null) {
         // 收不到 callId——question/resolved 写不出，桌宠端提醒队列卡死。
         const callId = d.message && (d.message.callId || (d.message.source && d.message.source.callId));
         if (callId) resolveQuestion(callId, sessionId);
-        // 用户介入信号：ask_user_question 回答后
-        if (callId && pendingQuestionCallIds.has(String(callId))) {
-          writeRecord({
-            event: "user_action",
-            action: "question_resolved",
-            callId: String(callId),
-            sessionId,
-          });
-        }
+        // 不写 user_action(question_resolved) 兜底（合入 main 的 b62c1be）：
+        // resolveQuestion 已写 question/resolved 并清 pending；裸 callId 匹配
+        // 复合键（sessionId|callId）恒错，该分支恒不可达，纯属死代码。
         const info = toolResultInfo(d);
         const pending = consumeToolCall(info.callId) || {};
         const tool = pending.tool || "";
@@ -1909,6 +1999,17 @@ export { inject };
 // Kept private-by-convention: package tests use this surface to exercise the
 // control boundary without starting a DSH host or touching the real queue.
 export const __controlTest = { controlAgent, handleControlRequest, liveAgents, knownSessions };
+export const __messageTest = { createUserMessage };
+export const __questionTest = {
+  questionCallIdentity,
+  pendingQuestionCallIds,
+  pendingQuestionRpcPairs,
+  pendingQuestionOrder,
+  registerQuestionCall,
+  forgetQuestionCall,
+  muxQuestionRequestedRecord,
+  muxQuestionResolvedRecord,
+};
 export const __retryTest = {
   threshold: RETRY_EVENT_THRESHOLD,
   reset: resetRetryConnection,
