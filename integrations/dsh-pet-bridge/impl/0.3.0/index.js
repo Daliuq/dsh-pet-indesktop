@@ -1354,6 +1354,11 @@ const INSTANCE_FILE = `dsh-${process.pid}.jsonl`;
 const FLUSH_DELAY_MS = 80; // 事件合批窗口：80ms 内的记录合并成一次写盘
 let writeQueue = [];
 let flushTimer = null;
+// 桥目录是否已就绪（按目录路径记忆）：mkdirSync(recursive) 对已存在目录实测
+// ~0.46ms/次，而 flush 每 80ms 一次（DSH 活跃时把 0.46ms 主线程占用放大到
+// ~0.6%）——目录首次创建后就不再需要 mkdir。记录已就绪的目录路径：APPDATA
+// 可能变化（多实例/测试/换用户），目录不同时必须重新 mkdir。
+let bridgeDirReadyPath = "";
 
 function flushPending() {
   flushTimer = null;
@@ -1361,7 +1366,10 @@ function flushPending() {
   const batch = writeQueue.splice(0, writeQueue.length).join("");
   try {
     const dir = bridgeDir();
-    fs.mkdirSync(dir, { recursive: true });
+    if (bridgeDirReadyPath !== dir) {
+      fs.mkdirSync(dir, { recursive: true });
+      bridgeDirReadyPath = dir;
+    }
     const file = path.join(dir, INSTANCE_FILE);
     try {
       // 超上限轮转：dsh-{pid}.jsonl → dsh-{pid}.jsonl.1（只留一代）
@@ -1373,7 +1381,9 @@ function flushPending() {
     } catch {}
     fs.appendFileSync(file, batch, "utf8");
   } catch {
-    // 静默失败：桥接是锦上添花，绝不能影响 DSH 本体
+    // 静默失败：桥接是锦上添花，绝不能影响 DSH 本体。
+    // 目录可能被外部删除/换盘，清路径让下轮重新 mkdir 自愈。
+    bridgeDirReadyPath = "";
   }
 }
 
