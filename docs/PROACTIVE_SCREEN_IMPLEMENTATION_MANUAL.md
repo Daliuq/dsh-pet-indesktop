@@ -63,8 +63,8 @@ QTimer 8s（仅 enabled==True 且窗口可见时存在）
 | min_idle_seconds | 30 | 0 ~ 3600（仅 `require_idle=true` 时生效；require_idle 默认 false = 不要求闲置） |
 | cooldown_minutes | 5 | 0.5 ~ 120（支持 0.5 分钟粒度，2026-08-27 用户反馈后放宽） |
 | daily_cap | 15 | 1 ~ 9999（2026-08-27 用户反馈后取消 100 硬顶） |
-| min_request_interval_seconds | 60 | 30 ~ 3600 |
-| change_threshold | 8 | 0 ~ 32（Hamming 距离 0~64） |
+| min_request_interval_seconds | 60 | 30–3600 |
+| change_threshold | 8 | 0–32（Hamming 距离 0–64） |
 
 ---
 
