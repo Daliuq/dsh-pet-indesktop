@@ -2823,12 +2823,22 @@ class AgentLinkManager(QObject):
 
         # 状态 -> 桌宠行为映射（手册 §8.2）
         if state in ("thinking", "working"):
-            # busy 动作池轮换（写代码/吃Token 为主，每第 3 次插播短摸鱼），
-            # 经 request_link_anim 平滑衔接：正在播的一次性动作不被打断
+            # 动画与状态气泡**共用状态气泡时间门**（state_bubble_min_interval）：
+            # 移除 busy↔busy 节流后，DSH working↔thinking 每 2-5s 切换会让
+            # _next_link_anim_rotation 每次返回不同动作名 → window 侧判"当前
+            # anim 非动作池"立即 _switch → 反复启停 ffmpeg 解码进程（实测多个
+            # reader 同时退出、pet 性能下降）。时间门内不重复 request（当前动画
+            # 继续播），门到期才按轮换序列切下一个动作——保轮换语义又防风暴。
+            gate_ok = self._state_bubble_gate(agent_key)
             anim = self._next_link_anim_rotation()
-            if anim and hasattr(self.win, "request_link_anim"):
+            if (
+                gate_ok
+                and anim
+                and hasattr(self.win, "request_link_anim")
+            ):
                 self.win.request_link_anim(anim)
-            self._maybe_notify_start(agent_key, prev_raw, state)
+            # 气泡共用同一 gate 判定（由 `gate_ok` 传入，避免双判把气泡挡掉/不同频）
+            self._maybe_notify_start(agent_key, prev_raw, state, gate_ok=gate_ok)
         elif state == "attention":
             # busy 后的 attention（如 Claude Stop=回合结束）由完成确认流程接管，
             # 避免「需要看一眼」和「完成通知」双气泡；独立出现的才立即提醒
@@ -3042,7 +3052,25 @@ class AgentLinkManager(QObject):
             gates = {}
         return should_report_event(gates, event_key, self._rng())
 
-    def _maybe_notify_start(self, agent_key: str, prev_raw: str | None, state: str = "working") -> None:
+    def _state_bubble_gate(self, agent_key: str) -> bool:
+        """状态气泡/动画时间门：同 agent 两次状态气泡（开始干活/思考）最小间隔
+        （agent_link.state_bubble_min_interval，默认 2.0s）。返回 True 表示本次
+        放行（并记录时刻）；门内再次调用返回 False。动画与气泡共用此门——
+        DSH working↔thinking 反复切换时，动画与气泡同频限频，避免反复启停
+        ffmpeg 解码进程（性能回归修复）。"""
+        agent_cfg = self.cfg.get("agent_link", {})
+        min_gap = float(agent_cfg.get("state_bubble_min_interval", 2.0) or 0.0)
+        if min_gap <= 0:
+            return True  # 0 = 无时间门
+        last_bubble = self._state_bubble_at.get(agent_key, None)
+        now = self._clock()
+        if last_bubble is not None and (now - last_bubble) < min_gap:
+            return False
+        self._state_bubble_at[agent_key] = now
+        return True
+
+    def _maybe_notify_start(self, agent_key: str, prev_raw: str | None, state: str = "working",
+                            gate_ok: bool = True) -> None:
         """开始干活/思考气泡。
 
         - working「开始干活」：仅「非 busy → busy」时提示（thinking↔working
@@ -3053,23 +3081,17 @@ class AgentLinkManager(QObject):
           （用户实测：状态机收敛 thinking 但宠无思考气泡）。thinking 是独立
           语义（用户提问/模型推理），应在其出现时可见。
 
-        防刷屏双门：概率门（report_gates.state）控"要不要弹"；**时间门**
-        （agent_link.state_bubble_min_interval，默认 2.0s）控"多快能再弹一次"——
-        DSH 短时间内反复 working↔thinking 时，两次状态气泡间隔小于时间门则
-        跳过本弹（每次状态变化只留最新一次，避免刷屏；0 = 无时间门）。"""
+        防刷屏双门：概率门（report_gates.state）控"要不要弹"；时间门
+        （agent_link.state_bubble_min_interval，默认 2.0s）控"多快能再弹一次"。
+        gate_ok 由动画路径统一判定一次（_state_bubble_gate）传入——动画与气泡
+        同频：时间门内都不出现（防 ffmpeg 反复启停的性能回归），到期都恢复。"""
+        if not gate_ok:
+            return
         agent_cfg = self.cfg.get("agent_link", {})
         if not self._report_allowed(agent_cfg, "thinking" if state == "thinking" else "start"):
             return
         if state != "thinking" and prev_raw in self._BUSY_STATES:
             return
-        # 时间门：同 agent 两次状态气泡最小间隔（仅状态气泡，不拦审批/完成等）。
-        min_gap = float(agent_cfg.get("state_bubble_min_interval", 2.0) or 0.0)
-        if min_gap > 0:
-            last_bubble = self._state_bubble_at.get(agent_key, None)
-            now = self._clock()
-            if last_bubble is not None and (now - last_bubble) < min_gap:
-                return
-            self._state_bubble_at[agent_key] = now
         name = self.agent_names.get(agent_key, agent_key)
         if state == "thinking":
             self._show_link_bubble(self._thinking_text(agent_key), important=False, duration_ms=3000)
