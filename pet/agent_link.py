@@ -70,6 +70,29 @@ _PET_CONTROL_AUDIT_EVENTS: frozenset[str] = frozenset({
     "pet/control-clicked",
     "pet/control-queued",
 })
+# 在 _poll 里由**专用信号分支**处理的桥接事件（语义层/状态机之外的通路）。
+# 声明在这里而不是仅靠 _RAW_BRIDGE_KNOWN_EVENTS 兜底：后者是「不误报未知事件」
+# 的豁免名单，曾被当成「已消费」的证据，掩盖了「契约声明了、实际无人消费」
+# 的事件。契约测试 test_declared_events_have_an_effect_consumer 以本集合 + 语义层
+# + 状态机 + 看门狗分类 四路共同判定「有真实消费者」，新增事件必须至少命中一路。
+_POLL_SIGNAL_EVENTS: frozenset[str] = frozenset({
+    "bridge/hello",
+    "bridge/diagnostic",
+    "bridge/control-received",
+    "model_access",
+    "llm_error",
+    "user_action",
+    "execution/failed",
+    "approval/request",
+    "approval/decided",
+    "approval/resolved",
+    "question/requested",
+    "question/resolved",
+    "cordis/request-run",
+    "cordis/request-run-resolved",
+    "bridge/control-result",
+    "watchdog/control-result",
+})
 _RAW_BRIDGE_KNOWN_EVENTS: frozenset[str] = (
     BRIDGE_EVENT_INVENTORY | _PET_CONTROL_AUDIT_EVENTS
 )
@@ -1082,6 +1105,11 @@ class BaseAgentMonitor(QObject):
     # 未知桥接事件（DSH 桥接写出的、Pet 全部识别路径都不认识的事件名）：
     # (agent_key, record) —— Manager 侧据此提醒用户更新/重装 bridge。
     unknown_bridge_event = Signal(str, object)
+    # bridge/diagnostic（每实例一次的运行时路径元数据）与 bridge/control-received
+    # （控制请求已被 bridge 收到的确认）：供诊断与日志审计，避免这些真实产出的事件
+    # 在 Pet 侧没有任何消费者而被静默丢弃。(agent_key, record)
+    bridge_diagnostic = Signal(str, object)
+    bridge_control_received = Signal(str, object)
     # DSH envelope/inventory incompatibility.  Incompatible records are
     # stopped before raw_record and every semantic/interaction consumer.
     bridge_incompatible = Signal(str, object)
@@ -1407,6 +1435,16 @@ class BaseAgentMonitor(QObject):
                 # 用户介入信号：user_action（审批决定/回答）→ 关闭对应弹窗
                 if ev == "user_action":
                     self._emit(self.user_action, (self.agent_key, data))
+                # bridge/diagnostic：桥接每次 apply 写出一次的运行时目标路径
+                # （bridgeDir/instanceFile/appData/packaged）。仅含路径元数据，
+                # 不含密钥；转发给 Manager 记录，便于诊断打包版写偏目录。
+                if ev == "bridge/diagnostic":
+                    self._emit(self.bridge_diagnostic, (self.agent_key, data))
+                # bridge/control-received：bridge 已受理一次控制请求
+                # （interrupt/replan）并记录 foundAgent 结果。是控制链路的
+                # 「已收到」确认，早于 bridge/control-result。
+                if ev == "bridge/control-received":
+                    self._emit(self.bridge_control_received, (self.agent_key, data))
                 # 未知桥接事件：DSH 桥接写出的、Pet 全部识别路径（语义层/状态机/
                 # 直通名单）都不认识的事件名 → 大概率 bridge 与桌宠版本不匹配，
                 # 呈递给 Manager 弹「更新/重装 bridge」提醒。claude/cursor 的
@@ -2346,6 +2384,8 @@ class AgentLinkManager(QObject):
         self.monitors["dsh"].user_action.connect(self._on_user_action)
         self.monitors["dsh"].unknown_bridge_event.connect(self._on_unknown_bridge_event)
         self.monitors["dsh"].bridge_incompatible.connect(self._on_bridge_incompatible)
+        self.monitors["dsh"].bridge_diagnostic.connect(self._on_bridge_diagnostic)
+        self.monitors["dsh"].bridge_control_received.connect(self._on_bridge_control_received)
         # 检测器提醒跨模块节流（N2）：stuck / pattern / exploration watchdog 三个
         # 检测器各有独立 cooldown，但同一 busy 周期可能先后各自弹窗造成连环换弹。
         # 按 agent/session 记最近一次**任一**检测器弹窗时刻与档位，窗口内同档
@@ -4550,6 +4590,63 @@ class AgentLinkManager(QObject):
         )
         if hasattr(self.win, "show_bubble"):
             self.win.show_bubble(text, duration_ms=6000)
+
+    def _on_bridge_diagnostic(self, agent_key: str, record: dict) -> None:
+        """Record the bridge's per-instance runtime paths.
+
+        ``bridge/diagnostic`` is emitted once per bridge apply and carries only
+        path metadata (bridgeDir/instanceFile/appData/packaged).  It previously
+        had no Pet consumer at all, so a packaged build writing to an unexpected
+        directory was invisible.  Store the latest snapshot per agent for
+        diagnostics and log it once at info level.
+        """
+        if not isinstance(record, dict):
+            return
+        if not hasattr(self, "_bridge_diagnostics"):
+            self._bridge_diagnostics: dict[str, dict] = {}
+        self._bridge_diagnostics[agent_key] = {
+            "bridgeDir": str(record.get("bridgeDir") or ""),
+            "instanceFile": str(record.get("instanceFile") or ""),
+            "appData": str(record.get("appData") or ""),
+            "packaged": bool(record.get("packaged")),
+            "_ts": self._clock(),
+        }
+        log.info(
+            "[dsh-pet-bridge] diagnostic agent=%s dir=%s instance=%s packaged=%s",
+            agent_key,
+            self._bridge_diagnostics[agent_key]["bridgeDir"],
+            self._bridge_diagnostics[agent_key]["instanceFile"],
+            self._bridge_diagnostics[agent_key]["packaged"],
+        )
+
+    def _on_bridge_control_received(self, agent_key: str, record: dict) -> None:
+        """Record that the bridge accepted a control (interrupt/replan) request.
+
+        This is the bridge's early acknowledgement, distinct from
+        ``bridge/control-result`` which carries the final outcome.  Keeping the
+        pending state lets a lost result be diagnosed instead of appearing as a
+        silently ignored click.
+        """
+        if not isinstance(record, dict):
+            return
+        if not hasattr(self, "_bridge_control_pending"):
+            self._bridge_control_pending: dict[str, dict] = {}
+        request_id = str(record.get("requestId") or "")
+        if not request_id:
+            return
+        self._bridge_control_pending[request_id] = {
+            "agent": agent_key,
+            "operation": str(record.get("operation") or ""),
+            "sessionId": str(record.get("sessionId") or ""),
+            "foundAgent": bool(record.get("foundAgent")),
+            "_ts": self._clock(),
+        }
+        log.debug(
+            "[dsh-pet-bridge] control received agent=%s op=%s found=%s",
+            agent_key,
+            self._bridge_control_pending[request_id]["operation"],
+            self._bridge_control_pending[request_id]["foundAgent"],
+        )
 
     @staticmethod
     def _bridge_incompat_reason_text(reason: str) -> str:

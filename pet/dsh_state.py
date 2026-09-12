@@ -109,7 +109,16 @@ _EVENT_TO_STATE = {
     # 完成 / 出错
     "turn/end": DshState.SUCCESS,
     "llm/retry": DshState.ERROR,
-    "llm/error": DshState.ERROR,  # API 级错误（llm_error：errorCode 为真实上游码如 bad_response_status_code）
+    # API 级错误：bridge 实际写出的名字是 "llm_error"（下划线，见
+    # integrations/dsh-pet-bridge/index.js 的 writeRecord）。历史上这里误写成
+    # "llm/error"（斜杠），而 bridge 从不发送该拼写，导致上游 API 错误
+    # （errorCode 如 bad_response_status_code）不产生 error 状态转移。
+    # 两者都保留：下划线为真实生产者拼写，斜杠兼容任何既有记录。
+    "llm_error": DshState.ERROR,
+    "llm/error": DshState.ERROR,
+    # 上下文压缩：DSH 压缩会话上下文后仍在本轮内继续，对桌宠是 working 信号
+    # （此前该事件被契约声明却无任何消费者，属于静默丢弃）。
+    "context_compacted": DshState.WORKING,
 }
 
 

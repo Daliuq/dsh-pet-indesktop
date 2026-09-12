@@ -258,3 +258,118 @@ def test_incompatible_bridge_warning_ignores_report_probability(tmp_path):
     )
     assert len(bubbles) == 1
     manager.shutdown()
+
+
+# ----------------------------------------------------------------------
+# Effect coverage: a declared event must actually DO something.
+#
+# The original inventory test only proved that every declared event reaches the
+# raw stream and avoids the unknown-event warning.  That let two classes of
+# defect survive a fully green suite:
+#   * a producer event with no consumer at all (silently dropped), and
+#   * a state-table entry spelled differently from what the bridge emits
+#     (llm_error vs llm/error), so the state transition never fired.
+# These tests assert the *effect* instead of mere delivery, so either
+# regression fails here rather than in production.
+# ----------------------------------------------------------------------
+
+def _state_effect(event: str) -> str | None:
+    """The DshState a bridge record produces, or None when nothing happens."""
+    from pet.dsh_state import map_event_to_state
+
+    return map_event_to_state({"event": event})
+
+
+def test_declared_events_have_an_effect_consumer():
+    """Every declared event must hit a semantic, state, or explicit consumer.
+
+    Delivery is not effect: the sibling inventory test only proves an event
+    reaches ``raw_record`` and dodges the unknown-event warning.  Here every
+    declared event must additionally reach a *behavioural* consumer, which is
+    one of:
+
+    * ``map_event_to_state``            -> a DshState transition
+    * ``normalize_event``               -> a semantic event
+    * an explicit ``_poll`` signal branch
+    * the exploration watchdog classifier
+
+    An event that only satisfies the inventory whitelist is treated as inert,
+    because the whitelist is exactly what hid the previous silent drops.
+    """
+    from pet.agent_event_normalizer import normalize_event
+    from pet.agent_event_protocol import parse_agent_event
+    from pet.exploration_watchdog import WatchdogClass, classify_event
+    from pet import agent_link
+
+    def has_signal_branch(event: str) -> bool:
+        """True when _poll forwards this event on a dedicated signal."""
+        return event in agent_link._POLL_SIGNAL_EVENTS
+
+    inert: list[str] = []
+    for event in sorted(BRIDGE_EVENT_INVENTORY):
+        if _state_effect(event) is not None:
+            continue
+        if has_signal_branch(event):
+            continue
+        if classify_event({"event": event}) != WatchdogClass.OTHER:
+            continue
+        try:
+            normalized = normalize_event(
+                parse_agent_event(
+                    {"event": event, "agent": "dsh"},
+                    source_hint="dsh",
+                    agent_name_hint="dsh",
+                )
+            )
+        except Exception:  # noqa: BLE001
+            normalized = None
+        if normalized is not None:
+            continue
+        inert.append(event)
+
+    assert inert == [], (
+        "these events are declared in BRIDGE_EVENT_INVENTORY but no Pet "
+        f"consumer acts on them (silently dropped): {inert}"
+    )
+
+
+def test_llm_error_event_drives_the_error_state():
+    """The bridge emits ``llm_error``; the state table must know that spelling.
+
+    Regression: the table carried ``llm/error`` (slash), which the bridge never
+    emits, so an API-level failure produced no error state.
+    """
+    from pet.dsh_state import DshState
+
+    assert _state_effect("llm_error") == DshState.ERROR
+    # The legacy slash spelling stays accepted for older producers.
+    assert _state_effect("llm/error") == DshState.ERROR
+
+
+def test_compaction_and_web_search_events_are_recognised():
+    """Compaction and web-search watchdog events must reach a real consumer."""
+    from pet.exploration_watchdog import WatchdogClass, classify_event
+
+    assert _state_effect("context_compacted") is not None
+    # Search begin/end must classify as web search for the watchdog.
+    assert classify_event({"event": "web_search_begin"}) == WatchdogClass.SEARCH_WEB
+    assert classify_event({"event": "web_search_end"}) == WatchdogClass.SEARCH_WEB
+
+
+def test_control_and_diagnostic_events_reach_a_consumer(tmp_path):
+    """Bridge control/diagnostic records must not be silently discarded."""
+    _qapp()
+    monitor = DshMonitor("dsh", tmp_path / "config")
+    raw = []
+    incompatible = []
+    monitor.raw_record.connect(lambda _agent, record: raw.append(record["event"]))
+    monitor.bridge_incompatible.connect(lambda *args: incompatible.append(args))
+    monitor.events_file.parent.mkdir(parents=True, exist_ok=True)
+    monitor.events_file.touch()
+    monitor._poll()
+    for event in ("bridge/control-received", "bridge/diagnostic"):
+        _append(monitor.events_file, _record(event))
+    monitor._poll()
+    assert set(raw) == {"bridge/control-received", "bridge/diagnostic"}
+    assert incompatible == []
+    monitor.stop()
