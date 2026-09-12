@@ -16,12 +16,17 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const sourcePath = path.resolve(here, "../integrations/dsh-pet-bridge/index.js");
+// 实现层：只读 package.json.version 对应的 impl/<version>/index.js（与壳的
+// probeDisk 精确选中语义一致，不扫描全部历史版本，避免多版本并存时测到旧版）。
+const bridgeRoot = path.resolve(here, "../integrations/dsh-pet-bridge");
+const pkg = JSON.parse(fs.readFileSync(path.join(bridgeRoot, "package.json"), "utf8"));
+const sourcePath = path.join(bridgeRoot, "impl", String(pkg.version || ""), "index.js");
+assert.ok(fs.existsSync(sourcePath), `impl/${pkg.version}/index.js 应存在（与 package.json.version 对应）`);
 const source = fs.readFileSync(sourcePath, "utf8");
 
 function loadResolveControlRoot() {
   const match = source.match(/function resolveControlRoot\(agent, sessionLookup\) \{[\s\S]*?\n\}/);
-  assert.ok(match, "index.js 应定义 resolveControlRoot");
+  assert.ok(match, "桥接实现层应定义 resolveControlRoot");
   return new Function(`${match[0]}; return resolveControlRoot;`)();
 }
 
