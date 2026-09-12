@@ -28,7 +28,10 @@ python -m pytest -q `
 
 Bridge 验收采用真实插件源码上的 Node contract 测试，并结合桌宠端真实事件解析/状态处理测试：
 
-- `tests/test_bridge_control_contract.js`：读取并检查实际的 `integrations/dsh-pet-bridge/index.js`，验证控制结果、审批/问题身份字段和未知会话行为；
+- `tests/test_bridge_root_control.js`：读取并检查实际的 `integrations/dsh-pet-bridge/index.js`，验证控制结果与未知会话行为（子代理归一到根会话）；
+- `tests/test_bridge_interaction_dedup.js`：验证审批/问题写盘去重的身份字段（降级键必须带 sessionId）；
+- `tests/test_bridge_manifest.js`：插件可独立加载（inject 契约）+ 清单零依赖红线；
+- `integrations/dsh-pet-bridge/verify_import.mjs`：hermetic 零依赖冒烟（无 node_modules 隔离目录 import + envelope 形状 + 动态 import/require 禁令）；
 - `tests/test_agent_link.py`：真实 `AgentLinkManager`、tailer、事件映射、请求生命周期和交互队列；
 - `tests/test_dsh_state.py`：真实 DSH JSONL 状态读取与状态转换。
 
@@ -36,7 +39,8 @@ Bridge 验收采用真实插件源码上的 Node contract 测试，并结合桌�
 
 ```powershell
 node --check integrations/dsh-pet-bridge/index.js
-node --test tests/test_bridge_control_contract.js
+node --test tests/test_bridge_hardfailure.js tests/test_bridge_interaction_dedup.js tests/test_bridge_manifest.js tests/test_bridge_retry.js tests/test_bridge_root_control.js
+node integrations/dsh-pet-bridge/verify_import.mjs
 $env:QT_QPA_PLATFORM = "offscreen"
 python -m pytest -q tests/test_agent_link.py tests/test_dsh_state.py
 ```
