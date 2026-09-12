@@ -4,6 +4,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
 import { randomUUID } from "node:crypto";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
@@ -12,6 +13,12 @@ import { createUserMessage } from "@deepseek-ai/dsh-llm";
 
 const MAX_BYTES = 1024 * 1024; // 事件文件超过 1MB 时轮转（保留 .1 备份，防无限增长）
 const PLUGIN_ID = "dsh-pet-bridge";
+const require = createRequire(import.meta.url);
+const PACKAGE_VERSION = String(require("./package.json").version || "");
+export const BRIDGE_PROTOCOL_VERSION = 1;
+// Read the package metadata at runtime so a package-version change cannot
+// silently leave the diagnostic version advertised by the bridge stale.
+export const BRIDGE_VERSION = PACKAGE_VERSION;
 // These services are resolved by DSH when the plugin is loaded.  The bridge
 // uses them only for the watchdog's isolated diagnosis request; normal event
 // forwarding remains usable even when no model is configured.
@@ -889,6 +896,68 @@ const WATCHDOG_EVENT_TYPES = new Set([
   "user_action",
 ]);
 
+// This is the single producer-side source of truth for the event contract.
+// Keep AgentStatus: writeRecord supplies it for records that carry no explicit
+// event (for example the legacy aggregate state and session metadata records).
+// The two dynamic producer sets above are expanded here so the inventory is a
+// plain JSON-compatible value for the hello record and for contract tests.
+export const BRIDGE_EVENT_INVENTORY = Object.freeze([
+  "AgentStatus",
+  "agent/request-error",
+  "agent_reasoning",
+  "agent_reasoning_raw_content",
+  "approval/asked",
+  "approval/decided",
+  "approval/request",
+  "approval/resolved",
+  "assistant/message",
+  "bridge/control-received",
+  "bridge/control-result",
+  "bridge/diagnostic",
+  "bridge/hello",
+  "command/done",
+  "command/run",
+  "context_compacted",
+  "cordis/request-run",
+  "cordis/request-run-resolved",
+  "execution/failed",
+  "exec_command_begin",
+  "exec_command_end",
+  "interaction/resolved",
+  "llm/retry",
+  "llm_error",
+  "mcp_tool_call_begin",
+  "mcp_tool_call_end",
+  "model_access",
+  "question/requested",
+  "question/resolved",
+  "step/end",
+  "step/start",
+  "task_complete",
+  "task_started",
+  "thread_rolled_back",
+  "tool-workflow/run-end",
+  "tool-workflow/run-start",
+  "tool/call",
+  "tool/result",
+  "turn/end",
+  "turn/start",
+  "user/message",
+  "user_action",
+  "watchdog/control-result",
+  "web_search_begin",
+  "web_search_end",
+]);
+
+export const BRIDGE_CAPABILITIES = Object.freeze([
+  "agent-status",
+  "session-events",
+  "tool-events",
+  "interaction-relay",
+  "watchdog-control",
+  "model-access-diagnostics",
+]);
+
 // 审批 UI 请求只由权威 mux 帧（approval/requested，带 rpcId+sessionId）产生
 // （见下方 mux 中继）。这里不再提供 writeApprovalRequest：approval/asked 等
 // session/event 只是状态/审计信号，绝不能升级成桌宠的审批弹窗——普通工具调用
@@ -1152,7 +1221,14 @@ function writeRecord(extra) {
       }
     }
     writeQueue.push(
-      JSON.stringify({ ts: Date.now() / 1000, agent: "dsh", event: "AgentStatus", ...extra }) + "\n",
+      JSON.stringify({
+        ts: Date.now() / 1000,
+        agent: "dsh",
+        event: "AgentStatus",
+        ...extra,
+        bridgeProtocolVersion: BRIDGE_PROTOCOL_VERSION,
+        bridgeVersion: BRIDGE_VERSION,
+      }) + "\n",
     );
     if (flushTimer === null) {
       flushTimer = setTimeout(flushPending, FLUSH_DELAY_MS);
@@ -1161,6 +1237,16 @@ function writeRecord(extra) {
   } catch {
     // 入队失败也静默：绝不影响 DSH
   }
+}
+
+function writeBridgeHello() {
+  writeRecord({
+    event: "bridge/hello",
+    bridgeProtocolVersion: BRIDGE_PROTOCOL_VERSION,
+    bridgeVersion: BRIDGE_VERSION,
+    capabilities: BRIDGE_CAPABILITIES,
+    emittedEvents: BRIDGE_EVENT_INVENTORY,
+  });
 }
 
 // ===== 审批/问题写盘去重（P0 竞态防线） =====
@@ -1251,6 +1337,9 @@ function writeRecordDedup(extra) {
 // 写 record 去重前的代理：mux 交互记录（审批/问题）走 writeRecordDedup，其余事件（状态/工具/结果/错误）直接走 writeRecord。
 
 export function apply(ctx) {
+  // One hello per bridge apply gives each DSH instance an explicit contract
+  // handshake while keeping compatibility independent of package semver.
+  writeBridgeHello();
   // Make the resolved runtime destination observable for packaged builds.
   // This is intentionally emitted once per Bridge process and contains only
   // path metadata, never secrets or the full environment.
@@ -1690,4 +1779,10 @@ export const __hardFailureTest = {
   noteRetry: noteStatsRetry,
   recovery: noteStatsRecovery,
   noteToolResult: noteStatsToolResult,
+};
+export const __bridgeTest = {
+  flush: flushPending,
+  writeRecord,
+  bridgeDir,
+  instanceFile: INSTANCE_FILE,
 };
