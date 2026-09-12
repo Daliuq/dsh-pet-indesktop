@@ -21,10 +21,22 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { createRequire } from "node:module";
 
-const require = createRequire(import.meta.url);
-const PACKAGE_VERSION = String(require("./package.json").version || "");
+// 版本用 fs.readFileSync 直读（不用 require 系机制）：既满足
+// verify_import 的「零依赖 + 禁 CommonJS 逃逸口」红线，又保证读到磁盘当前
+// 内容（CJS require(package.json) 会命中 require.cache，跨热重载实例共享
+// 旧版本——已实测抓出的 bug，见 impl 同款注释）。
+const PACKAGE_VERSION = String(
+  (() => {
+    try {
+      return JSON.parse(
+        fs.readFileSync(new URL("./package.json", import.meta.url), "utf8"),
+      ).version || "";
+    } catch {
+      return "";
+    }
+  })(),
+);
 
 // ===== 协议契约（单一真相来源，Python/Node 契约测试按文本解析这些导出） =====
 // 协议版本独立于包 semver：改记录信封才 bump 协议；修实现只升包版本。
