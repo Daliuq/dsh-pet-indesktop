@@ -460,6 +460,11 @@ class ModernSettingsDialog(QDialog):
             SettingRow("self_talk_image_scale", "配图大小", "气泡里配图的显示尺寸（100% 为默认）。", self.self_talk_image_scale_spin),
             SettingRow("click_talk_bindings", "点击动画台词绑定", "为每个点击动画设置专属自言自语台词。", self.click_talk_bindings_btn),
         ], behavior_content))
+        # Agent 联动：状态气泡时间门（thinking/start 共用最小间隔）
+        state_bubble_rows = [
+            SettingRow("state_bubble_min_interval", "状态气泡间隔", "「开始干活 / 正在思考」气泡的最小间隔；防止 Agent 反复切换时刷屏。0 表示无时间门。", self.state_bubble_min_interval_spin),
+        ]
+        behavior_layout.addWidget(SettingsSection("Agent 联动 · 状态气泡", state_bubble_rows, behavior_content))
         # Agent 联动：音效设置
         agent_sound_rows = [
             SettingRow("agent_sound_enabled", "Agent 音效联动", "当 Agent 开始工作、任务完成或发生错误时播放提示音。", self.agent_sound_check),
@@ -1719,6 +1724,7 @@ class ModernSettingsDialog(QDialog):
         agent_cfg["sound_error_path"] = self.agent_sound_error_picker.text().strip() or "builtin:agent-error"
         agent_cfg["sound_volume"] = float(self.agent_sound_volume_spin.value()) / 100.0
         agent_cfg["sound_cooldown_seconds"] = float(self.agent_sound_cooldown_spin.value())
+        agent_cfg["state_bubble_min_interval"] = float(self.state_bubble_min_interval_spin.value())
         # 事件汇报概率门：滑块值即通过概率（0.00–1.00，步长 0.05），逐类写回。
         report_gates = dict(agent_cfg.get("report_gates") or {})
         for gate, slider in self.report_gate_sliders.items():

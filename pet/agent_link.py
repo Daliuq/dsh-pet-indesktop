@@ -1035,7 +1035,16 @@ class DirGlobTailer:
         try:
             if not self.directory.is_dir():
                 return
-            files = sorted(self.directory.glob(self.pattern))
+            # max_files 封顶时按"最近写入优先"排序：活跃 DSH 实例的文件持续追加，
+            # 必须永远排在最前被跟踪。按字典序截断会让生命周期较短的当前实例
+            # （PID 排名随机）被历史文件挤出 64 上限，pet 因此读不到最新桥接事件
+            # （现象：桥接正常写盘、pet 无任何联动/弹窗）。测试
+            # test_glob_capped_prefers_recently_written 锁定该行为。
+            files = sorted(
+                self.directory.glob(self.pattern),
+                key=lambda f: f.stat().st_mtime_ns,
+                reverse=True,
+            )
             files = files[: self.max_files]
             candidates = {str(f) for f in files}
             for stale in [k for k in self._tailers if k not in candidates]:
@@ -2343,6 +2352,11 @@ class AgentLinkManager(QObject):
         # 汇报抽稀随机源（可注入：测试用确定序列，避免 60% 抽样导致用例不确定）
         self._rng = rng
         self._last_applied: dict[str, tuple[str, float]] = {}
+        # 状态气泡（开始干活/思考）时间门：agent → 最近一次状态气泡时刻
+        # （_clock 域）。与 _last_applied 去抖不同——thinking 每次出现都可见，
+        # 但受 state_bubble_min_interval 时间门限频（防 DSH working↔thinking
+        # 反复时刷屏）。
+        self._state_bubble_at: dict[str, float] = {}
         # 原始状态流（不受去抖/节流影响）：用于 busy→idle 完成检测。
         # 不能用 _last_applied 做完成判定——节流会丢掉紧跟其后的 idle，导致完成通知丢失。
         self._last_raw: dict[str, str] = {}
@@ -2813,21 +2827,13 @@ class AgentLinkManager(QObject):
         """接收 Agent 状态变更并调度桌宠动作/气泡（带去抖与节流）。"""
         if not self._gen_current(agent_key, gen):
             return
-        # 兜底：该 agent 已回待机（任务结束）但审批/问题还没收到 resolved → 交互必然失效。
-        # 放在可见性判断之前：窗口隐藏期间也要清 pending，避免恢复显示时挂出陈旧气泡。
-        if state in ("idle", "sleeping"):
-            # 改为按交互 id 遍历清理（同一 agent 可能有多个并发审批/问题）
-            for iid in [i for i, v in self._pending_interactions.items()
-                        if v.get("agent_key") == agent_key]:
-                item = self._pending_interactions.pop(iid, None)
-                if item is None:
-                    continue
-                alert_id = item.get("alert_id", "")
-                if alert_id and hasattr(self.win, "resolve_alert"):
-                    self.win.resolve_alert(alert_id)
-                elif hasattr(self.win, "hide_bubble"):
-                    self.win.hide_bubble()
-
+        # 注意：这里**不再**按 idle 清 pending 阻塞交互——DSH 的 AgentStatus idle
+        # 是空闲心跳/step 间隙（实测 working→idle→working 每 2-5s 出现），并非
+        # 回合结束。若把 idle 当结束清 pending，会让仍在进行的审批/选择常驻气泡
+        # 被误清（用户报告的不再常驻显示）。审批/问题由各自的 resolved 帧精确
+        # 关闭（_on_approval_resolved / _on_question_resolved），兜底只走权威
+        # _INTERACTION_END_EVENTS（turn/end 等）与 dismiss_all_interactions
+        # （DSH 离线/重启，见 _on_bridge_offline / pause 路径）。
         if not hasattr(self.win, "isVisible") or not self.win.isVisible():
             return
 
@@ -2846,7 +2852,12 @@ class AgentLinkManager(QObject):
             self._emit_sound("error", agent_key)
         if state in self._BUSY_STATES:
             self._cancel_done_check(agent_key)
-            self._saw_alert.discard(agent_key)
+            # 注意：**不**在此清 _saw_alert——审批/选择交互登记时设置过它
+            # （_register_interaction），用来让随后的 done 走「停下待确认」而非
+            # 「干完活啦」。若这里在 busy 时 discard，交互刚解决后的回合结束
+            # （working→success→idle）会误报成功完成（用户报告「操作后弹窗
+            # 重复出现一次，以普通气泡形式」）。_saw_alert 只在 _fire_done
+            # 真正弹出后（L3752）再清除。
             if prev_raw != "error":
                 self._saw_error.discard(agent_key)
         elif state in ("attention", "error") and prev_raw in self._BUSY_STATES:
@@ -2866,9 +2877,11 @@ class AgentLinkManager(QObject):
         last = self._last_applied.get(agent_key)
         if last is not None and last[0] == state:
             return
-        # 节流：同一 Agent 两次动作/气泡切换最小间隔
-        if last is not None and (now - last[1]) < self._min_interval:
-            return
+        # 防刷屏由 report_gates 概率门兜底（thinking/start 同属 state 门），这里
+        # 不做额外节流：DSH 序列里 working（AgentStatus）常先于 thinking
+        # （user/message 收敛）到达，若节流 thinking 会让真人消息引发的思考
+        # 气泡永不出现。thinking 该弹就弹；working「开始干活」由
+        # _maybe_notify_start 的 prev 判断（仅非 busy→busy）控频。
         self._last_applied[agent_key] = (state, now)
 
         log.debug("Agent 状态变更 [%s]: %s", agent_key, state)
@@ -3095,13 +3108,33 @@ class AgentLinkManager(QObject):
         return should_report_event(gates, event_key, self._rng())
 
     def _maybe_notify_start(self, agent_key: str, prev_raw: str | None, state: str = "working") -> None:
-        """开始干活气泡：仅「非 busy → busy」时提示（thinking↔working 互跳不弹）。
-        低优先级：气泡位被占时直接丢弃。thinking 状态用更有趣的文案。"""
+        """开始干活/思考气泡。
+
+        - working「开始干活」：仅「非 busy → busy」时提示（thinking↔working
+          互跳不弹，避免刷屏）；
+        - thinking「正在思考」：**不受 busy→busy 抑制**——DSH 序列里 AgentStatus
+          working 常先于 user/message（→thinking）到达，thinking 的 prev_raw
+          总是 working（busy），若按互跳抑制则真人消息引发的思考气泡永不出现
+          （用户实测：状态机收敛 thinking 但宠无思考气泡）。thinking 是独立
+          语义（用户提问/模型推理），应在其出现时可见。
+
+        防刷屏双门：概率门（report_gates.state）控"要不要弹"；**时间门**
+        （agent_link.state_bubble_min_interval，默认 2.0s）控"多快能再弹一次"——
+        DSH 短时间内反复 working↔thinking 时，两次状态气泡间隔小于时间门则
+        跳过本弹（每次状态变化只留最新一次，避免刷屏；0 = 无时间门）。"""
         agent_cfg = self.cfg.get("agent_link", {})
         if not self._report_allowed(agent_cfg, "thinking" if state == "thinking" else "start"):
             return
-        if prev_raw in self._BUSY_STATES:
+        if state != "thinking" and prev_raw in self._BUSY_STATES:
             return
+        # 时间门：同 agent 两次状态气泡最小间隔（仅状态气泡，不拦审批/完成等）。
+        min_gap = float(agent_cfg.get("state_bubble_min_interval", 2.0) or 0.0)
+        if min_gap > 0:
+            last_bubble = self._state_bubble_at.get(agent_key, None)
+            now = self._clock()
+            if last_bubble is not None and (now - last_bubble) < min_gap:
+                return
+            self._state_bubble_at[agent_key] = now
         name = self.agent_names.get(agent_key, agent_key)
         if state == "thinking":
             self._show_link_bubble(self._thinking_text(agent_key), important=False, duration_ms=3000)
@@ -3818,6 +3851,10 @@ class AgentLinkManager(QObject):
             return  # 隐藏中不弹不切（pause 已取消计时器，这里是兜底）
         if self._last_raw.get(agent_key) in self._BUSY_STATES:
             return
+        # 有未决审批/选择时不弹"完成"：DSH 等待用户交互的回合不算完成，
+        # 且交互气泡本身常驻展示——此时说"干完活啦"是误报。
+        if self.pending_interactions_for(agent_key):
+            return
         if agent_key not in self._saw_error:
             self._emit_sound("done", agent_key)
         agent_cfg = self.cfg.get("agent_link", {})
@@ -3885,7 +3922,7 @@ class AgentLinkManager(QObject):
                 getattr(self.win, "_alert_queue", None):
             return
         if not important and getattr(self.win, "_sticky_bubble_active", False):
-            # 兼容旧路径：审批等一直挂着的气泡优先
+            # 兼容旧路径：审批等一直挂着的气泡优先（让路，不打扰）
             return
         busy_until = getattr(self.win, "_bubble_busy_until", 0.0)
         # window.hold_bubble 以 time.monotonic() 写入 _bubble_busy_until，这里必须
@@ -4323,13 +4360,20 @@ class AgentLinkManager(QObject):
     }
 
     def _on_interaction_lifecycle(self, agent_key: str, record: dict) -> None:
-        """会话/turn 结束或 Agent 停止时，清掉对应会话/agent 的 pending 阻塞交互。"""
+        """会话/turn 结束或 Agent 停止时，清掉对应会话/agent 的 pending 阻塞交互。
+
+        只认权威结束信号（turn/end、task_complete、execution/failed、
+        thread_rolled_back）。**不含 AgentStatus idle**：DSH 的 idel 是空闲心跳/
+        step 间隙（实测 working→idle→working 每 2-5s 出现），并非回合结束，
+        若把它当 ended 会把仍在进行的审批/选择常驻气泡误清（用户报告的不再
+        常驻显示）。带 rpcId/approvalId 的真实审批/问题由各自的 resolved 帧
+        精确关闭（_on_approval_resolved / _on_question_resolved），兜底只给
+        无 id 的旧路径提示。"""
         if not isinstance(record, dict):
             return
         event = str(record.get("event") or "")
         session = str(record.get("sessionId") or record.get("session_id") or "")
-        ended = (event in self._INTERACTION_END_EVENTS or
-                 (event == "AgentStatus" and str(record.get("state") or "") in {"idle", "sleeping"}))
+        ended = event in self._INTERACTION_END_EVENTS
         if not ended:
             return
         for iid in [i for i, v in self._pending_interactions.items()
