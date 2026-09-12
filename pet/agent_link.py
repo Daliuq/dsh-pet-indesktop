@@ -2664,7 +2664,16 @@ class AgentLinkManager(QObject):
             if hasattr(self.win, "show_bubble"):
                 name = self.AGENT_NAMES.get(agent_key, agent_key)
                 if self._report_allowed(self.cfg.get("agent_link", {}), "bridge.install.success"):
-                    self.win.show_bubble(self._dialogue("bridge.install.success", "DSH 桥接插件已装好，联动开启～", name=name), duration_ms=4000)
+                    # 安装只写盘（profile 依赖 + bundles），运行中的 DSH 不会
+                    # 自动加载**新装的**插件——首次安装必须重启 DSH 才挂载壳；
+                    # 之后的一切升级/修复走壳的热重载（≤2s 生效），无需再重启。
+                    # 直接 show_bubble（不用 _dialogue：persona 模板会覆盖掉
+                    # 重启提示，而这个提示是首次安装的必要说明，必须显示）。
+                    self.win.show_bubble(
+                        f"{name} 桥接插件已装好，联动开启～\n"
+                        "首次安装需要重启 DSH 生效（仅这一次；之后升级都自动生效）",
+                        duration_ms=7000,
+                    )
         else:
             log.warning("DSH 桥接插件安装失败: %s", msg)
             if hasattr(self.win, "show_bubble"):

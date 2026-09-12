@@ -409,3 +409,28 @@ def test_control_and_diagnostic_events_reach_a_consumer(tmp_path):
     assert set(raw) == {"bridge/control-received", "bridge/diagnostic"}
     assert incompatible == []
     monitor.stop()
+
+
+def test_first_install_success_prompts_restart(tmp_path):
+    """首次安装成功必须提示重启 DSH（运行中的 DSH 不自动加载新装插件）。
+
+    安装只写盘（profile 依赖 + bundles），DST 插件加载器在启动时扫描——运行中
+    新增依赖不生效。首次安装的唯一一次重启提示必须显示（不走 persona 模板，
+    模板会覆盖掉它）。"""
+    _qapp()
+    bubbles = []
+
+    class DummyWindow:
+        def isVisible(self):
+            return True
+
+        def show_bubble(self, text, duration_ms=3000):
+            bubbles.append(text)
+
+    cfg = Config(base=tmp_path)
+    manager = AgentLinkManager(DummyWindow(), cfg, min_interval=0)
+    manager._on_install_finished("dsh", True, "已安装到 1 个 dsh 实例")
+    assert bubbles, "首次安装成功必须弹气泡"
+    assert any("重启" in b and "生效" in b for b in bubbles), \
+        f"首次安装气泡必须提示重启 DSH: {bubbles}"
+    manager.shutdown()
