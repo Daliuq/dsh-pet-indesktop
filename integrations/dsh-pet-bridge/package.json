@@ -5,7 +5,7 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test --test-force-exit test/*.test.mjs"
   },
   "exports": {
     ".": "./index.js"
@@ -25,7 +25,8 @@
   },
   "files": [
     "index.js",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "impl/"
   ],
   "dsh": {
     "bundle": {
