@@ -1379,6 +1379,7 @@ class ModernSettingsDialog(QDialog):
         dialogue_rows = claim_prefix("dialogue_")
         gate_rows = claim_prefix("report_gate_")
         automation = page_content([
+            ("状态气泡", claim("state_bubble_min_interval")),
             ("Agent 提示音", claim_prefix("agent_sound_")),
             ("待办提醒", claim("todo_reminder_enabled", "todo_reminder_lead_minutes")),
             ("主动感知", proactive_rows),
@@ -1425,15 +1426,19 @@ class ModernSettingsDialog(QDialog):
             insert_at += 1
         automation_layout.insertWidget(insert_at, gates_box)
 
-        # Preserve any newly added row until it receives an explicit domain decision.
+        # 未认领的开发期行**直接屏蔽**（用户指示：待分类(开发期) 不再展示）。
+        # 新加入的设置行必须先走完认领（这里扫描残留可帮助补认领）。
         leftovers = [
             row for row in all_rows
             if row not in claimed
             and (self.ai_page is None or not self.ai_page.isAncestorOf(row))
         ]
         if leftovers:
-            layout = automation.layout()
-            layout.insertWidget(max(0, layout.count() - 1), SettingsSection("待分类（开发期）", leftovers, automation))
+            # 仅日志提示（避免开发期行静默失踪），设置页不再开「待分类（开发期）」节。
+            logging.warning(
+                "设置页存在 %d 个未认领行（已屏蔽显示）: %s",
+                len(leftovers), [r.objectName() for r in leftovers],
+            )
 
         while self.pages.count():
             self.pages.removeWidget(self.pages.widget(0))
