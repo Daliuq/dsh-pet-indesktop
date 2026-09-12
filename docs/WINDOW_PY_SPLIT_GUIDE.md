@@ -59,8 +59,7 @@
    当前不同名实例字段 159 个（赋值去重口径），此步骤的准确性
    直接决定拆分质量，建议逐字段核对而非依赖估计。
 3. **建立控制器**：新模块持有本域字段；对窗口的反向依赖经构造参数注入，
-   避免循环 import（参考 `collision_client.py` 的常量注入与
-   `agent_link_reducer.py` 的 Callable 注入两种模式）。
+   避免循环 import（参考 `collision_client.py` 的常量注入模式）。
 4. **搬移与变更分离**：拆分提交仅做机械搬移，不夹带逻辑或数值修改，
    以保证回归可归因。
 5. **保留兼容面**：window.py 保留薄委托 property / 转发方法，使既有调用
@@ -172,8 +171,8 @@
 `context_menus/` 三个外围调用面**——这些模块不得访问 `win._xxx`。
 而 `collision_client.py`、`platform_win.py` 等窗口的近邻控制器目前仍
 按既有约定访问窗口私有成员（属当前事实而非违规），
-`agent_link_presentation.py` 也保留了一处有注释登记的例外
-（`win._bubble_busy_until`）。新拆控制器时建议优先走公开 seam；确实
+`agent_link.py` 也保留了一处有注释登记的例外
+（`win._bubble_busy_until`，见 `pet/agent_link.py:3820`）。新拆控制器时建议优先走公开 seam；确实
 需要近邻访问时，参照这些既有模块保持克制并在注释中说明。
 
 ## 6. 生命周期边界补充

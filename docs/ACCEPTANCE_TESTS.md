@@ -30,6 +30,8 @@ Bridge 验收采用真实插件源码上的 Node contract 测试，并结合桌�
 
 - `tests/test_bridge_root_control.js`：读取并检查实际的 `integrations/dsh-pet-bridge/index.js`，验证控制结果与未知会话行为（子代理归一到根会话）；
 - `tests/test_bridge_interaction_dedup.js`：验证审批/问题写盘去重的身份字段（降级键必须带 sessionId）；
+- `tests/test_bridge_question_callid.js`：mux question 帧的 callId 构造（按会话反查、帧自带优先）；
+- `tests/test_bridge_user_action_guard.js`：tool/result 兜底只走 resolveQuestion，不再写恒不可达的 user_action；
 - `tests/test_bridge_manifest.js`：插件可独立加载（inject 契约）+ 清单零依赖红线；
 - `integrations/dsh-pet-bridge/verify_import.mjs`：hermetic 零依赖冒烟（无 node_modules 隔离目录 import + envelope 形状 + 动态 import/require 禁令）；
 - `tests/test_agent_link.py`：真实 `AgentLinkManager`、tailer、事件映射、请求生命周期和交互队列；
@@ -39,7 +41,7 @@ Bridge 验收采用真实插件源码上的 Node contract 测试，并结合桌�
 
 ```powershell
 node --check integrations/dsh-pet-bridge/index.js
-node --test tests/test_bridge_hardfailure.js tests/test_bridge_interaction_dedup.js tests/test_bridge_manifest.js tests/test_bridge_retry.js tests/test_bridge_root_control.js
+node --test tests/test_bridge_hardfailure.js tests/test_bridge_interaction_dedup.js tests/test_bridge_manifest.js tests/test_bridge_question_callid.js tests/test_bridge_retry.js tests/test_bridge_root_control.js tests/test_bridge_user_action_guard.js
 node integrations/dsh-pet-bridge/verify_import.mjs
 $env:QT_QPA_PLATFORM = "offscreen"
 python -m pytest -q tests/test_agent_link.py tests/test_dsh_state.py
@@ -52,14 +54,14 @@ Qt 生命周期问题：
 
 ```powershell
 $env:QT_QPA_PLATFORM = "offscreen"
-python -m pytest -q -k "not cross_process_concurrent_publish_read_stress"
-python -m pytest -q tests/test_decode_broker_shm.py::test_cross_process_concurrent_publish_read_stress
+python -m pytest -q -k "not decode_fanout"
+python -m pytest -q tests/test_decode_fanout.py tests/test_decode_fanout_integration.py
 ```
 
 第一步应先完整结束且无 native abort；第二步只能在第一步通过后运行。本轮实测结果：
 
-- 主套件：`1421 passed, 7 skipped, 1 deselected`；
-- 跨进程压力测试：`1 passed`。
+- 主套件：`1895 passed, 8 skipped, 2 deselected`（2 deselected = 本机两个已知环境假红：高刷屏 drag 节流钟差、collision 真时钟竞态）；
+- 解码扇出族（原跨进程 shm broker 已被进程内 fan-out 取代）：`29 passed`。
 
 生命周期重点覆盖 `PetWindow.closeEvent()` 的幂等关闭、外置
 `PetSpeechBubble` 的 owner 清理、右键菜单执行 seam、AgentLink/WebM/session

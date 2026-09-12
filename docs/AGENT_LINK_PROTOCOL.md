@@ -5,7 +5,7 @@
 
 ---
 
-## 1. 架构总览：本地文件事件总线（零网络）
+## 1. 架构总览：本地文件事件总线（不访问外网）
 
 ```
 Agent 侧（写方）                          桌宠侧（读方）
@@ -19,7 +19,7 @@ Agent 侧（写方）                          桌宠侧（读方）
                                         └────────────────────────────────────┘
 ```
 
-- **通信方式**：纯本地文件追加写 + 增量读，无端口、无 HTTP、无 WebSocket。
+- **通信方式**：事件主通道是纯本地文件追加写 + 增量读；交互回写另走**本机回环**的 WebSocket/HTTP——DSH 桥接插件订阅 DSH 的 `ws://127.0.0.1:<port>/api/events.mux`，桌宠侧 POST `http://127.0.0.1:<port>/api/respond`。两者都只连 `127.0.0.1`，全程不访问外网。
 - **读方保证**：byte-offset tail 不回放历史事件；文件不存在时静默空转；半行缓冲不丢事件；单次读取有界（64KB）。
 - **低功耗**：联动默认全关；桌宠隐藏时监视器全线 pause，显示时 resume。
 
@@ -92,7 +92,7 @@ Agent 侧（写方）                          桌宠侧（读方）
 
 1. **追加写**（append），UTF-8 编码；PowerShell 写入方建议 `-Encoding UTF8`（读方已兼容首行 BOM）。
 2. **去重**：连续相同状态不要重复落盘（状态切换瞬间可能抖出重复事件，重复行会占住桌宠端换帧节流位）。
-3. **轮转**：事件文件超过约 1MB 时轮转（如 `dsh.jsonl` → `dsh.jsonl.1`，只留一代）；读方通过文件身份识别自动适配，无需特殊处理。
+3. **轮转**：事件文件超过约 1MB 时轮转（如 `dsh-{pid}.jsonl` → `dsh-{pid}.jsonl.1`，只留一代）；读方通过文件身份识别自动适配，无需特殊处理。
 4. **绝不阻塞宿主**：写事件失败时静默放弃——联动是锦上添花，不能影响 Agent 本体（参考 `integrations/dsh-pet-bridge/index.js` 的做法）。
 5. **隐私红线**：只写状态/事件元数据（状态、事件名、工具名），**不要**把代码内容、命令全文、文件内容、屏幕信息写进事件文件。
 
@@ -100,7 +100,7 @@ Agent 侧（写方）                          桌宠侧（读方）
 
 | Agent | 模式 | 事件来源 | 是否写外部配置 |
 |---|---|---|---|
-| DSH | 插件订阅 | 内置桥接插件 `integrations/dsh-pet-bridge/` 订阅 agent 生命周期事件，写桥目录 `<base>/dsh-pet-bridge/dsh.jsonl` | 安装/卸载 dsh 插件（弹窗同意） |
+| DSH | 插件订阅 | 内置桥接插件 `integrations/dsh-pet-bridge/` 订阅 agent 生命周期事件，按实例写桥目录 `<base>/dsh-pet-bridge/dsh-{pid}.jsonl`（消费端 glob `dsh*.jsonl`，兼容旧版单文件 `dsh.jsonl`） | 安装/卸载 dsh 插件（弹窗同意） |
 | Claude Code | hooks 注入 | 向 `~/.claude/settings.json` 注入官方 hooks，落地脚本把事件写 `agent-events/claude.jsonl` | 注入/卸载 hooks（弹窗同意） |
 | Cursor | transcript 直读 | 直接 tail `~/.cursor/projects/**/agent-transcripts/*.jsonl`（官方转写文件，按 role/content 解析） | 否 |
 | OpenCode | 数据库直读 | 只读 `~/.local/share/opencode/opencode.db` 的 `event` 表（rowid 增量） | 否 |
@@ -165,7 +165,7 @@ printf '{"ts": %s, "state": "idle"}\n' "$(date +%s)" >> ~/.gemini/pet-events.jso
 ## 6. 隐私与安全红线（不可违反）
 
 1. **默认全关**：所有 Agent 联动开关默认关闭，用户显式勾选才启动。
-2. **零网络**：联动链路只碰本地文件/本地数据库，任何一方不得发起网络请求。
+2. **不访问外网**：联动链路只碰本地文件/本地数据库，以及本机回环（`127.0.0.1`）的 WebSocket/HTTP 交互回写；任何一方不得向外网发起网络请求。
 3. **只存元数据**：事件文件只有状态/事件名/工具名，绝不写截图、代码内容、命令全文。
 4. **写外部配置必须先弹窗**：任何向 Agent 配置（如 `~/.claude/settings.json`、dsh profiles）注入内容的操作，必须先经用户确认，且卸载时只清理带本桌宠标记的条目。
 5. **自定义通道只读**：`custom_agents` 仅监听用户指定的文件，不创建目录、不写任何外部位置。

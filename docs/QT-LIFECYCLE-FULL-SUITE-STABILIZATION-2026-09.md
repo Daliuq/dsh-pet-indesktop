@@ -92,7 +92,7 @@ ModuleNotFoundError: No module named 'pet.chat'
 | 验证 | 结果 |
 |---|---:|
 | 主套件（排除最终跨进程压力测试） | 1421 passed, 7 skipped, 1 deselected |
-| 最后单独运行 `test_cross_process_concurrent_publish_read_stress` | 1 passed |
+| 最后单独运行 `tests/test_decode_fanout*.py`（shm broker 退役后的等价跨进程套件） | 29 passed |
 | 菜单/窗口/预热相关组合 | 35 passed |
 | AgentLink、窗口、预热组合 | 177 passed |
 | 两个高风险回归各运行 20 个新进程 | 20 轮全部通过 |

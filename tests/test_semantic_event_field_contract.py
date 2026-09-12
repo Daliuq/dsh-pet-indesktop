@@ -49,7 +49,10 @@ def test_consume_counts_consecutive_model_access_retries():
         assert out is not None, "限流重试必须产出一份 streak"
         assert out["consecutiveRetryCount"] == i
         assert out["sessionId"] == "s-1"
-    assert tracker.count("dsh", "s-1") == 3
+    # 再喂一条仍在连续链上 → 计数继续累加（证明 streak 按 session 留存）
+    out = tracker.consume(_norm("llm/retry", retry=4, errorCode="RATE_LIMIT",
+                                errorMessage="429 too many requests"))
+    assert out["consecutiveRetryCount"] == 4
 
 
 def test_consume_does_not_count_non_model_access_retry():
@@ -57,7 +60,10 @@ def test_consume_does_not_count_non_model_access_retry():
     out = tracker.consume(_norm("llm/retry", retry=1, errorCode="server_error",
                                 errorMessage="upstream boom"))
     assert out is None
-    assert tracker.count("dsh", "s-1") == 0
+    # 随后的真实限流重试必须从 1 开始（前面那条不该建 streak）
+    out = tracker.consume(_norm("llm/retry", retry=2, errorCode="RATE_LIMIT",
+                                errorMessage="429 too many requests"))
+    assert out["consecutiveRetryCount"] == 1
 
 
 def test_consume_counts_consecutive_timeout_retries():
@@ -75,7 +81,9 @@ def test_consume_counts_consecutive_timeout_retries():
                                     errorMessage="upstream response headers timed out before streaming started"))
         assert out is not None, "TIMEOUT 重试必须产出一份 streak"
         assert out["consecutiveRetryCount"] == i
-    assert tracker.count("dsh", "s-1") == 3
+    out = tracker.consume(_norm("llm/retry", retry=4, errorCode="TIMEOUT",
+                                errorMessage="upstream response headers timed out before streaming started"))
+    assert out["consecutiveRetryCount"] == 4
 
 
 def test_consume_counts_connection_failure_message_without_code():
@@ -89,7 +97,6 @@ def test_consume_counts_connection_failure_message_without_code():
 
 def test_consume_resets_streak_on_recovery_events():
     """恢复/交互类事件必须复位连续限流计数（否则模型访问失败提示会一直叠加）。"""
-    tracker = ModelAccessTracker()
     resetting = (
         ("tool/call", {"tool": "pwsh"}),
         ("turn/start", {}),
@@ -99,25 +106,31 @@ def test_consume_resets_streak_on_recovery_events():
         ("turn/end", {}),
     )
     for event_name, extra in resetting:
-        tracker.consume(_norm("llm/retry", retry=1, errorCode="RATE_LIMIT",
-                              errorMessage="429 too many requests"))
-        assert tracker.count("dsh", "s-1") == 1, f"{event_name} 之前应已计数"
+        tracker = ModelAccessTracker()  # 每个恢复事件独立验证，互不残留
+        streak = tracker.consume(_norm("llm/retry", retry=1, errorCode="RATE_LIMIT",
+                                       errorMessage="429 too many requests"))
+        assert streak["consecutiveRetryCount"] == 1, f"{event_name} 之前应已计数"
         tracker.consume(_norm(event_name, **extra))
-        assert tracker.count("dsh", "s-1") == 0, f"{event_name} 必须复位连续限流计数"
+        # 复位后重新计数必须从 1 开始（未复位会累加到 2）
+        streak = tracker.consume(_norm("llm/retry", retry=2, errorCode="RATE_LIMIT",
+                                       errorMessage="429 too many requests"))
+        assert streak["consecutiveRetryCount"] == 1, f"{event_name} 必须复位连续限流计数"
 
 
 def test_non_model_access_error_also_resets():
     tracker = ModelAccessTracker()
-    tracker.consume(_norm("llm/retry", retry=1, errorCode="RATE_LIMIT", errorMessage="429"))
-    assert tracker.count("dsh", "s-1") == 1
+    streak = tracker.consume(_norm("llm/retry", retry=1, errorCode="RATE_LIMIT", errorMessage="429"))
+    assert streak["consecutiveRetryCount"] == 1
     tracker.consume(_norm("error", errorCode="EACCES", errorMessage="permission denied"))
-    assert tracker.count("dsh", "s-1") == 0
+    streak = tracker.consume(_norm("llm/retry", retry=2, errorCode="RATE_LIMIT", errorMessage="429"))
+    assert streak["consecutiveRetryCount"] == 1
 
 
 def test_model_access_error_itself_does_not_reset():
     """限流错误的 error 事件不得复位自己（否则计数会被自己清零）。"""
     tracker = ModelAccessTracker()
-    tracker.consume(_norm("llm/retry", retry=1, errorCode="RATE_LIMIT", errorMessage="429"))
-    assert tracker.count("dsh", "s-1") == 1
+    streak = tracker.consume(_norm("llm/retry", retry=1, errorCode="RATE_LIMIT", errorMessage="429"))
+    assert streak["consecutiveRetryCount"] == 1
     tracker.consume(_norm("agent/request-error", errorCode="RATE_LIMIT", errorMessage="429 too many requests"))
-    assert tracker.count("dsh", "s-1") == 1
+    streak = tracker.consume(_norm("llm/retry", retry=2, errorCode="RATE_LIMIT", errorMessage="429"))
+    assert streak["consecutiveRetryCount"] == 2

@@ -42,7 +42,6 @@ from .click_sound import play_sound, resolve_builtin_sound
 from .report_gates import should_report, should_report_event
 from .agent_event_protocol import parse_agent_event
 from .agent_event_normalizer import normalize_event
-from .agent_event_runtime import AgentEventRuntime
 from .model_access_tracker import ModelAccessTracker
 from .node_runtime import augmented_path as _augmented_path
 from .node_runtime import global_node_modules_roots
@@ -76,7 +75,32 @@ _RAW_BRIDGE_KNOWN_EVENTS: frozenset[str] = frozenset({
     "command/done",
     "pet/control-clicked",
     "bridge/control-received",
+    # - tool-workflow/run-end：桥接 STATE_EVENT_TYPES 直写，与已登记的
+    #   tool-workflow/run-start 成对（语义层只认识 run-start）；
+    # - web_search_begin / web_search_end / context_compacted：桥接
+    #   WATCHDOG_EVENT_TYPES 直写（供探索看门狗，非状态迁移）；
+    # - pet/control-queued：桌宠控制队列写盘回显（pet/dsh_control.py）。
+    "tool-workflow/run-end",
+    "web_search_begin",
+    "web_search_end",
+    "context_compacted",
+    "pet/control-queued",
 })
+
+
+def _cordis_requires_approval(data: dict) -> bool:
+    """cordis 审批门禁：requiresApproval 是否严格布尔 True。
+
+    桥接写盘把原始 cordis request 整体嵌在 payload 下（index.js：
+    ``writeRecord({event: "cordis/request-run", ..., payload: request, requestId})``），
+    顶层只有 requestId/agentId/sessionId 等身份字段；旧版桥与手写桩则可能把
+    字段平铺在顶层。两处都认，payload 内存在该键时以它为准（避免嵌套 False
+    被顶层残留 True 顶掉）。
+    """
+    nested = data.get("payload")
+    if isinstance(nested, dict) and "requiresApproval" in nested:
+        return nested.get("requiresApproval") is True
+    return data.get("requiresApproval") is True
 
 
 def _which(name: str) -> str | None:
@@ -482,6 +506,113 @@ def _manifest_set_bundle(pkg: dict, profile_dir: Path, present: bool) -> bool:
     return True
 
 
+# dsh-app-boot initProfile 的等价产物（见该包 lib/index.js）：新装 dsh 从未
+# 运行时没有任何 profile，全新用户第一次开联动会被「没有可用的 dsh profile」
+# 挡住——安装桥接前先按同一套三件套补出默认 web profile。
+_WEB_PROFILE_BUNDLES = ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"]
+_PROFILE_PATCH_TEMPLATE = (
+    "# Your patch layer for this dsh profile, applied after every bundle layer:\n"
+    "# a top-level YAML array of loader patch entries (id-targeted config\n"
+    "# overrides, disables, and insert lists; `!!js` expressions allowed).\n"
+    "[]\n"
+)
+_PROFILE_PNPM_WORKSPACE = "packages:\n  - .\n\nnodeLinker: hoisted\n"
+
+
+def _ensure_profile(profile_dir: Path) -> bool:
+    """按 dsh initProfile 三件套补齐 profile（幂等：已有文件一律不动）。
+
+    manifest（web 预设 bundles）+ cordis.patch.yml + pnpm-workspace.yaml。
+    bundles 层与 dependencies 不同：只声明层列表，无需安装即可加 link: 依赖。
+    """
+    try:
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        manifest = profile_dir / "package.json"
+        if not manifest.exists():
+            manifest.write_text(json.dumps({
+                "name": f"dsh-profile-{profile_dir.name}",
+                "private": True,
+                "dependencies": {},
+                "dsh": {"profile": {"bundles": list(_WEB_PROFILE_BUNDLES),
+                                     "patchReload": "live"}},
+            }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        patch = profile_dir / "cordis.patch.yml"
+        if not patch.exists():
+            patch.write_text(_PROFILE_PATCH_TEMPLATE, encoding="utf-8")
+        workspace = profile_dir / "pnpm-workspace.yaml"
+        if not workspace.exists():
+            workspace.write_text(_PROFILE_PNPM_WORKSPACE, encoding="utf-8")
+        return True
+    except OSError:
+        log.exception("补齐 dsh profile 失败: %s", profile_dir)
+        return False
+
+
+def _prune_manifest_backups(profile_dir: Path, keep: int = 5) -> None:
+    """package.json.bak-* 只保留最近 N 份（文件名含时间戳，按名排序即按时间）。
+
+    备份是安全网、清旧是卫生——清理失败只记日志，绝不能反噬主流程。
+    """
+    try:
+        backups = sorted(profile_dir.glob("package.json.bak-*"))
+    except OSError:
+        return
+    for stale in backups[:-keep] if len(backups) > keep else []:
+        try:
+            stale.unlink()
+        except OSError:
+            log.debug("清理过期 manifest 备份失败: %s", stale)
+
+
+def _uninstall_manifest_without_pnpm(profile_dir: Path, pkg: dict) -> dict | None:
+    """没有 pnpm 时的纯 JSON 卸载：备份 → 删依赖条目 → 清 bundles → 写回。
+
+    无 pnpm 不能直接报成功：manifest 里的 ``link:`` 条目还指着即将被删除的
+    程序目录，dsh 启动解析失败会拖垮整个插件树（2026-09 事故同型）。返回写回
+    后的 manifest；备份或写入失败返回 None（保留原文件，绝不半改）。
+    """
+    manifest = profile_dir / "package.json"
+    backup = profile_dir / f"package.json.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+    try:
+        backup.write_text(manifest.read_text(encoding="utf-8"), encoding="utf-8")
+    except OSError:
+        log.exception("卸载桥接插件前备份失败，保留原 package.json: %s", profile_dir)
+        return None
+    _prune_manifest_backups(profile_dir)
+    deps = pkg.get("dependencies")
+    if isinstance(deps, dict):
+        deps.pop(DSH_PLUGIN_NAME, None)
+    bundles = ((pkg.get("dsh") or {}).get("profile") or {}).get("bundles")
+    if isinstance(bundles, list) and DSH_PLUGIN_NAME in bundles:
+        bundles.remove(DSH_PLUGIN_NAME)
+    try:
+        manifest.write_text(
+            json.dumps(pkg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+    except OSError:
+        log.exception("卸载桥接插件写入失败: %s", profile_dir)
+        return None
+    return pkg
+
+
+def _remove_linked_plugin_dir(profile_dir: Path) -> None:
+    """清掉 profile/node_modules 下的插件链接；失败只记日志（尽力而为）。
+
+    pnpm 的本地目录依赖在 Windows 上是 junction：``os.rmdir`` 只摘掉重解析点
+    本身，不会递归删掉链接目标里的文件；符号链接走 unlink。真实目录不动。
+    """
+    link = profile_dir / "node_modules" / "@dsh-pet" / "bridge"
+    try:
+        if link.is_symlink():
+            link.unlink()
+        elif link.is_dir():
+            link.rmdir()
+        elif link.exists():
+            link.unlink()
+    except OSError as exc:
+        log.debug("清理桥接插件链接失败(%s): %s", profile_dir, exc)
+
+
 # ---------------------------------------------------------------------------
 # 依赖规格体检（issue：桥接装不上，报错只说 pnpm 失败，看不出是哪条依赖）
 #
@@ -694,6 +825,7 @@ def _repair_missing_dependency_specs(profile_dir: Path, pkg: dict) -> list[str]:
     except OSError:
         log.exception("依赖路径修正前备份失败，放弃修正: %s", profile_dir)
         return []
+    _prune_manifest_backups(profile_dir)
     for name, _old, new in changes:
         deps[name] = new
     try:
@@ -1351,7 +1483,7 @@ class BaseAgentMonitor(QObject):
                     self._emit(self.question_requested, (self.agent_key, data))
                 if ev == "question/resolved":
                     self._emit(self.question_resolved, (self.agent_key, data))
-                if ev == "cordis/request-run" and data.get("requiresApproval") is True:
+                if ev == "cordis/request-run" and _cordis_requires_approval(data):
                     self._emit(self.cordis_requested, (self.agent_key, data))
                 if ev == "cordis/request-run-resolved":
                     self._emit(self.cordis_resolved, (self.agent_key, data))
@@ -1395,7 +1527,7 @@ class BaseAgentMonitor(QObject):
                     continue  # 不认识的事件类型：忽略，不误报为 working
                 self._emit_state(normalized, emit_gen)
             except Exception:
-                pass
+                log.debug("桥接记录处理失败，跳过该行", exc_info=True)
 
 # ----------------------------------------------------------------------
 # 各 Agent 具体监视器实现
@@ -1438,25 +1570,6 @@ class DshMonitor(BaseAgentMonitor):
             if (c / "package.json").is_file():
                 return c
         return None
-
-    @staticmethod
-    def _list_profiles() -> list[str]:
-        """枚举已存在的 dsh profile。
-
-        只认含 cordis.yml 的目录（真实 profile 的标志）；profiles 目录下
-        可能混入 node_modules 等包管理器/误操作残留的杂项目录，把它们当实例
-        安装会失败并触发整体回滚，必须过滤。目录不存在或无有效 profile 时
-        回退 ["web"]（安装命令会自动创建该 profile）。
-        统一使用 DSH_PROFILE_HOME（尊重 DSH_HOME），与 _real_profiles 一致。
-        """
-        profiles_dir = DSH_PROFILE_HOME / "profiles"
-        if not profiles_dir.is_dir():
-            return ["web"]
-        profiles = sorted(
-            p.name for p in profiles_dir.iterdir()
-            if p.is_dir() and (p / "cordis.yml").is_file()
-        )
-        return profiles or ["web"]
 
     @classmethod
     def bridge_link_stale(cls) -> list[tuple[str, str]]:
@@ -1506,12 +1619,19 @@ class DshMonitor(BaseAgentMonitor):
         for profile in _real_profiles():
             if profile.name not in stale_names:
                 continue
-            rc, out = _run_pnpm(profile, "add", str(plugin))
+            # 与安装路径同源：manifest 里可能存在指向不存在路径的依赖（旧构建目录 /
+            # 版本号变更的 tgz），裸 pnpm 会一直失败。先按探测结果修正再重试一次，
+            # 否则启动自检每次都在同一处静默失败，link 永远刷不新。
+            rc, out, repaired = _run_pnpm_repairing_specs(profile, "add", str(plugin))
             if rc != 0:
                 log.warning(
                     "桥接 link 刷新失败 %s: %s", profile.name, (out or "")[-200:],
                 )
                 continue
+            if repaired:
+                log.info(
+                    "桥接 link 刷新前修正依赖路径 %s: %s", profile.name, "；".join(repaired),
+                )
             pkg = _read_manifest(profile)
             if pkg is not None:
                 try:
@@ -1612,7 +1732,14 @@ class DshMonitor(BaseAgentMonitor):
 
         profiles = _real_profiles()
         if not profiles:
-            return False, "没有可用的 dsh profile（~/.dsh/profiles 下无 package.json）"
+            # 全新 dsh（从未运行过）没有 profile：先按 dsh initProfile 三件套
+            # 补出默认 web profile 再安装；补不出才报错，不把新用户挡住。
+            if not _ensure_profile(DSH_PROFILE_HOME / "profiles" / "web"):
+                return False, ("没有可用的 dsh profile（~/.dsh/profiles 下无 package.json），"
+                               "且自动补齐默认 web profile 失败")
+            profiles = _real_profiles()
+            if not profiles:
+                return False, "补齐默认 web profile 后仍未识别到 dsh profile"
 
         failed = []
         succeeded = []
@@ -1682,24 +1809,34 @@ class DshMonitor(BaseAgentMonitor):
         """关闭联动时卸载桥接插件。返回是否全部成功（失败记日志）。
 
         幂等：未安装的 profile 直接视为成功；不再依赖 dsh CLI（同 install_bridge）。
+        没有 pnpm 时不能直接报成功：manifest 里的 `link:` 条目还指着即将被删除的
+        程序目录（2026-09 dsh 事故同型），改为纯 JSON 手改卸载——备份 package.json、
+        删依赖条目与 dsh.profile.bundles 登记、尽力删 profile 内的插件链接。
         """
-        if _pnpm_command() is None:
-            return True  # 没有运行环境视为无残留
+        has_pnpm = _pnpm_command() is not None
         ok = True
         for profile in _real_profiles():
             pkg = _read_manifest(profile)
             if pkg is None or not _manifest_has_plugin(pkg):
                 continue  # 未安装视为成功（幂等）
-            rc, out = _run_pnpm(profile, "remove", DSH_PLUGIN_NAME)
-            if rc != 0:
-                ok = False
-                log.warning("卸载 DSH 桥接插件失败(%s): %s", profile.name, (out or "")[-150:])
-                continue
-            pkg = _read_manifest(profile)
-            if pkg is None:
-                ok = False
-                log.warning("卸载 DSH 桥接插件失败(%s): 卸载后 package.json 读取失败", profile.name)
-                continue
+            if has_pnpm:
+                rc, out = _run_pnpm(profile, "remove", DSH_PLUGIN_NAME)
+                if rc != 0:
+                    ok = False
+                    log.warning("卸载 DSH 桥接插件失败(%s): %s", profile.name, (out or "")[-150:])
+                    continue
+                pkg = _read_manifest(profile)
+                if pkg is None:
+                    ok = False
+                    log.warning("卸载 DSH 桥接插件失败(%s): 卸载后 package.json 读取失败", profile.name)
+                    continue
+            else:
+                pkg = _uninstall_manifest_without_pnpm(profile, pkg)
+                if pkg is None:
+                    ok = False
+                    log.warning("卸载 DSH 桥接插件失败(%s): package.json 手改失败", profile.name)
+                    continue
+                _remove_linked_plugin_dir(profile)
             try:
                 _manifest_set_bundle(pkg, profile, False)
             except Exception as exc:
@@ -2144,12 +2281,12 @@ class AgentLinkManager(QObject):
     """多 Agent 联动总调度管理器。
 
     批6-5 拆分后本类只保留装配与编排：
-    - 装配：4 内置 + 配置驱动的自定义监视器、AgentLinkReducer（纯状态机）、
-      AgentLinkPresentation（气泡/音效/动画调度），并完成信号接线；
+    - 装配：4 内置 + 配置驱动的自定义监视器、StuckDetector / BehaviorPatternDetector /
+      ExplorationWatchdog，并完成信号接线；
     - 监视器生命周期：pause / resume / shutdown / apply_config；
     - set_enabled 安装/卸载编排（授权弹窗、后台安装、hooks 注入/移除）；
-    - 对既有调用面（PetWindow / AppShell / ProactiveScreenWatcher / 测试）的
-      薄转发。状态机与呈现逻辑分别位于 agent_link_reducer / agent_link_presentation。
+    - 对既有调用面（PetWindow / AppShell / ProactiveScreenWatcher / 测试）的薄转发。
+    去抖/节流/完成确认与气泡/音效/动画调度都在本类内实现。
     挂载于 PetWindow，持有 4 个 Agent 的监视器，并根据状态驱动桌宠动作与气泡。
     """
 
@@ -2229,7 +2366,6 @@ class AgentLinkManager(QObject):
         # 过程汇报气泡与 tool 信号同轮触发，用它把 target 等字段显式送进气泡，
         # 不再依赖「恰好是最后一条记录」的隐式上下文。
         self._last_tool_records: dict[str, dict[str, Any]] = {}
-        self._event_runtime = AgentEventRuntime()
         self._model_access_tracker = ModelAccessTracker()
         # 待处理阻塞型交互：interaction_id → {"agent_key", "kind": "approval"|"question",
         # "text": str, "tool"?: str, "questions"?: list, "rpc_id"?, "approval_id"?,
@@ -2292,11 +2428,9 @@ class AgentLinkManager(QObject):
         self._session_meta_cache: dict[str, dict] = {}
         self._exploration_alerts: dict[str, str] = {}
         self._exploration_names: dict[str, str] = {}
-        self._exploration_lifecycle_epoch: dict[str, int] = {}
 
         for mon in self.monitors.values():
             mon.raw_record.connect(self._remember_dialogue_record)
-            mon.normalized_event.connect(self._event_runtime.dispatch)
             mon.normalized_event.connect(self._on_normalized_event)
             mon.state_event.connect(self._on_agent_state_event)
             mon.activity_event.connect(self._on_agent_activity_event)
@@ -2391,10 +2525,10 @@ class AgentLinkManager(QObject):
             elif not should_run and monitor._running:
                 monitor.stop()
         # 卡住检测：开关 + 阈值/窗口/冷却参数同步（DSH 联动开启才有效）
-        self._stuck_detector.set_enabled(bool(agent_cfg.get("stuck_detect", False)))
+        self._stuck_detector.set_enabled(bool(agent_cfg.get("stuck_detect", True)))
         self._stuck_detector.get_config_overrides(agent_cfg if isinstance(agent_cfg, dict) else {})
         # 行为模式检测：开关 + 双窗口/step/冷却参数同步
-        self._behavior_detector.set_enabled(bool(agent_cfg.get("pattern_detect", False)))
+        self._behavior_detector.set_enabled(bool(agent_cfg.get("pattern_detect", True)))
         self._behavior_detector.get_config_overrides(agent_cfg if isinstance(agent_cfg, dict) else {})
         self._exploration_watchdog.configure(agent_cfg if isinstance(agent_cfg, dict) else {})
 
@@ -2562,6 +2696,10 @@ class AgentLinkManager(QObject):
             mon.pause()
         self._stuck_detector.pause()
         self._behavior_detector.pause()
+        # 探索看门狗随隐藏暂停：隐藏期继续跑只会让提醒在显示层被丢弃
+        # （_poll_long_think 发射前置位已上报标志），永久丢失；暂停后恢复时
+        # 计时锚点整体后移，隐藏时长不计入任何时长判定（产品决策：方案A）。
+        self._exploration_watchdog.pause()
         if hasattr(self.win, "clear_pending_link_anim"):
             self.win.clear_pending_link_anim()
         for key in list(self._done_pending):
@@ -2574,6 +2712,7 @@ class AgentLinkManager(QObject):
             mon.resume()
         self._stuck_detector.resume()
         self._behavior_detector.resume()
+        self._exploration_watchdog.resume()
 
     def shutdown(self) -> None:
         """窗口销毁/角色切换时停止所有 monitor worker，且作废安装回调。"""
@@ -3092,6 +3231,10 @@ class AgentLinkManager(QObject):
             rpc_id=payload.get("rpcId"),
             approval_id=payload.get("approvalId"),
             request_id=payload.get("requestId"),
+            # callId 是审批收尾的精确身份：登记端必须存下，_on_approval_resolved
+            # 的 callId 分支才能配对关闭。当前桥接版本的审批帧实际不带 callId
+            # （此分支面向旧版/自定义桥的防御路径，常态走 rpcId/approvalId 关闭）。
+            call_id=payload.get("callId"),
             session_id=session_id,
         )
 
@@ -3108,15 +3251,25 @@ class AgentLinkManager(QObject):
         return text
 
     def _on_cordis_request(self, agent_key: str, payload: dict) -> None:
-        payload = payload if isinstance(payload, dict) else {}
+        record = payload if isinstance(payload, dict) else {}
+        # 字段来源以桥接写盘形状为准：原始 cordis request 整体在 payload 下，
+        # 顶层只有 requestId/agentId/sessionId 等身份字段；旧版/手写桩把字段
+        # 平铺在顶层。两处都取，payload 内的非 None 字段优先。
+        nested = record.get("payload")
+        fields = dict(record)
+        if isinstance(nested, dict):
+            for key, value in nested.items():
+                if value is not None:
+                    fields[key] = value
         # 可关联身份门禁：cordis 交互靠 requestId 与 request-run-resolved 配对关闭。
         # 无 requestId 的记录无法关闭，直接忽略（requiresApproval 严格布尔检查在 _poll）。
-        if not payload.get("requestId"):
-            log.debug("cordis/request-run 缺 requestId，忽略（不弹窗）: %s", str(payload)[:200])
+        request_id = fields.get("requestId")
+        if not request_id:
+            log.debug("cordis/request-run 缺 requestId，忽略（不弹窗）: %s", str(record)[:200])
             return
-        name = str(payload.get("name") or "Cordis 插件")
-        purpose = str(payload.get("purpose") or "需要你的确认")
-        self._register_interaction(agent_key, kind="cordis", text=f"{name} 请求运行：{purpose}", interactive=False, request_id=payload.get("requestId"), session_id=payload.get("agentId") or payload.get("sessionId"))
+        name = str(fields.get("name") or "Cordis 插件")
+        purpose = str(fields.get("purpose") or "需要你的确认")
+        self._register_interaction(agent_key, kind="cordis", text=f"{name} 请求运行：{purpose}", interactive=False, request_id=request_id, session_id=fields.get("agentId") or fields.get("sessionId"))
 
     def _on_cordis_resolved(self, agent_key: str, payload: dict) -> None:
         payload = payload if isinstance(payload, dict) else {}
@@ -3246,11 +3399,21 @@ class AgentLinkManager(QObject):
             for iid, item in self._pending_interactions.items():
                 if (item.get("agent_key") == agent_key and item.get("kind") == kind
                         and not item.get("rpc_id")):
-                    self._pending_interactions[iid] = {
-                        "kind": kind, "text": text,
+                    # 重建保留 item 旧值，仅用新记录的非 None 字段覆盖：
+                    # 桥接双通道下交互版（mux 帧）可能不带 callId，而 callId 是
+                    # mux 断线时兜底 question/resolved 的唯一配对身份——若被
+                    # None 覆盖，升级后的气泡就再也关不掉。
+                    merged = {
+                        **item, "kind": kind, "text": text, "agent_key": agent_key,
                         "alert_id": item.get("alert_id", ""),
-                        "agent_key": agent_key, **extra,
                     }
+                    for key, value in extra.items():
+                        # None 与空串都不覆盖旧身份：桥接可能写出 callId=""
+                        #（String(...) || "" 兜底），覆盖掉旧 callId 会让
+                        # mux 断线时的兜底关闭失配。
+                        if value is not None and value != "":
+                            merged[key] = value
+                    self._pending_interactions[iid] = merged
                     self._saw_alert.add(agent_key)
                     self._show_interaction_bubble(iid)
                     return iid
@@ -3285,11 +3448,11 @@ class AgentLinkManager(QObject):
         if call_id:
             call_id = str(call_id)
             for iid, item in self._pending_interactions.items():
-                if (item.get("kind") == "question"
+                if (item.get("kind") == "approval"
                         and str(item.get("call_id") or "") == call_id):
                     self._resolve_interaction(iid)
                     return
-            return  # 带 callId 但未匹配：陈旧已解决帧，不动其他问题
+            return  # 带 callId 但未匹配：陈旧已解决帧，不动其他审批
         rpc_id = payload.get("rpcId")
         approval_id = payload.get("approvalId")
         if rpc_id:
@@ -3753,7 +3916,10 @@ class AgentLinkManager(QObject):
         - 同 scope 窗口内已弹过同档或更高档提醒：本次抑制（避免连环换弹）；
         - 真正更高档（level 更大）的升级放行并刷新记录，让"情况恶化"的更强提醒
           能覆盖低档提醒；
-        - 不同 scope（不同 agent/session）互不影响；
+        - scope 由调用方给出（stuck / pattern / watchdog 都用 agent 键，故同一
+          Agent 的各检测器共用一个槽位）；不同 scope 互不影响；
+        - 本 gate 只做「记账」判定，调用方必须先过事件汇报概率门：被概率门抽稀
+          丢弃的提醒没有展示，不得占用 30s 节流槽；
         - 设置窗口打开期间 show_alert 会直接丢弃普通提醒（N2-a）：此时不记账也
           不放行，避免被丢掉的提醒白占节流槽。
         """
@@ -3788,11 +3954,6 @@ class AgentLinkManager(QObject):
             self.win.request_link_anim(anim)
         if severity < 2:
             return  # 档位 1：只播动画，不弹气泡
-        # N2 跨检测器节流：档位 2 属控制级（level=2），比普通 watchdog 提醒高、
-        # 可覆盖低档；但同 scope 已弹过同档提醒（pattern control / 上一次档位 2）
-        # 时由 gate 抑制，避免连环换弹。
-        if not self._detector_alert_gate(agent_key, level=2):
-            return
         # 档位 2：持续提醒（可自定义文案；{name} 占位 = Agent 显示名）
         from .stuck_detector import stuck_reminder_text
         name = self.AGENT_NAMES.get(agent_key, agent_key)
@@ -3800,7 +3961,14 @@ class AgentLinkManager(QObject):
         custom = str((agent_cfg.get("stuck_reminder_text") or "") if isinstance(agent_cfg, dict) else "")
         text = stuck_reminder_text(name, custom)
         # 事件汇报概率门（检测类）：档位 1 的动画不受影响，只有气泡受门控制。
+        # 概率门判定必须在 N2 节流记账之前：被抽稀丢弃的提醒并没有展示，不该
+        # 占用 30s 节流槽，否则同 scope 的下一条提醒会被误压（F14）。
         if not self._report_allowed(agent_cfg, "stuck.reminder"):
+            return
+        # N2 跨检测器节流：档位 2 属控制级（level=2），比普通 watchdog 提醒高、
+        # 可覆盖低档；但同 scope 已弹过同档提醒（pattern control / 上一次档位 2）
+        # 时由 gate 抑制，避免连环换弹。
+        if not self._detector_alert_gate(agent_key, level=2):
             return
         if hasattr(self.win, "show_alert"):
             self.win.show_alert(self._dialogue("stuck.reminder", text, name=name), duration_ms=self._STUCK_REMINDER_MS, sticky=False)
@@ -3831,7 +3999,7 @@ class AgentLinkManager(QObject):
 
     def _on_pattern_control(self, agent_key: str, payload: dict) -> None:
         """行为模式控制（🛑）：播焦急动画 + 弹气泡。
-        payload 中的 verdict 来自可选 Judge，默认 REPLAN（只提醒，不打断 Agent）。"""
+        payload 的 verdict 恒为 REPLAN（可选 Judge 机制已移除），只提醒、不打断 Agent。"""
         if not hasattr(self.win, "isVisible") or not self.win.isVisible():
             return
         payload = payload if isinstance(payload, dict) else {}
@@ -3863,13 +4031,14 @@ class AgentLinkManager(QObject):
             )
         key = "pattern.control" if verdict in ("STOP", "ASK_USER", "REPLAN") else "pattern.warning"
         text = self._dialogue(key, text, name=name, reasons=reason)
+        agent_cfg = self.cfg.get("agent_link", {})
+        # 事件汇报概率门（检测类）：动画照旧，只有气泡受门控制。判定先于 N2
+        # 节流记账——被抽稀丢弃的提醒没有展示，不该占 30s 节流槽（F14）。
+        if not self._report_allowed(agent_cfg, key):
+            return
         # N2 跨检测器节流：pattern control 属控制级（level=2），可覆盖普通
         # watchdog 提醒；同档重复则被 gate 抑制。
         if not self._detector_alert_gate(agent_key, level=2):
-            return
-        agent_cfg = self.cfg.get("agent_link", {})
-        # 事件汇报概率门（检测类）：动画照旧，只有气泡受门控制。
-        if not self._report_allowed(agent_cfg, key):
             return
         if hasattr(self.win, "show_alert"):
             self.win.show_alert(text, duration_ms=self._PATTERN_REMINDER_MS, sticky=False)
@@ -3899,10 +4068,16 @@ class AgentLinkManager(QObject):
             return
         payload = payload if isinstance(payload, dict) else {}
         is_control = str(payload.get("level") or "warning").strip().lower() == "control"
+        agent_cfg = self.cfg.get("agent_link", {})
+        # 事件汇报概率门（检测类）：循环检测 warning 按门抽稀；control 级是常驻
+        # 可操作气泡，不经过概率门。判定先于 N2 节流记账——被抽稀丢弃的提醒
+        # 没有展示，不该占 30s 节流槽（F14）。
+        if not is_control and not self._report_allowed(agent_cfg, "watchdog.warning"):
+            return
         # N2 跨检测器节流：warning 是非升级普通提醒（level=1）；control 属控制级
         # （level=2），可覆盖 30s 窗口内的普通提醒，同档重复仍被抑制（防连环换弹）。
-        # scope 归一到 agent_key：payload 携带 state 记录的 agent_key，
-        # 缺失时用 session_key 前缀近似（dsh 联动同一会话即同一 agent）。
+        # scope 是 agent 键：stuck/pattern 用同一把键，故同一 Agent 的各检测器
+        # 共用一个槽位；payload 缺 agent_key 时按 session 兜底隔离。
         scope_key = str(payload.get("agent_key") or "") or f"session:{session_key}"
         if not self._detector_alert_gate(scope_key, level=2 if is_control else 1):
             return
@@ -3915,10 +4090,6 @@ class AgentLinkManager(QObject):
             "watchdog.warning", f"{name} 近期存在重复探索行为：{reasons}，暂不打断运行。",
             name=name, reasons=reasons,
         )
-        agent_cfg = self.cfg.get("agent_link", {})
-        # 事件汇报概率门（检测类）：循环检测提醒按门抽稀。
-        if not self._report_allowed(agent_cfg, "watchdog.warning"):
-            return
         if hasattr(self.win, "show_alert"):
             self._show_alert_compat(text, duration_ms=self._EXPLORATION_REMINDER_MS,
                                 sticky=False, alert_id=f"exploration-warning:{session_key}",
@@ -4051,6 +4222,12 @@ class AgentLinkManager(QObject):
     def _on_exploration_control_result(self, session_key: str, operation: str,
                                        ok: bool, detail: str) -> None:
         """后台线程信号回主线程：把控制成功/失败结果弹成气泡。"""
+        if ok:
+            # 用户已经让目标会话换方向/停下：给探索看门狗记一段宽限（宽限期内两个
+            # 阈值各 +1，并跳过对旧历史的立即复评）。否则控制回执刚落，同一段
+            # 重复探索历史会立刻再触发一次 control 级告警，用户刚点的按钮看起来
+            # 完全没生效。失败回执不给宽限——问题没解决就该继续提醒。
+            self._exploration_watchdog.grant_grace(session_key)
         self._show_exploration_control_result(session_key, operation, ok, detail)
 
     def _show_exploration_control_result(self, session_key: str, operation: str,
@@ -4131,7 +4308,6 @@ class AgentLinkManager(QObject):
             if event == "AgentStatus" and session == agent_key:
                 sessions.update(self._exploration_alerts)
             for key in sessions:
-                self._exploration_lifecycle_epoch[key] = self._exploration_lifecycle_epoch.get(key, 0) + 1
                 self._dismiss_exploration(key)
 
     # 阻塞交互兜底清理（approval / question / cordis 共用）。
@@ -4326,6 +4502,11 @@ class AgentLinkManager(QObject):
         """清理全部模型访问失败提醒、计数和定时器。"""
         session_keys = set(self._model_access_cache) | set(self._model_access_timers)
         self._model_access_cache.clear()
+        # tracker 内部按 (source, sessionId) 留存的连续 streak 也要清：只清外部
+        # 镜像的话，重新开启联动后同一会话的新失败会接着旧计数，提醒里出现
+        # 「已连续 N 次」虚高。全量 clear 比按镜像键逐个 reset 更稳——镜像键
+        # 未必覆盖 tracker 的全部键。
+        self._model_access_tracker.clear()
         self._model_access_retry_counts.clear()
         for session_key in list(self._model_access_timers):
             self._cancel_model_access_timer(session_key)

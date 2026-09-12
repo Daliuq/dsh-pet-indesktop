@@ -13,7 +13,6 @@ import logging
 import re
 import threading
 import time
-import uuid
 from collections import Counter, OrderedDict
 from enum import Enum
 
@@ -34,15 +33,6 @@ class WatchdogClass(str, Enum):
     RUN = "RUN"
     TEST = "TEST"
     OTHER = "OTHER"
-
-
-class WatchdogMacro(str, Enum):
-    EXPLORATION = "EXPLORATION"
-    ACTION = "ACTION"
-    OTHER = "OTHER"
-
-
-
 
 
 _EXPLORATION = frozenset({
@@ -168,14 +158,6 @@ def classify_event(record: dict) -> WatchdogClass:
     return WatchdogClass.OTHER
 
 
-def macro_of(cls: WatchdogClass) -> WatchdogMacro:
-    if cls in _EXPLORATION:
-        return WatchdogMacro.EXPLORATION
-    if cls in _ACTION:
-        return WatchdogMacro.ACTION
-    return WatchdogMacro.OTHER
-
-
 def make_fingerprint(record: dict, cls: WatchdogClass, target: str) -> str:
     tool = _text(record.get("tool") or record.get("toolName") or record.get("name")).lower()
     args_key = _text(record.get("argsKey") or record.get("fingerprint") or _args_obj(record), 180)
@@ -233,7 +215,6 @@ class _Step:
 
 class ExplorationWatchdog(QObject):
     warning = Signal(str, object)
-    resolved = Signal(str)
 
     def __init__(self, parent=None, *, goal_provider=None, cooldown_steps=3):
         super().__init__(parent)
@@ -246,7 +227,10 @@ class ExplorationWatchdog(QObject):
         self.long_run_seconds = 10 * 60
         self.long_think_seconds = 120
         self._states = {}
+        self._anchor_memory: dict[str, tuple[float, float]] = {}
         self._lock = threading.RLock()
+        self._paused = False
+        self._paused_at = 0.0
         self._think_timer = QTimer(self)
         self._think_timer.setInterval(1000)
         self._think_timer.timeout.connect(self._poll_long_think)
@@ -254,6 +238,73 @@ class ExplorationWatchdog(QObject):
 
     def close(self):
         self._think_timer.stop()
+
+    def _new_state(self, session: str, agent_key: str, record: dict, now: float) -> dict:
+        """创建会话状态；reset 重建时（锚点记忆命中）沿用旧的计时锚点。
+
+        方案A1（任务级语义）：turn/idle 等边界重建状态不刷新 started_at/
+        grace_until，否则 30 秒一轮的 workload 下启动宽限永久生效、长运行
+        降阈值永不触发（设置页文案是任务级承诺）。重复行为窗口（steps）
+        照常从空开始——那是另一回事。
+        所有创建状态的路径（user/message 目标提取、分类事件）都必须走这里，
+        绕过本方法直接 setdefault 会重新引入锚点被刷新的缺陷。
+        """
+        anchors = self._anchor_memory.get(session)
+        return {"steps": OrderedDict(), "current": None,
+                "last_inspected_seq": 0, "seq": 0, "goal": "",
+                "started_at": anchors[0] if anchors else now,
+                "grace_until": anchors[1] if anchors else now + self.early_grace_seconds,
+                "agent_name": _text(record.get("agentName") or record.get("agent") or agent_key),
+                "agent_key": agent_key}
+
+    def pause(self) -> None:
+        """桌宠隐藏时暂停（产品决策：方案A）——停 1s 轮询并冻结全部计时锚点。
+
+        不采用「照常检测、显示层丢弃」：_poll_long_think 发射前置位
+        long_think_reported，显示层（_on_exploration_warning）在窗口不可见时
+        直接 return，提醒会永久丢失。暂停期间喂入的记录一并忽略。
+        """
+        with self._lock:
+            if self._paused:
+                return
+            self._paused = True
+            self._paused_at = time.monotonic()
+            self._think_timer.stop()
+
+    def resume(self) -> None:
+        """恢复显示：隐藏时长不计入任何时长判定——计时锚点整体后移暂停时长。
+
+        可见期已积累的时长保留（提醒推迟到恢复后补发，而不是丢失）。
+        """
+        with self._lock:
+            if not self._paused:
+                return
+            shift = time.monotonic() - self._paused_at
+            self._paused = False
+            self._paused_at = 0.0
+            for state in self._states.values():
+                state["started_at"] = state.get("started_at", 0.0) + shift
+                if state.get("grace_until") is not None:
+                    state["grace_until"] = state["grace_until"] + shift
+                steps = list(state["steps"].values())
+                if state.get("current") is not None:
+                    steps.append(state["current"])
+                for step in steps:
+                    if getattr(step, "think_started_at", None) is not None:
+                        step.think_started_at += shift
+            # 锚点记忆同样后移：否则隐藏时长会被后续重建的状态计入。
+            for session, anchors in list(self._anchor_memory.items()):
+                self._anchor_memory[session] = (anchors[0] + shift, anchors[1] + shift)
+            # 暂停期丢弃了 step/end 等收尾记录：隐藏期间可能已经结束的 Think
+            # 仍挂着 think_active。保守解除武装——只有恢复后真实继续的 Think
+            # （下一条 reasoning 记录重新武装）才允许触发长思考告警，避免对
+            # 已结束的思考补发过期提醒。
+            for state in self._states.values():
+                current = state.get("current")
+                if current is not None and current.think_active:
+                    current.think_active = False
+                    current.think_started_at = None
+            self._think_timer.start()
 
     def configure(self, config: dict):
         config = config if isinstance(config, dict) else {}
@@ -279,11 +330,22 @@ class ExplorationWatchdog(QObject):
 
     def reset(self, session_key: str):
         with self._lock:
-            self._states.pop(session_key, None)
-        self.resolved.emit(session_key)
+            old = self._states.pop(session_key, None)
+            if old is not None:
+                # 方案A1（任务级语义）：turn/idle 等边界重建状态时沿用旧的
+                # started_at/grace_until，否则 30 秒一轮的 workload 下启动宽限
+                # 永久生效、长运行降阈值永不触发（设置页文案是任务级承诺）。
+                self._anchor_memory[session_key] = (
+                    float(old.get("started_at") or 0.0),
+                    float(old.get("grace_until") or 0.0),
+                )
+                while len(self._anchor_memory) > 64:
+                    self._anchor_memory.popitem(last=False)
 
     def feed_record(self, agent_key: str, record: dict):
         if not self.enabled or not isinstance(record, dict):
+            return
+        if self._paused:
             return
         event = _text(record.get("event"))
         session = _text(record.get("sessionId") or record.get("session_id") or agent_key) or agent_key
@@ -314,11 +376,7 @@ class ExplorationWatchdog(QObject):
             goal = _text(record.get("text") or record.get("content") or record.get("summary"), 1200)
             now = time.monotonic()
             with self._lock:
-                state = self._states.setdefault(session, {"steps": OrderedDict(), "current": None,
-                    "last_inspected_seq": 0, "seq": 0, "last_level": "", "goal": "",
-                    "started_at": now, "grace_until": now + self.early_grace_seconds,
-                    "agent_name": _text(record.get("agentName") or record.get("agent") or agent_key),
-                    "agent_key": agent_key})
+                state = self._states.setdefault(session, self._new_state(session, agent_key, record, now))
                 if goal:
                     state["goal"] = goal
             return
@@ -330,11 +388,7 @@ class ExplorationWatchdog(QObject):
         fp = make_fingerprint(record, cls, target)
         with self._lock:
             now = time.monotonic()
-            state = self._states.setdefault(session, {"steps": OrderedDict(), "current": None,
-                "last_inspected_seq": 0, "seq": 0, "last_level": "", "goal": "",
-                "started_at": now, "grace_until": now + self.early_grace_seconds,
-                "agent_name": _text(record.get("agentName") or record.get("agent") or agent_key),
-                "agent_key": agent_key})
+            state = self._states.setdefault(session, self._new_state(session, agent_key, record, now))
             current = state["current"]
             if current is None or current.step != step:
                 if current is not None:
@@ -389,6 +443,8 @@ class ExplorationWatchdog(QObject):
 
     def _poll_long_think(self):
         """Detect a still-running Think without waiting for a Think-end event."""
+        if self._paused:
+            return
         pending = []
         now = time.monotonic()
         with self._lock:
@@ -585,7 +641,6 @@ class ExplorationWatchdog(QObject):
         level = "control" if score >= control_threshold else "warning"
         state["last_inspected_seq"] = current_seq
         payload = {"type": "pet/exploration-watchdog", "level": level, "risk": score,
-                   "generation_id": uuid.uuid4().hex,
                    "reasons": reasons, "steps": [s.payload() for s in w10],
                    "riskScore": score,
                    "targetCount": len({t for s in w10 for t in s.exploration_targets}),

@@ -24,11 +24,12 @@
 - 加载：`pet/persona_phrases.py`
   - `load_builtin_presets()`：模块导入（启动）时读盘全部内置预设 →
     模块级注册表 `_presets`。
-  - `reload_builtin_presets()`：「重设/恢复内置」入口，重新读盘；已持有的
+  - `reload_builtin_presets()`：重新读盘入口（数据契约由测试锁定；当前无生产
+    调用方，待设置页提供「重设/恢复内置」后再接线）；已持有的
     `PhrasePicker` 无需重建（渲染每次实时读注册表）。
   - `builtin_phrases(mode)`：取某模式当前预设（未知/未加载 → 空 → 调用方 fallback）。
-  - 触发点：模块导入即加载；`pet/window.py` `_set_dialogue_mode()` 切换内置
-    风格时重载（文件改动即时生效）。
+  - 触发点：模块导入即加载（设置页 `pet/exploration_watchdog_settings.py` 等
+    界面改版后，运行时「切换内置风格重载」入口已随孤儿方法移除）。
 - 渲染：`PhrasePicker.get(mode, key, fallback, autohide=None, **values)`
   —— 命中预设即取变体渲染（轮换避免同 key 连续重复）；缺失/未知模式原样回退。
 - 事件词表 `phrase_keys()` = 内置预设键并集；`default_phrases()` = 每个 key

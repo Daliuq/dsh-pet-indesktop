@@ -930,30 +930,7 @@ class TestModernSettingsProactivePage:
 # 12. DSH profile 枚举（桥接插件安装/卸载目标）
 # ============================================================================
 class TestDshProfileEnumeration:
-    """_list_profiles 只认含 cordis.yml 的目录，过滤 node_modules 等杂项残留。"""
-
-    def test_filters_non_profile_dirs(self, tmp_path, monkeypatch):
-        dsh_home = tmp_path / "dsh-home"
-        monkeypatch.setattr(agent_link, "DSH_PROFILE_HOME", dsh_home)
-        profiles = dsh_home / "profiles"
-        for name in ("web", "headless"):
-            d = profiles / name
-            d.mkdir(parents=True)
-            (d / "cordis.yml").write_text("{}", encoding="utf-8")
-        # 包管理器/误操作残留的杂项目录，不应被当作 profile
-        (profiles / "node_modules").mkdir()
-        (profiles / "empty-dir").mkdir()
-        assert DshMonitor._list_profiles() == ["headless", "web"]
-
-    def test_fallback_when_profiles_dir_missing(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(agent_link, "DSH_PROFILE_HOME", tmp_path / "dsh-home")
-        assert DshMonitor._list_profiles() == ["web"]
-
-    def test_fallback_when_no_valid_profiles(self, tmp_path, monkeypatch):
-        dsh_home = tmp_path / "dsh-home"
-        monkeypatch.setattr(agent_link, "DSH_PROFILE_HOME", dsh_home)
-        (dsh_home / "profiles" / "node_modules").mkdir(parents=True)
-        assert DshMonitor._list_profiles() == ["web"]
+    """_real_profiles 只认含 package.json 的目录，过滤 node_modules 等杂项残留。"""
 
     def test_real_profiles_filters_node_modules_and_empty_dirs(self, tmp_path, monkeypatch):
         # issue #23：~/.dsh/profiles 下可能有 pnpm 产生的 node_modules 等杂项目录，
@@ -1456,6 +1433,113 @@ class TestInstallErrorSummary:
         summary = DshMonitor._summarize_install_error(output)
         assert len(summary) <= 60
         assert summary.startswith("Error:")
+
+
+class TestUninstallBridgeWithoutPnpm:
+    """没有 pnpm 时关闭联动不能假成功：manifest 里的 link: 残留会指向被删目录。
+
+    2026-09 dsh 事故同型——profile 的 package.json 还挂着 link:<即将删除的程序
+    目录>，dsh 启动时解析失败拖垮整个插件树。旧实现 _pnpm_command() is None
+    直接 return True，什么都不改。
+    """
+
+    def _profile(self, tmp_path, deps, bundles=None):
+        profile = tmp_path / "profiles" / "web"
+        profile.mkdir(parents=True)
+        data = {"dependencies": dict(deps)}
+        if bundles is not None:
+            data["dsh"] = {"profile": {"bundles": list(bundles)}}
+        (profile / "package.json").write_text(
+            json.dumps(data, ensure_ascii=False), encoding="utf-8"
+        )
+        return profile
+
+    def test_no_pnpm_removes_manifest_entries_with_backup(self, tmp_path, monkeypatch):
+        """无 pnpm：备份 → 删依赖条目 → 清 bundles → 删链接 → 返回 True。"""
+        plugin = tmp_path / "old-build" / "dsh-pet-bridge"
+        plugin.mkdir(parents=True)
+        profile = self._profile(
+            tmp_path,
+            deps={agent_link.DSH_PLUGIN_NAME: f"link:{plugin}", "keep-me": "^1.0.0"},
+            bundles=[agent_link.DSH_PLUGIN_NAME, "other-bundle"],
+        )
+        linked = profile / "node_modules" / "@dsh-pet" / "bridge"
+        linked.mkdir(parents=True)
+        monkeypatch.setattr(agent_link, "DSH_PROFILE_HOME", tmp_path)
+        monkeypatch.setattr(agent_link, "_pnpm_command", lambda: None)
+
+        assert DshMonitor.uninstall_bridge() is True
+
+        manifest = json.loads((profile / "package.json").read_text(encoding="utf-8"))
+        assert agent_link.DSH_PLUGIN_NAME not in manifest["dependencies"], \
+            "link: 残留必须删掉（否则指向即将删除的程序目录）"
+        assert manifest["dependencies"]["keep-me"] == "^1.0.0", "无关依赖不许动"
+        assert agent_link.DSH_PLUGIN_NAME not in manifest["dsh"]["profile"]["bundles"]
+        assert "other-bundle" in manifest["dsh"]["profile"]["bundles"]
+        assert list(profile.glob("package.json.bak-*")), "手改前必须备份"
+        assert not linked.exists(), "profile 内的插件链接应尽力清理"
+
+    def test_no_pnpm_profile_without_plugin_is_noop(self, tmp_path, monkeypatch):
+        """未安装的 profile 幂等成功，且不该产生备份。"""
+        profile = self._profile(tmp_path, deps={"keep-me": "^1.0.0"})
+        monkeypatch.setattr(agent_link, "DSH_PROFILE_HOME", tmp_path)
+        monkeypatch.setattr(agent_link, "_pnpm_command", lambda: None)
+
+        assert DshMonitor.uninstall_bridge() is True
+        assert not list(profile.glob("package.json.bak-*"))
+
+    def test_backups_pruned_to_recent_five(self, tmp_path, monkeypatch):
+        """manifest 备份只保留最近 5 份：卸载/修复都会持续产 bak，需有清理。"""
+        profile = self._profile(
+            tmp_path,
+            deps={agent_link.DSH_PLUGIN_NAME: "link:W:/gone/bridge"},
+            bundles=[agent_link.DSH_PLUGIN_NAME],
+        )
+        fakes = {profile / f"package.json.bak-2026090{i}-12000{i}" for i in range(7)}
+        for fake in fakes:
+            fake.write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(agent_link, "DSH_PROFILE_HOME", tmp_path)
+        monkeypatch.setattr(agent_link, "_pnpm_command", lambda: None)
+
+        assert DshMonitor.uninstall_bridge() is True
+
+        backups = sorted(profile.glob("package.json.bak-*"))
+        assert len(backups) == 5, f"备份应清理到最近 5 份，现有 {len(backups)}"
+        kept = {b.name for b in backups}
+        fake_names = {fake.name for fake in fakes}
+        assert kept & fake_names, "应保留 7 份旧备份中最新的 4 份"
+        assert len(kept - fake_names) == 1, "本次卸载新建的备份必须在其中"
+        assert not any(n < "package.json.bak-20260903" for n in kept), "最旧的 3 份必须被清掉"
+
+    def test_with_pnpm_still_uses_pnpm_remove(self, tmp_path, monkeypatch):
+        """有 pnpm 时保持现状：走 pnpm remove，再清 bundles，不做 JSON 手改备份。"""
+        plugin = tmp_path / "current-build" / "dsh-pet-bridge"
+        plugin.mkdir(parents=True)
+        profile = self._profile(
+            tmp_path,
+            deps={agent_link.DSH_PLUGIN_NAME: f"link:{plugin}"},
+            bundles=[agent_link.DSH_PLUGIN_NAME],
+        )
+        monkeypatch.setattr(agent_link, "DSH_PROFILE_HOME", tmp_path)
+        monkeypatch.setattr(agent_link, "_pnpm_command", lambda: ["pnpm"])
+        calls = []
+
+        def fake_run(profile_dir, *args):
+            calls.append(args)
+            data = json.loads((profile_dir / "package.json").read_text(encoding="utf-8"))
+            data["dependencies"].pop(agent_link.DSH_PLUGIN_NAME, None)
+            (profile_dir / "package.json").write_text(
+                json.dumps(data, ensure_ascii=False), encoding="utf-8"
+            )
+            return 0, ""
+
+        monkeypatch.setattr(agent_link, "_run_pnpm", fake_run)
+
+        assert DshMonitor.uninstall_bridge() is True
+        assert calls == [("remove", agent_link.DSH_PLUGIN_NAME)]
+        manifest = json.loads((profile / "package.json").read_text(encoding="utf-8"))
+        assert agent_link.DSH_PLUGIN_NAME not in manifest["dsh"]["profile"]["bundles"]
+        assert not list(profile.glob("package.json.bak-*")), "pnpm 路径不做手改备份"
 
 
 # ============================================================================
@@ -2319,6 +2403,42 @@ class TestApprovalStickyBubble:
         assert mgr._pending_interactions == {}
         assert mgr.win.hidden_calls == 0
 
+    def test_approval_resolved_call_id_does_not_close_question(self, tmp_path):
+        """审批 resolved 帧带 callId 时不得按 callId 关闭问题交互。
+
+        `_on_approval_resolved` 的 callId 分支是从问题侧复制粘贴来的错位判定：
+        approval 与 question 的 callId 是两个独立命名空间，若该分支按
+        kind == "question" 遍历，一条无关审批的收尾帧就会把同名 callId 的
+        问题气泡误关掉（用户还没回答，问题弹窗先消失）。
+        """
+        mgr = self._make_mgr(tmp_path)
+        mgr._on_question_request(
+            "dsh", {"questions": self.QUESTIONS, "callId": "call-shared"}
+        )
+
+        mgr._on_approval_resolved("dsh", {"callId": "call-shared"})
+
+        pending = mgr.pending_interactions_for("dsh")
+        assert len(pending) == 1, "审批 resolved 不得误关同名 callId 的问题气泡"
+        assert next(iter(pending.values()))["kind"] == "question"
+        assert mgr.win.hidden_calls == 0
+
+    def test_approval_resolved_call_id_closes_approval(self, tmp_path):
+        """审批 resolved 帧带 callId 时按 callId 关闭审批交互。
+
+        登记端必须存下审批的 callId 身份，否则改判 kind 后新分支也无从匹配。
+        """
+        mgr = self._make_mgr(tmp_path)
+        mgr._on_approval_request(
+            "dsh", {"tool": "bash", "callId": "call-ap", "sessionId": "s-1"}
+        )
+        assert mgr.pending_interactions_for("dsh") != {}
+
+        mgr._on_approval_resolved("dsh", {"callId": "call-ap"})
+
+        assert mgr.pending_interactions_for("dsh") == {}
+        assert mgr.win.hidden_calls == 1
+
     # ---- 用户问题（ask_user_question）与审批同待遇 ----
     QUESTIONS = [
         {"id": "q1", "question": "要执行哪个方案？",
@@ -2558,6 +2678,37 @@ class TestApprovalStickyBubble:
         item = next(iter(pending.values()))
         assert item["interactive"] is True
         assert mgr.win.shown_buttons[-1][1] == ["方案 A", "方案 B", "方案 C"]
+
+    def test_hint_upgrade_keeps_call_id(self, tmp_path):
+        """升级重建保留旧 callId：hint 带 callId → 交互版升级 → 兜底 resolved 仍能关闭。
+
+        桥接双通道的真实形状：tool/call 兜底记录带 callId，随后 mux 交互帧只带
+        rpcId（不带 callId）。升级重建若把 call_id 覆盖成 None，mux 断线时兜底
+        发出的 question/resolved(callId) 就再也匹配不上，气泡永久挂住。
+        """
+        mgr = self._make_mgr(tmp_path)
+        mgr._on_question_request("dsh", {"questions": self.QUESTIONS, "callId": "call-keep"})
+        mgr._on_question_request(
+            "dsh", {"questions": self.QUESTIONS, "rpcId": "rpc-keep", "sessionId": "s-1"}
+        )
+        pending = mgr.pending_interactions_for("dsh")
+        assert len(pending) == 1, "同一条问题只应有一条 pending"
+        item = next(iter(pending.values()))
+        assert item["interactive"] is True
+        assert item["rpc_id"] == "rpc-keep"
+        assert item["call_id"] == "call-keep", "升级重建不得丢掉旧 callId"
+        mgr._on_question_resolved("dsh", {"callId": "call-keep"})
+        assert mgr.pending_interactions_for("dsh") == {}, "兜底 callId 关闭必须仍然有效"
+
+    def test_upgrade_empty_string_does_not_clear_call_id(self, tmp_path):
+        """升级帧显式带空串 callId（桥接 String(...) || \"\" 兜底形状）不得清掉旧身份。"""
+        mgr = self._make_mgr(tmp_path)
+        mgr._on_question_request("dsh", {"questions": self.QUESTIONS, "callId": "call-keep"})
+        mgr._on_question_request(
+            "dsh", {"questions": self.QUESTIONS, "rpcId": "rpc-keep", "sessionId": "s-1", "callId": ""}
+        )
+        item = next(iter(mgr.pending_interactions_for("dsh").values()))
+        assert item["call_id"] == "call-keep", "空串 callId 不得覆盖旧身份"
 
     def test_interactive_not_downgraded_by_late_hint(self, tmp_path):
         """先到带 rpcId 的交互版，后到无 rpcId 的提示→不降级，仍保持可点选。
@@ -2865,17 +3016,36 @@ class TestInteractionIdentityGate:
         assert mgr.pending_interactions_for("dsh") == {}
 
     def test_cordis_requires_strict_true_and_request_id(self, tmp_path):
-        """monitor 层：cordis/request-run 只有 requiresApproval 严格布尔 True 且带 requestId 才触发。"""
+        """monitor 层：cordis/request-run 只有 requiresApproval 严格布尔 True 且带 requestId 才触发。
+
+        记录形状以桥接真实写盘为准（index.js 的 cordis/request-run 分支：
+        `writeRecord({event, agentId, sessionId, kind, payload: request, requestId})`
+        ——原始 request 整体嵌在 payload 下，requiresApproval 只在 payload 内，
+        顶层只有 requestId/agentId/sessionId 等身份字段）；旧版/手写桩把字段
+        平铺在顶层的形状仍须兼容。
+        """
         mon = self._make_mon(tmp_path)
         got = []
         mon.cordis_requested.connect(lambda a, p: got.append((a, p.get("requestId"))))
         self._write_events(mon, [
-            {"ts": 1, "agent": "dsh", "event": "cordis/request-run", "requiresApproval": True, "requestId": "r-ok"},
-            {"ts": 2, "agent": "dsh", "event": "cordis/request-run", "requiresApproval": False, "requestId": "r-no"},
-            {"ts": 3, "agent": "dsh", "event": "cordis/request-run", "requestId": "r-miss"},
-            {"ts": 4, "agent": "dsh", "event": "cordis/request-run", "requiresApproval": "true", "requestId": "r-str"},
+            {"ts": 1, "agent": "dsh", "event": "cordis/request-run", "requestId": "r-ok",
+             "payload": {"requiresApproval": True, "requestId": "r-ok", "name": "插件", "purpose": "运行"}},
+            {"ts": 2, "agent": "dsh", "event": "cordis/request-run", "requestId": "r-no",
+             "payload": {"requiresApproval": False, "requestId": "r-no"}},
+            {"ts": 3, "agent": "dsh", "event": "cordis/request-run", "requestId": "r-miss",
+             "payload": {"requestId": "r-miss"}},
+            {"ts": 4, "agent": "dsh", "event": "cordis/request-run", "requestId": "r-str",
+             "payload": {"requiresApproval": "true", "requestId": "r-str"}},
+            {"ts": 5, "agent": "dsh", "event": "cordis/request-run", "requestId": "r-legacy",
+             "requiresApproval": True},
+            # 嵌套与顶层同时存在时以嵌套为准：嵌套 False 不得被顶层残留 True 顶掉。
+            {"ts": 6, "agent": "dsh", "event": "cordis/request-run", "requestId": "r-nested-wins",
+             "requiresApproval": True,
+             "payload": {"requiresApproval": False, "requestId": "r-nested-wins"}},
         ])
-        assert got == [("dsh", "r-ok")], "仅严格布尔 True 且带 requestId 才触发 cordis 交互"
+        assert got == [("dsh", "r-ok"), ("dsh", "r-legacy")], \
+            "仅严格布尔 True 且带 requestId 才触发 cordis 交互（payload 内与顶层平铺两处都认，嵌套优先）"
+
 
     def test_cordis_without_request_id_ignored(self, tmp_path):
         """_on_cordis_request 无 requestId：不登记 pending 交互。"""
@@ -2893,6 +3063,26 @@ class TestInteractionIdentityGate:
         assert item["request_id"] == "req-1"
         mgr._on_cordis_resolved("dsh", {"requestId": "req-1"})
         assert mgr.pending_interactions_for("dsh") == {}
+
+    def test_cordis_request_reads_nested_payload_fields(self, tmp_path):
+        """_on_cordis_request 消费桥接写盘形状：名称/用途/会话从 payload 内取。
+
+        桥接顶层不带 name/purpose，只把原始 cordis request 放进 payload；只读
+        顶层会得到占位文案（"Cordis 插件 请求运行：需要你的确认"），用户看不出
+        是哪条请求。顶层平铺的旧版/手写桩形状仍须兼容（见上一用例）。
+        """
+        mgr = self._make_mgr(tmp_path)
+        mgr._on_cordis_request("dsh", {
+            "requestId": "req-2", "agentId": "sess-9",
+            "payload": {"requestId": "req-2", "name": "构建插件", "purpose": "执行打包脚本"},
+        })
+        pending = mgr.pending_interactions_for("dsh")
+        item = next(iter(pending.values()))
+        assert item["kind"] == "cordis"
+        assert item["request_id"] == "req-2"
+        assert item["session_id"] == "sess-9"
+        assert "构建插件" in item["text"]
+        assert "执行打包脚本" in item["text"]
 
     def test_turn_end_clears_stale_pending(self, tmp_path):
         """turn 结束兜底清理：DSH 漏发 resolved 时，会话结束不再留永久弹窗。"""
@@ -3111,6 +3301,79 @@ class TestModelAccessAlert:
                                          "retryExhausted": False, "retries": 0,
                                          "errorCode": ""})
         assert len(mgr.win.alerts) == 2, "提醒已收起后工具失败应正常提醒"
+
+
+class TestModelAccessStreakCleanup:
+    """F13：清理模型访问提醒时必须同步清空 tracker 内部 streak。
+
+    只清外部镜像（``_model_access_cache`` / ``_model_access_retry_counts``）会
+    让 tracker 里按 (source, session) 留存的连续计数残留；重新开启联动后同一
+    会话的新一轮失败直接接着旧计数，提醒里出现「已连续 N 次」虚高。
+    """
+
+    class _Win:
+        def __init__(self):
+            self.alerts = []
+            self.resolved = []
+
+        def isVisible(self):
+            return True
+
+        def show_alert(self, text, **_kwargs):
+            self.alerts.append(str(text))
+
+        def resolve_alert(self, alert_id):
+            self.resolved.append(str(alert_id))
+
+        def show_bubble(self, *_args, **_kwargs):
+            pass
+
+    def _make_mgr(self, tmp_path):
+        return AgentLinkManager(self._Win(), Config(base=tmp_path))
+
+    @staticmethod
+    def _retry():
+        from pet.agent_event_normalizer import normalize_event
+        return normalize_event({"event": "llm/retry", "agent": "dsh", "sessionId": "s-1",
+                                "errorCode": "RATE_LIMIT", "errorMessage": "429 too many requests"})
+
+    def _feed_and_next_streak(self, mgr):
+        """喂一条限流重试，返回 tracker 记账后的连续计数（经 consume 观察）。"""
+        out = mgr._model_access_tracker.consume(self._retry())
+        assert out is not None, "限流重试必须产出 streak"
+        return int(out["consecutiveRetryCount"])
+
+    def test_clear_resets_tracker_streak(self, tmp_path):
+        mgr = self._make_mgr(tmp_path)
+        mgr._on_normalized_event(self._retry())
+        mgr._on_normalized_event(self._retry())
+        assert self._feed_and_next_streak(mgr) == 3, "前置：tracker 已累计到 3"
+        mgr._clear_model_access_alerts()
+        assert self._feed_and_next_streak(mgr) == 1, "清理后 tracker streak 必须清零"
+
+    def test_disable_and_reenable_does_not_inherit_old_streak(self, tmp_path):
+        mgr = self._make_mgr(tmp_path)
+        mgr._on_normalized_event(self._retry())
+        mgr._on_normalized_event(self._retry())
+        # 关闭 DSH 联动：apply_config 走 _clear_model_access_alerts
+        cfg = dict(mgr.cfg.get("agent_link", {}))
+        cfg["dsh"] = False
+        mgr.cfg.set("agent_link", cfg)
+        mgr.apply_config()
+        # 重新开启后再来一次失败：计数必须从 1 开始（不继承旧 streak）
+        mgr._on_normalized_event(self._retry())
+        assert self._feed_and_next_streak(mgr) == 2, \
+            "重启用后不得继承旧 streak，否则提醒计数虚高"
+
+    def test_normalized_event_signal_reaches_consumer(self, tmp_path):
+        """守卫：normalized_event 信号必须直连 _on_normalized_event。
+
+        移除 AgentEventRuntime 分发层后这是该信号的唯一消费接线；其余用例
+        全部直调 handler，connect 丢失时它们照样全绿——信号级守卫不可省。
+        """
+        mgr = self._make_mgr(tmp_path)
+        mgr.monitors["dsh"].normalized_event.emit(self._retry())
+        assert self._feed_and_next_streak(mgr) == 2, "经信号发射的重试事件必须被消费记账"
 
 
 class TestSessionNameTruthfulness:
@@ -3396,7 +3659,7 @@ class TestDetectorAlertThrottle:
     """N2 跨检测器弹窗节流：stuck/pattern/watchdog 同 agent 30s 内只弹一次窗
     （动画照常），升级档位放行，不同 scope 互不影响。"""
 
-    def _make_mgr(self, tmp_path):
+    def _make_mgr(self, tmp_path, **gate_overrides):
         class FakeWin:
             def __init__(self):
                 self.alerts = []
@@ -3422,8 +3685,10 @@ class TestDetectorAlertThrottle:
         cfg = Config(base=tmp_path)
         # 本类取证 N2 跨检测器节流：stuck/pattern/watchdog 三条检测类概率门开 1.0，
         # 避免文件头 autouse 基线（全 0.0）把「没弹窗」冒充「被节流」。
+        gates = {"stuck": 1.0, "pattern": 1.0, "watchdog": 1.0}
+        gates.update(gate_overrides)
         ag = dict(cfg.get("agent_link", {}))
-        ag["report_gates"] = _agent_gates(stuck=1.0, pattern=1.0, watchdog=1.0)
+        ag["report_gates"] = _agent_gates(**gates)
         cfg.set("agent_link", ag)
         mgr = AgentLinkManager(FakeWin(), cfg)
         mgr._clock = lambda: mgr._throttle_now[0]
@@ -3505,6 +3770,46 @@ class TestDetectorAlertThrottle:
         mgr._on_exploration_warning("sess-1", {"agent_key": "dsh", "reasons": ["search"], "steps": []})
         assert len(mgr.win.alerts) == 1, "被丢弃的提醒不该占用节流槽"
 
+    def test_stuck_gate_rejected_alert_does_not_consume_throttle_slot(self, tmp_path):
+        """F14：概率门丢弃的提醒不该占 30s 节流槽（stuck 路径）。
+
+        先被概率门拒绝（未展示），随后一条放行的同 scope 提醒必须能正常弹；
+        旧实现先记节流槽再判概率门，第二次会被 30s 窗口误压。
+        """
+        mgr = self._make_mgr(tmp_path, stuck=0.5)
+        rolls = iter([0.99, 0.0])
+        mgr._rng = lambda: next(rolls)
+        mgr._on_stuck_intervention("dsh", {"severity": 2})
+        assert mgr.win.alerts == [], "概率门拒绝时不得弹窗"
+        mgr._throttle_now[0] += 5.0
+        mgr._on_stuck_intervention("dsh", {"severity": 2})
+        assert len(mgr.win.alerts) == 1, "被概率门丢弃的提醒不得占用节流槽"
+
+    def test_pattern_gate_rejected_alert_does_not_consume_throttle_slot(self, tmp_path):
+        """F14：pattern.control 同走 stuck 门，被门丢弃的提醒不得占节流槽。"""
+        mgr = self._make_mgr(tmp_path, stuck=0.5)
+        rolls = iter([0.99, 0.0])
+        mgr._rng = lambda: next(rolls)
+        payload = {"verdict": "REPLAN", "reason": "loop", "class": "search",
+                   "count": 8, "window": "10"}
+        mgr._on_pattern_control("dsh", payload)
+        assert mgr.win.alerts == [], "概率门拒绝时不得弹窗"
+        mgr._throttle_now[0] += 5.0
+        mgr._on_pattern_control("dsh", payload)
+        assert len(mgr.win.alerts) == 1, "被概率门丢弃的提醒不得占用节流槽"
+
+    def test_watchdog_gate_rejected_alert_does_not_consume_throttle_slot(self, tmp_path):
+        """F14：watchdog.warning 同走 stuck 门，被门丢弃的提醒不得占节流槽。"""
+        mgr = self._make_mgr(tmp_path, stuck=0.5)
+        rolls = iter([0.99, 0.0])
+        mgr._rng = lambda: next(rolls)
+        payload = {"agent_key": "dsh", "reasons": ["search"], "steps": []}
+        mgr._on_exploration_warning("sess-1", payload)
+        assert mgr.win.alerts == [], "概率门拒绝时不得弹窗"
+        mgr._throttle_now[0] += 5.0
+        mgr._on_exploration_warning("sess-1", payload)
+        assert len(mgr.win.alerts) == 1, "被概率门丢弃的提醒不得占用节流槽"
+
 
 # ============================================================================
 class TestUnknownBridgeEventReminder:
@@ -3581,6 +3886,35 @@ class TestUnknownBridgeEventReminder:
             f.write(json.dumps({"event": "command/done", "step": 1, "ts": 3}) + "\n")
             f.write(json.dumps({"event": "pet/control-clicked", "ts": 4}) + "\n")
             f.write(json.dumps({"event": "bridge/control-received", "ts": 5}) + "\n")
+            f.write(json.dumps({"event": "brand/sparkle", "ts": 6}) + "\n")  # 真未知仍要报
+        mon._poll()
+        assert [(k, d.get("event")) for k, d in unknown] == [("dsh", "brand/sparkle")]
+        mon.stop()
+
+    def test_watchdog_and_control_events_are_not_unknown(self, tmp_path):
+        """桥接/桌宠回显真实会写、语义层与状态机都没建模的事件不得判成「未知」。
+
+        漏登记后果与 user/message 同型：每次写盘触发一次「更新/重装 bridge」
+        误提醒（10 分钟冷却 → 表现为偶发弹窗）。来源：
+        - tool-workflow/run-end：桥接 STATE_EVENT_TYPES（与已登记的 run-start 成对）；
+        - web_search_begin / web_search_end / context_compacted：桥接
+          WATCHDOG_EVENT_TYPES 直写（供探索看门狗，非状态迁移）；
+        - pet/control-queued：桌宠控制队列写盘回显（pet/dsh_control.py）。
+        """
+        app = QApplication.instance() or QApplication([])
+        mon = BaseAgentMonitor("dsh", tmp_path)
+        unknown = []
+        mon.unknown_bridge_event.connect(lambda k, d: unknown.append((k, d)))
+        events_file = mon.events_file
+        events_file.parent.mkdir(parents=True, exist_ok=True)
+        events_file.touch()
+        mon._poll()  # 初始化 tailer（首轮不重放）
+        with open(events_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"event": "tool-workflow/run-end", "step": 1, "ts": 1}) + "\n")
+            f.write(json.dumps({"event": "web_search_begin", "ts": 2}) + "\n")
+            f.write(json.dumps({"event": "web_search_end", "ts": 3}) + "\n")
+            f.write(json.dumps({"event": "context_compacted", "ts": 4}) + "\n")
+            f.write(json.dumps({"event": "pet/control-queued", "ts": 5}) + "\n")
             f.write(json.dumps({"event": "brand/sparkle", "ts": 6}) + "\n")  # 真未知仍要报
         mon._poll()
         assert [(k, d.get("event")) for k, d in unknown] == [("dsh", "brand/sparkle")]

@@ -83,9 +83,6 @@ class ModelAccessTracker:
             return not ModelAccessTracker.is_model_access(event)
         return False
 
-    def count(self, source: str, session_id: str) -> int:
-        item = self._streaks.get((source, session_id))
-        return item.count if item else 0
-
-    def reset(self, source: str, session_id: str) -> None:
-        self._streaks.pop((source, session_id), None)
+    def clear(self) -> None:
+        """清空全部 streak（禁用联动/全局重置用，见 _clear_model_access_alerts）。"""
+        self._streaks.clear()

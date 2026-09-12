@@ -2,7 +2,8 @@
 """DSH 统一状态跟踪（第一版：状态联动 pipeline）。
 
 数据源：随桌宠内置的 DSH 桥接插件 ``integrations/dsh-pet-bridge`` 写入的
-``<数据基目录>/dsh-pet-bridge/dsh.jsonl``。桥接插件订阅 DSH 真实事件
+``<数据基目录>/dsh-pet-bridge/dsh-{pid}.jsonl``（多实例分区写入；消费端
+glob ``dsh*.jsonl``，兼容旧版单文件 ``dsh.jsonl``）。桥接插件订阅 DSH 真实事件
 （``agent/status``、``session/event`` 的 ``turn/start`` / ``turn/end`` /
 ``tool/call`` / ``approval/asked`` / ``approval/decided`` / ``llm/retry`` …，
 词汇见 DSH ``dsh-session/known-event-types``），以简单事件行追加写入。
@@ -84,11 +85,9 @@ _AGENT_STATUS_STATE = {
 # 桥接「简单事件」（DSH 原始 session/event 类型）→ 统一状态。
 # 事件名来自 DSH dsh-session/known-event-types.js 的真实词汇。
 _EVENT_TO_STATE = {
-    # 用户提交 / turn 开始 / 流式生成 → 思考
+    # 用户提交 / turn 开始 → 思考
     "user/message": DshState.THINKING,
     "turn/start": DshState.THINKING,
-    "assistant/chunk": DshState.THINKING,
-    "plan/mode": DshState.THINKING,
     # 工具 / 步骤 / 命令执行 → working
     "assistant/message": DshState.WORKING,
     "tool/call": DshState.WORKING,
@@ -109,7 +108,7 @@ _EVENT_TO_STATE = {
     # 完成 / 出错
     "turn/end": DshState.SUCCESS,
     "llm/retry": DshState.ERROR,
-    "llm/error": DshState.ERROR,  # API 级错误（llm_error：errorCode 为真实上游码如 bad_response_status_code）
+    "llm_error": DshState.ERROR,  # API 级错误（errorCode 为真实上游码如 bad_response_status_code）
 }
 
 
@@ -170,7 +169,6 @@ class DshStateTracker(QObject):
 
         # 统一状态（edge-trigger）。初始 None，使首个状态（offline/idle）也真正落日志
         self.current_state: Optional[DshState] = None
-        self.last_state: Optional[DshState] = None
 
         # 阻塞型交互锁存（审批 / 用户问题同待遇）：
         # 进入 waiting_approval / waiting_question 后忽略 working/thinking，
@@ -236,7 +234,6 @@ class DshStateTracker(QObject):
         if to_state is self.current_state:
             return
         from_state = self.current_state  # 切换前状态（即上一步的当前态）
-        self.last_state = from_state     # 记录上一状态
         self.current_state = to_state
 
         if from_state is None:

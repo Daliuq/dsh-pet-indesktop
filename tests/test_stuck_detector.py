@@ -78,17 +78,6 @@ def _make_detector(**kw) -> tuple[StuckDetector, _FakeClock]:
     return det, clock
 
 
-class _ReasonCollector:
-    """通过 score_changed 信号收集触发的卡住原因。"""
-
-    def __init__(self, det: StuckDetector) -> None:
-        self.reasons: set[str] = set()
-        det.score_changed.connect(self._on_score)
-
-    def _on_score(self, agent_key: str, score: int, reasons: list, is_peak: bool) -> None:
-        self.reasons.update(reasons)
-
-
 class TestStuckDetectorScoring:
     def test_consecutive_two_failures_scores_one(self):
         det, _ = _make_detector()
@@ -106,44 +95,40 @@ class TestStuckDetectorScoring:
 
     def test_repeated_timeouts_two_in_window(self):
         det, clock = _make_detector()
-        collector = _ReasonCollector(det)
         det.feed_record("dsh", _result("pip", False, error_text="timed out", timeout=True))
         clock.advance(5)
         det.feed_record("dsh", _result("curl", False, error_text="ETIMEDOUT", timeout=True))
-        assert StuckReason.REPEATED_TIMEOUTS in collector.reasons
-        assert det.get_score("dsh") >= 2
+        # 连续失败 +1、窗口内 2 次 timeout 再加 +1
+        assert det.get_score("dsh") == 2
 
     def test_same_goal_three_calls(self):
         det, _ = _make_detector()
-        collector = _ReasonCollector(det)
         det.feed_record("dsh", _call("bash", "argv0:pip,command"))
         det.feed_record("dsh", _call("bash", "argv0:pip,command"))
         det.feed_record("dsh", _call("bash", "argv0:pip,command"))
-        assert StuckReason.SAME_GOAL_LOOPING in collector.reasons
+        # 「同一目标连续 3 次工具调用」规则 +1
+        assert det.get_score("dsh") == 1
 
     def test_similar_error_text(self):
         det, _ = _make_detector()
-        collector = _ReasonCollector(det)
         det.feed_record("dsh", _result("a", False, error_text="Cannot connect to host 1.2.3.4: Connection refused"))
         det.feed_record("dsh", _result("b", False, error_text="Cannot connect to host 5.6.7.8: Connection refused"))
         det.feed_record("dsh", _result("c", False, error_text="Cannot connect to host 9.10.11.12: Connection refused"))
-        assert StuckReason.SIMILAR_ERROR_TEXT in collector.reasons
+        # 连续失败 +1、错误文本高度相似 +1
+        assert det.get_score("dsh") == 2
 
     def test_retry_language_text(self):
         det, _ = _make_detector()
-        collector = _ReasonCollector(det)
         det.feed_record("dsh", {"event": "assistant/message", "text": "连接还是失败，我换个思路再试一次"})
-        assert StuckReason.RETRY_LANGUAGE in collector.reasons
-        assert det.get_score("dsh") >= 1
+        # 模型文本出现重试措辞 +1
+        assert det.get_score("dsh") == 1
 
     def test_no_progress_same_root_cause(self):
         det, _ = _make_detector()
-        collector = _ReasonCollector(det)
         for _ in range(3):
             det.feed_record("dsh", _result("pip", False, error_code="ECONNREFUSED", error_text="connection refused"))
-        assert StuckReason.NO_PROGRESS_SAME_CAUSE in collector.reasons
-        # 相同根因连续 3 次 → +2
-        assert det.get_score("dsh") >= 2
+        # 连续失败 +1、错误文本相似 +1、相同根因连续 3 次无改善 +2
+        assert det.get_score("dsh") == 4
 
     def test_request_error_counts_as_failure(self):
         det, _ = _make_detector()
@@ -154,11 +139,9 @@ class TestStuckDetectorScoring:
 
     def test_llm_retry_feeds_retry_rule(self):
         det, _ = _make_detector()
-        collector = _ReasonCollector(det)
         # 仅一条 llm/retry（无模型文本）→ 也应命中重试措辞规则 +1
         det.feed_record("dsh", _llm_retry(1, "429", "rate limited"))
-        assert StuckReason.RETRY_LANGUAGE in collector.reasons
-        assert det.get_score("dsh") >= 1
+        assert det.get_score("dsh") == 1
 
     def test_realistic_pip_proxy_scenario_recommends_intervention(self):
         """复刻典型卡住场景：不同命令、不同工具，但都围绕同一失败目标反复试探。

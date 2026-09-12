@@ -242,6 +242,48 @@ class TestRefreshStaleBridgeLinks:
         assert [name for name, _args in calls] == ["web"]
         assert calls[0][1] == ("add", str(plugin))
 
+    def test_refresh_repairs_broken_dep_specs_then_retries(self, tmp_path, monkeypatch):
+        """陈旧 link 的 profile 里另有可修复的坏依赖时，refresh 也要先修后重试。
+
+        启动自检与安装路径同源失败原因（manifest 指向不存在的旧路径）：裸
+        _run_pnpm 一次失败就放弃，每次启动都重复同一轮静默失败，link 永远刷不新。
+        """
+        plugin = tmp_path / "current-build" / "integrations" / "dsh-pet-bridge"
+        plugin.mkdir(parents=True)
+        other = tmp_path / "old-build"
+        other.mkdir()
+        artifacts = tmp_path / "artifacts"
+        artifacts.mkdir()
+        (artifacts / "ext-0.13.6.tgz").write_text("x", encoding="utf-8")
+        profile = _profile(tmp_path, name="web", deps={
+            agent_link.DSH_PLUGIN_NAME: f"link:{other}",
+            "ext": f"file:{artifacts / 'ext-0.12.80.tgz'}",
+        })
+        monkeypatch.setattr(agent_link, "DSH_PROFILE_HOME", tmp_path)
+        monkeypatch.setattr(DshMonitor, "bundled_plugin_dir", classmethod(lambda cls: plugin))
+        monkeypatch.setattr(agent_link, "_pnpm_command", lambda: ["pnpm"])
+        calls: list[tuple] = []
+
+        def fake_run(profile_dir, *args):
+            calls.append(args)
+            if len(calls) == 1:
+                return 1, "ERR_PNPM_ ... ext-0.12.80.tgz does not exist"
+            # 修复已生效后的重试：模拟 pnpm add 成功并把 link 指到当前构建目录
+            data = json.loads((profile_dir / "package.json").read_text(encoding="utf-8"))
+            data.setdefault("dependencies", {})[agent_link.DSH_PLUGIN_NAME] = f"link:{plugin}"
+            (profile_dir / "package.json").write_text(
+                json.dumps(data, ensure_ascii=False), encoding="utf-8"
+            )
+            return 0, ""
+
+        monkeypatch.setattr(agent_link, "_run_pnpm", fake_run)
+
+        refreshed = DshMonitor.refresh_stale_bridge_links()
+
+        assert refreshed == ["web"]
+        assert len(calls) == 2, "修正坏依赖后必须重试一次"
+        assert "0.13.6" in _manifest(profile)["dependencies"]["ext"]
+
     def test_never_installs_absent_plugin(self, tmp_path, monkeypatch):
         plugin = tmp_path / "current-build" / "integrations" / "dsh-pet-bridge"
         plugin.mkdir(parents=True)
@@ -439,3 +481,46 @@ class TestSpecRepair:
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+class TestInstallBridgeScaffoldsMissingProfile:
+    """安装链缺口：全新 dsh（从未运行过）没有 profile，一键安装桥接必失败。
+
+    dsh-app-boot 的 initProfile 会在首次运行时补出 profile；桌宠侧安装桥接
+    前若一个 profile 都没有，应按同一套三件套（manifest + cordis.patch.yml +
+    pnpm-workspace.yaml）补出默认 web profile 再继续，而不是把全新用户挡住。
+    """
+
+    def test_install_creates_default_web_profile_when_none_exists(self, tmp_path, monkeypatch):
+        plugin = tmp_path / "bundled" / "dsh-pet-bridge"
+        plugin.mkdir(parents=True)
+        (tmp_path / "profiles").mkdir()
+        monkeypatch.setattr(agent_link, "DSH_PROFILE_HOME", tmp_path)
+        monkeypatch.setattr(DshMonitor, "bundled_plugin_dir", classmethod(lambda cls: plugin))
+        monkeypatch.setattr(agent_link, "_pnpm_command", lambda: ["pnpm"])
+        calls: list[str] = []
+
+        def fake_run(profile_dir, *args):
+            calls.append(profile_dir.name)
+            data = json.loads((profile_dir / "package.json").read_text(encoding="utf-8"))
+            data.setdefault("dependencies", {})[agent_link.DSH_PLUGIN_NAME] = f"link:{plugin}"
+            (profile_dir / "package.json").write_text(
+                json.dumps(data, ensure_ascii=False), encoding="utf-8"
+            )
+            return 0, ""
+
+        monkeypatch.setattr(agent_link, "_run_pnpm", fake_run)
+
+        ok, message = DshMonitor.install_bridge()
+
+        assert ok is True, message
+        assert calls == ["web"], "应先补出默认 web profile 再在其中安装"
+        web = tmp_path / "profiles" / "web"
+        assert (web / "cordis.patch.yml").is_file(), "initProfile 三件套之一"
+        assert (web / "pnpm-workspace.yaml").is_file(), "initProfile 三件套之二"
+        manifest = json.loads((web / "package.json").read_text(encoding="utf-8"))
+        bundles = manifest["dsh"]["profile"]["bundles"]
+        assert bundles[:2] == [
+            "@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app",
+        ], "web 预设 bundles 应与 dsh-app-boot 的模板一致"
+        assert agent_link.DSH_PLUGIN_NAME in bundles, "安装后 bundles 层应登记桥接插件"
