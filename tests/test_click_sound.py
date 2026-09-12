@@ -113,6 +113,40 @@ def test_wav_restarts_qsound_effect_on_each_click(monkeypatch, tmp_path):
     assert FakeQtEffect.instances[-1].loop_counts == [1, 1]
 
 
+def test_idle_effect_is_rebuilt_after_long_inactivity(monkeypatch, tmp_path):
+    """长时间放置后点击音效消失的回归：QSoundEffect 实例闲置超阈值要重建。
+
+    Windows 上 QtMultimedia 会把长期不播的音频会话休眠/回收，同一实例
+    再 play() 不报错但无声。闲置（_EFFECT_IDLE_REBUILD_S）后应丢弃缓存
+    实例、走新建重新加载路径（自愈）；未闲置则复用同一实例（保持预热
+    低延迟开局）。"""
+    monkeypatch.setattr(click_sound, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(click_sound._pool, "_qt_effects", {})
+    monkeypatch.setattr(click_sound._pool, "_effect_last_play", {})
+    monkeypatch.setattr(click_sound._pool, "qt_multimedia_classes", _fake_classes)
+    monkeypatch.setattr(
+        click_sound._pool, "_EFFECT_IDLE_REBUILD_S", 300.0,
+    )
+    path_wav = _make_file(tmp_path, "click.wav")
+
+    before = len(FakeQtEffect.instances)
+    assert click_sound.play_sound(path_wav, volume=1.0) is True
+    after_first = len(FakeQtEffect.instances)
+    assert after_first == before + 1, "首次播放应新建一个 QSoundEffect 实例"
+
+    # 未闲置：连续播放复用同一实例（不新建）
+    assert click_sound.play_sound(path_wav, volume=1.0) is True
+    assert len(FakeQtEffect.instances) == after_first, "未闲置不得重建实例"
+
+    # 闲置超阈值：回收缓存实例 → 再次播放重建（自愈）
+    key = str(path_wav.resolve())
+    click_sound._pool._effect_last_play[key] -= click_sound._pool._EFFECT_IDLE_REBUILD_S + 1
+    assert click_sound.play_sound(path_wav, volume=1.0) is True
+    assert len(FakeQtEffect.instances) == after_first + 1, \
+        "闲置超阈值后应重建 QSoundEffect 实例（自愈无声）"
+    assert FakeQtEffect.instances[-1].play_count == 1, "重建实例应重新加载/播放"
+
+
 def test_mp3_decode_failure_falls_back_to_player_pool(monkeypatch, tmp_path):
     monkeypatch.setattr(click_sound, "os", SimpleNamespace(name="nt"))
     monkeypatch.setattr(click_sound._pool, "_qt_effects", {})
