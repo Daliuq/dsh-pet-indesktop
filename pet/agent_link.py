@@ -4307,10 +4307,13 @@ class AgentLinkManager(QObject):
 
     def _exploration_control_buttons(self, session_key: str, payload: dict,
                                     alert_id: str) -> list[tuple[str, object]]:
-        """控制气泡按钮：replan=自动优化、interrupt=终止、忽略=关闭气泡。"""
+        """控制气泡按钮：interrupt=终止、忽略=关闭气泡。
+
+        不再展示「自动优化」（replan）：其桥接路径（runBridgeDiagnosis + steer
+        注入）在目标 DSH 上实效不可靠，点了形同虚设反而误导用户——只有真正
+        可用的「终止」与「忽略」。（B2 修复：不可用功能不展示）"""
         context = dict(payload or {})
         return [
-            ("自动优化", lambda sk=session_key, p=context: self._request_exploration_control("replan", sk, p)),
             ("终止", lambda sk=session_key, p=context: self._request_exploration_control("interrupt", sk, p)),
             ("忽略", lambda aid=alert_id: self._dismiss_exploration_control(aid)),
         ]
