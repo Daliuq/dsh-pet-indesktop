@@ -42,6 +42,11 @@ from .click_sound import play_sound, resolve_builtin_sound
 from .report_gates import should_report, should_report_event
 from .agent_event_protocol import parse_agent_event
 from .agent_event_normalizer import normalize_event
+from .bridge_contract import (
+    BRIDGE_PROTOCOL_VERSION,
+    BRIDGE_VERSION,
+    validate_bridge_record,
+)
 from .model_access_tracker import ModelAccessTracker
 from .node_runtime import augmented_path as _augmented_path
 from .node_runtime import global_node_modules_roots
@@ -85,6 +90,29 @@ _RAW_BRIDGE_KNOWN_EVENTS: frozenset[str] = frozenset({
     "web_search_end",
     "context_compacted",
     "pet/control-queued",
+})
+
+# _poll 里走**专用信号**直通的事件（契约测试 test_declared_events_have_an_
+# effect_consumer 以本集合 + 语义层 + 状态机 + 看门狗分类四路共同判定「有真实
+# 消费者」；新增事件必须至少命中一路）。与 _RAW_BRIDGE_KNOWN_EVENTS 的区别：
+# 那是「未知判定豁免名单」，这里是「有专门信号分支转发」的显式清单。
+_POLL_SIGNAL_EVENTS: frozenset[str] = frozenset({
+    "bridge/hello",
+    "bridge/diagnostic",
+    "bridge/control-received",
+    "model_access",
+    "llm_error",
+    "user_action",
+    "execution/failed",
+    "approval/request",
+    "approval/decided",
+    "approval/resolved",
+    "question/requested",
+    "question/resolved",
+    "cordis/request-run",
+    "cordis/request-run-resolved",
+    "bridge/control-result",
+    "watchdog/control-result",
 })
 
 
@@ -1203,6 +1231,10 @@ class BaseAgentMonitor(QObject):
     question_resolved = Signal(str, object)   # (agent_key, payload) —— 问题已解决，气泡应消失
     cordis_requested = Signal(str, object)
     cordis_resolved = Signal(str, object)
+    # Generic monitors (including user-supplied JSONL adapters) do not carry
+    # the DSH bridge envelope.  DshMonitor enables this gate for the bundled
+    # producer while preserving the generic monitor's established seam.
+    _enforce_bridge_contract = False
     # 原始桥接记录转发（供 stuck_detector 等消费）：(agent_key, record)
     # 只挂 DSH 监视器；其他 Agent（claude/cursor/…）不产生这类增强记录。
     raw_record = Signal(str, object)
@@ -1222,6 +1254,9 @@ class BaseAgentMonitor(QObject):
     # 未知桥接事件（DSH 桥接写出的、Pet 全部识别路径都不认识的事件名）：
     # (agent_key, record) —— Manager 侧据此提醒用户更新/重装 bridge。
     unknown_bridge_event = Signal(str, object)
+    # (agent_key, validation-detail) —— 桥接契约校验失败（版本化 hello/记录不
+    # 符合 Pet 期望）：Manager 弹「桥接与桌宠版本不对齐」提示。
+    bridge_incompatible = Signal(str, object)
 
     def __init__(self, agent_key: str, config_dir: Path, parent=None) -> None:
         super().__init__(parent)
@@ -1458,6 +1493,23 @@ class BaseAgentMonitor(QObject):
                     flattened = dict(data)
                     flattened.update(nested)
                     data = flattened
+                # The same directory also contains Pet-authored
+                # dsh-pet-control-*.jsonl audit records. They are local
+                # telemetry, not bridge output, so they use a separate seam.
+                is_bridge_record = data.get("agent") != "pet"
+                if self._enforce_bridge_contract and is_bridge_record:
+                    validation = validate_bridge_record(data)
+                    if not validation:
+                        self._emit(self.bridge_incompatible, (self.agent_key, {
+                            "record": data,
+                            "reason": validation.reason,
+                            "receivedProtocolVersion": validation.received_protocol,
+                            "receivedBridgeVersion": validation.received_version,
+                            "expectedProtocolVersion": BRIDGE_PROTOCOL_VERSION,
+                            "expectedBridgeVersion": BRIDGE_VERSION,
+                            "receivedEventInventory": list(validation.received_inventory),
+                        }))
+                        continue
                 ev = str(data.get("event", ""))
                 st = str(data.get("state", ""))
                 tool = str(data.get("tool", "") or "").strip()
@@ -1528,6 +1580,11 @@ class BaseAgentMonitor(QObject):
                     and normalized is None
                     and not normalize_event_state(ev, "")
                     and ev not in _RAW_BRIDGE_KNOWN_EVENTS
+                    # 契约已校验通过的桥接记录必然是已知事件（hello/版本化清单
+                    # 在 validate_bridge_record 里查过 BRIDGE_EVENT_INVENTORY），
+                    # 不得再落 unknown 兜底——否则 bridge/hello 等会被误报「未知
+                    # 桥接事件 → 提醒更新/重装」。
+                    and not (self._enforce_bridge_contract and is_bridge_record)
                     and meta_type not in ("session/meta", "debug/session-shape")
                 ):
                     self._emit(self.unknown_bridge_event, (self.agent_key, data))
@@ -1552,6 +1609,9 @@ class DshMonitor(BaseAgentMonitor):
     """
 
     PLUGIN_NAME = "@dsh-pet/bridge"
+    # DSH 桥接是随桌宠捆绑的**版本化契约生产者**：hello 携带协议/版本/事件清单，
+    # 记录逐条校验（validate_bridge_record），不兼容即弹「更新/重装 bridge」。
+    _enforce_bridge_contract = True
 
     def __init__(self, agent_key: str, config_dir: Path, parent=None) -> None:
         super().__init__(agent_key, config_dir, parent)
@@ -2460,6 +2520,7 @@ class AgentLinkManager(QObject):
         self.monitors["dsh"].llm_error.connect(self._on_llm_error)
         self.monitors["dsh"].user_action.connect(self._on_user_action)
         self.monitors["dsh"].unknown_bridge_event.connect(self._on_unknown_bridge_event)
+        self.monitors["dsh"].bridge_incompatible.connect(self._on_bridge_incompatible)
         # 检测器提醒跨模块节流（N2）：stuck / pattern / exploration watchdog 三个
         # 检测器各有独立 cooldown，但同一 busy 周期可能先后各自弹窗造成连环换弹。
         # 按 agent/session 记最近一次**任一**检测器弹窗时刻与档位，窗口内同档
@@ -4702,6 +4763,40 @@ class AgentLinkManager(QObject):
             call_id = str(record.get("callId") or "")
             rpc_id = str(record.get("rpcId") or "")
             self._close_interaction_by_id("question", rpc_id, call_id, session_key)
+
+    def _on_bridge_incompatible(self, agent_key: str, detail: dict) -> None:
+        """DSH 桥接契约校验失败（hello/记录版本或事件清单不符）→ 提醒更新/重装。
+
+        DshMonitor 对每条桥接记录做 validate_bridge_record（producer 是随桌宠
+        捆绑的版本化契约），不兼容即拒绝该记录并弹此事件。**不兼容是必需健康
+        反馈，不受事件汇报概率门控制**（门 0 也弹——否则版本不对齐会被静默
+        吞掉、桌宠一直收不到状态）；仅按冷却窗口限频（不兼容记录可能成串）。
+        """
+        if not isinstance(detail, dict):
+            return
+        now = self._clock()
+        last = self._unknown_bridge_reminded_at.get(agent_key)
+        if last is not None and now - last < self._UNKNOWN_BRIDGE_REMIND_COOLDOWN_S:
+            return
+        self._unknown_bridge_reminded_at[agent_key] = now
+        name = self.agent_names.get(agent_key, agent_key)
+        received = detail.get("receivedBridgeVersion")
+        expected = detail.get("expectedBridgeVersion")
+        recv_proto = detail.get("receivedProtocolVersion")
+        expected_proto = detail.get("expectedProtocolVersion")
+        version_hint = ""
+        if received or recv_proto:
+            version_hint = (
+                f"（bridge {received or '?'} / 协议 {recv_proto or '?'} → "
+                f"桌宠需 {expected or '?'} / 协议 {expected_proto or '?'}）"
+            )
+        # 直接 show_bubble（不用 _dialogue：不兼容提醒是**必需健康反馈**，
+        # 不应被 persona 文案模板替换，且不受事件汇报概率门控制）。
+        self.win.show_bubble(
+            f"{name} 检测到 DSH bridge 与桌宠不兼容（版本不对齐）{version_hint}——"
+            "请更新或重装 bridge 插件",
+            duration_ms=6000,
+        )
 
     def _on_unknown_bridge_event(self, agent_key: str, record: dict) -> None:
         """DSH 桥接写出的未知事件 → 提醒用户更新/重装 bridge。
