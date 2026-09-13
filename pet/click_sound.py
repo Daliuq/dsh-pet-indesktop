@@ -74,9 +74,13 @@ class ClickSoundPool:
         self._click_pair_state: dict[tuple[str, str], dict[str, Any]] = {}
         # effect 路径 → 最后一次 play 的 time.monotonic()（闲置重建判定用）。
         self._effect_last_play: dict[str, float] = {}
-        # 本池最后一次播放时刻（任意音频入口）：闲置判定用。初始化为当前时刻，
-        # 否则"自开机起 elapsed 巨大"会让第一次播放就误判闲置、把预热白做。
-        self._last_play_at = time.monotonic()
+        # 本池最后一次播放时刻（任意音频入口）；**None = 尚未播放过**。
+        # 判据只看时间差 `now - previous`，不用 0/正负号编码"从未播放"：
+        # monotonic 的原点与数值大小随机器与开机时长变化（CI runner 刚开机时
+        # 可能只有几十秒，人工构造的"回拨"值还可能为负），任何拿绝对值做判断的
+        # 写法都会在真实机器上翻车——macOS runner 实测：真实的闲置被当成"还没
+        # 播放过"，整池不重建、用例红。
+        self._last_play_at: float | None = None
         # 已进行的闲置重建次数（测试/诊断可观测；不参与播放逻辑）。
         self._idle_rebuild_count = 0
 
@@ -174,11 +178,16 @@ class ClickSoundPool:
         休眠。只重建 effect 的话，用户看到的仍是「全部音效消失」（用户实测：
         长期放置后点哪个都没声，且点击响应卡顿）。未闲置（含刚重建过）时复用
         对象，保持预热后的低延迟开局。返回 True 表示本次真的重建了。
+
+        闲置判据 = `now - _last_play_at >= 阈值`，其中 `_last_play_at is None`
+        表示"本池还没播放过"（首次播放只登记时刻，不重建）——刻意不用
+        `<= 0.0` 之类按数值判"从未播放"的写法：monotonic 绝对值的量级取决于
+        机器与开机时长，判据必须只依赖时间差。
         """
         now = time.monotonic()
         previous = self._last_play_at
         self._last_play_at = now
-        if previous <= 0.0 or now - previous < self._EFFECT_IDLE_REBUILD_S:
+        if previous is None or now - previous < self._EFFECT_IDLE_REBUILD_S:
             return False
         for effect in list(self._qt_effects.values()):
             try:

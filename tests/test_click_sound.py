@@ -96,6 +96,34 @@ def _make_file(tmp_path: Path, name: str) -> Path:
     return path
 
 
+class FakeMonotonic:
+    """可控 monotonic 时钟（替换 `click_sound.time`）。
+
+    为什么必须可控：闲置判定比的是 `now - 上次播放`，而 CI runner 是**刚开机**的
+    （`time.monotonic()` 绝对值可能只有几十秒）。用例若拿真实时钟做"把时刻往回
+    拨 阈值+1 秒"的算术，在 uptime 小于阈值时会算出负数，"真实闲置"就退化成
+    "从未播放过"的边界值 → 只在部分机器上红（macOS runner 实测红、Windows runner
+    绿）。AGENTS.md 也明确禁止用 monotonic 绝对值做回拨算术：让用例直接掌控时间，
+    判据里就只剩时间差。
+    """
+
+    def __init__(self, start: float = 10_000.0) -> None:
+        self.now = start
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        # 产品在解码等待里也用 time.sleep（真实休眠，不影响判定）。
+        time.sleep(seconds)
+
+
+def _install_clock(monkeypatch, start: float = 10_000.0) -> FakeMonotonic:
+    clock = FakeMonotonic(start)
+    monkeypatch.setattr(click_sound, "time", clock)
+    return clock
+
+
 def test_wav_restarts_qsound_effect_on_each_click(monkeypatch, tmp_path):
     monkeypatch.setattr(click_sound, "os", SimpleNamespace(name="nt"))
     effect = FakeQtEffect()
@@ -121,6 +149,7 @@ def test_idle_effect_is_rebuilt_after_long_inactivity(monkeypatch, tmp_path):
     再 play() 不报错但无声。闲置（_EFFECT_IDLE_REBUILD_S）后应丢弃缓存
     实例、走新建重新加载路径（自愈）；未闲置则复用同一实例（保持预热
     低延迟开局）。"""
+    _install_clock(monkeypatch)
     monkeypatch.setattr(click_sound, "os", SimpleNamespace(name="nt"))
     monkeypatch.setattr(click_sound._pool, "_qt_effects", {})
     monkeypatch.setattr(click_sound._pool, "_effect_last_play", {})
@@ -139,7 +168,8 @@ def test_idle_effect_is_rebuilt_after_long_inactivity(monkeypatch, tmp_path):
     assert click_sound.play_sound(path_wav, volume=1.0) is True
     assert len(FakeQtEffect.instances) == after_first, "未闲置不得重建实例"
 
-    # 闲置超阈值：回收缓存实例 → 再次播放重建（自愈）
+    # 只把**该路径**证的上次播放时刻回拨到阈值之外（全局时钟仍是新鲜的）：
+    # 本用例要验证的是每路径判定，不能顺手让整池闲置重建也插一脚。
     key = str(path_wav.resolve())
     click_sound._pool._effect_last_play[key] -= click_sound._pool._EFFECT_IDLE_REBUILD_S + 1
     assert click_sound.play_sound(path_wav, volume=1.0) is True
@@ -154,6 +184,7 @@ def test_idle_reset_rebuilds_the_player_pool_too(monkeypatch, tmp_path):
     压缩音频（mp3/ogg）解码缓存未就绪时走 QMediaPlayer 池 + 各自的
     QAudioOutput；Windows 上闲置久了这批对象的音频会话同样被回收/休眠，
     只重建 QSoundEffect 的话用户看到的仍是"点哪个都没声"。"""
+    clock = _install_clock(monkeypatch)
     monkeypatch.setattr(click_sound, "os", SimpleNamespace(name="nt"))
     monkeypatch.setattr(click_sound._pool, "_qt_effects", {})
     monkeypatch.setattr(click_sound._pool, "_qt_decoders", {})
@@ -161,13 +192,12 @@ def test_idle_reset_rebuilds_the_player_pool_too(monkeypatch, tmp_path):
     monkeypatch.setattr(click_sound._pool, "_qt_player_index", 0)
     monkeypatch.setattr(click_sound._pool, "_qt_player", None)
     monkeypatch.setattr(click_sound._pool, "_qt_audio", None)
-    monkeypatch.setattr(click_sound._pool, "_last_play_at", time.monotonic())
+    monkeypatch.setattr(click_sound._pool, "_last_play_at", clock.now)
     monkeypatch.setattr(click_sound._pool, "qt_multimedia_classes", _fake_classes)
     monkeypatch.setattr(click_sound, "_sound_cache_dir", lambda: tmp_path / "cache")
     path = _make_file(tmp_path, "click.mp3")
     # 计数器是**进程级**的（单例池跨用例共享）：只能按基线增量断言。写成
-    # `== 1` 会让结果取决于本用例之前有没有别的用例触发过闲置重建
-    # （CI 上慢跑时，任何一次 >5 分钟的播放空档都会先加一次 → 本地绿、CI 红）。
+    # `== 1` 会让结果取决于本用例之前有没有别的用例触发过闲置重建。
     rebuilds_before = click_sound._pool._idle_rebuild_count
 
     assert click_sound.play_click_sound(path) is True
@@ -179,8 +209,8 @@ def test_idle_reset_rebuilds_the_player_pool_too(monkeypatch, tmp_path):
     assert [p for p, _a in click_sound._pool._qt_player_pool] == pool_before, \
         "未闲置不得重建播放器池"
 
-    # 闲置超阈值：整池重建 → 下一次播放拿到全新对象（自愈无声）
-    click_sound._pool._last_play_at -= click_sound._pool._EFFECT_IDLE_REBUILD_S + 1
+    # 闲置超阈值：**时间前进**阈值+1 秒（不是把时刻往回拨成负数）→ 整池重建
+    clock.now += click_sound._pool._EFFECT_IDLE_REBUILD_S + 1
     assert click_sound.play_click_sound(path) is True
     pool_after = [player for player, _audio in click_sound._pool._qt_player_pool]
     assert pool_after, "闲置后仍须有可用播放器"
@@ -190,6 +220,34 @@ def test_idle_reset_rebuilds_the_player_pool_too(monkeypatch, tmp_path):
         "本用例应恰好触发一次闲置重建"
 
 
+def test_idle_reset_fires_even_on_a_just_booted_clock(monkeypatch, tmp_path):
+    """回归（macOS runner 实测红）：刚开机的机器上必须还能判定"闲置"。
+
+    `time.monotonic()` 的原点/量级取决于机器与开机时长——CI runner 刚开机时只有
+    几十秒。此前"从未播放过"用 `_last_play_at <= 0.0` 表达，于是任何"把时刻往回
+    拨"的算术在小 uptime 上都会落进那个分支：真实的闲置被当成"还没播放过"，
+    整池不重建（Windows runner uptime 大 → 绿；macOS runner 刚开机 → 红）。
+    现在判据只看时间差，且 None 才是"尚未播放"的语义。
+    """
+    clock = _install_clock(monkeypatch, start=5.0)  # 刚开机 5 秒
+    monkeypatch.setattr(click_sound, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(click_sound._pool, "_qt_effects", {})
+    monkeypatch.setattr(click_sound._pool, "_effect_last_play", {})
+    monkeypatch.setattr(click_sound._pool, "qt_multimedia_classes", _fake_classes)
+    path_wav = _make_file(tmp_path, "click.wav")
+    rebuilds_before = click_sound._pool._idle_rebuild_count
+
+    assert click_sound.play_sound(path_wav, volume=1.0) is True
+    # 开机 5 秒的机器上"回拨"必然越界成负数——判据仍必须只看时间差
+    click_sound._pool._last_play_at = clock.now - (
+        click_sound._pool._EFFECT_IDLE_REBUILD_S + 1
+    )
+    assert click_sound._pool._last_play_at < 0.0, "本用例要的就是越界成负数的时刻"
+    assert click_sound.play_sound(path_wav, volume=1.0) is True
+    assert click_sound._pool._idle_rebuild_count == rebuilds_before + 1, \
+        "负数时刻（真实闲置）必须照样触发整池重建"
+
+
 def test_first_play_after_warmup_reuses_the_warmed_effect(monkeypatch, tmp_path):
     """预热后首次点击必须复用预热实例。
 
@@ -197,15 +255,13 @@ def test_first_play_after_warmup_reuses_the_warmed_effect(monkeypatch, tmp_path)
     等于"自开机起一直闲置"（monotonic 是开机秒数），于是预热刚建好的
     QSoundEffect 会在第一次点击时被当场丢弃重建，预热白做、首次点击重新背上
     加载延迟。现在创建时即登记时刻，缺条目按"不闲置"处理。"""
+    clock = _install_clock(monkeypatch)
     monkeypatch.setattr(click_sound, "os", SimpleNamespace(name="nt"))
     monkeypatch.setattr(click_sound._pool, "_qt_effects", {})
     monkeypatch.setattr(click_sound._pool, "_effect_last_play", {})
     monkeypatch.setattr(click_sound._pool, "qt_multimedia_classes", _fake_classes)
     # 钉住"整池闲置"时钟：本用例只验证**每路径**判定，不允许全局闲置重建插手。
-    # 不钉的话结果取决于会话里距上次播放多久（CI 上慢跑 >5 分钟就会触发整池
-    # 重建、把刚预热的实例清掉，本地 3 分钟的套件则永远不触发——正是"本地绿、
-    # CI 红"的时间依赖）。
-    monkeypatch.setattr(click_sound._pool, "_last_play_at", time.monotonic())
+    monkeypatch.setattr(click_sound._pool, "_last_play_at", clock.now)
     path_wav = _make_file(tmp_path, "click.wav")
 
     click_sound._pool.effect_for(path_wav)  # 预热：创建并登记
@@ -222,13 +278,15 @@ def test_idle_reset_clears_effect_cache_and_shared_audio(monkeypatch, tmp_path):
     monkeypatch.setattr(click_sound._pool, "_qt_player_pool", [])
     monkeypatch.setattr(click_sound._pool, "_qt_decoders", {})
     monkeypatch.setattr(click_sound._pool, "_qt_player_index", 0)
-    monkeypatch.setattr(click_sound._pool, "_last_play_at", time.monotonic())
+    clock = _install_clock(monkeypatch)
+    monkeypatch.setattr(click_sound._pool, "_last_play_at", clock.now)
     monkeypatch.setattr(click_sound._pool, "qt_multimedia_classes", _fake_classes)
     path_wav = _make_file(tmp_path, "click.wav")
     assert click_sound.play_sound(path_wav, volume=1.0) is True
     assert click_sound._pool._qt_effects, "首次播放后应有 effect 缓存"
 
-    click_sound._pool._last_play_at -= click_sound._pool._EFFECT_IDLE_REBUILD_S + 1
+    # 时间前进超过阈值 → 整池重建（含共享播放器/音频输出）
+    clock.now += click_sound._pool._EFFECT_IDLE_REBUILD_S + 1
     shared_player, shared_audio = FakeQtAudio(), FakeQtAudio()
     monkeypatch.setattr(click_sound._pool, "_qt_player", shared_player)
     monkeypatch.setattr(click_sound._pool, "_qt_audio", shared_audio)
