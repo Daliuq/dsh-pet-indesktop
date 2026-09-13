@@ -38,6 +38,7 @@ from PySide6.QtCore import QObject, QTimer, Signal
 
 from . import harness_launcher
 from .agent_link import DirGlobTailer
+from .bridge_contract import resolve_bridge_dir
 
 log = logging.getLogger("dsh-pet-standalone")
 
@@ -172,7 +173,9 @@ class DshStateTracker(QObject):
         self.port = int(port) if port is not None else harness_launcher.DEFAULT_PORT
         self._clock = clock or time.monotonic
 
-        self._bridge_dir = self.config_dir.parent / BRIDGE_DIR_NAME
+        # 与插件同源解析桥目录：显式覆盖（DSH_PET_BRIDGE_DIR）优先，
+        # 未设时等价于 config_dir.parent/"dsh-pet-bridge"（生产环境即数据基目录）。
+        self._bridge_dir = resolve_bridge_dir(self.config_dir)
         self._bridge_file = self._bridge_dir / BRIDGE_FILE_NAME
         # 多 DSH 实例分区写入（P0-2）：生产端每个实例写 dsh-{pid}.jsonl，
         # 消费端 glob 全部 dsh*.jsonl（兼容旧版单文件 dsh.jsonl）。

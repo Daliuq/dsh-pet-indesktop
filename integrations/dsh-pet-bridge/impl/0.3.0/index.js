@@ -37,6 +37,9 @@ function createUserMessage(input) {
 
 const MAX_BYTES = 1024 * 1024; // 事件文件超过 1MB 时轮转（保留 .1 备份，防无限增长）
 const PLUGIN_ID = "dsh-pet-bridge";
+// 桥目录的显式覆盖入口；与桌宠端 pet/bridge_contract.py::BRIDGE_DIR_ENV 同名同语义
+// （设置时取代平台默认路径，插件与桌宠必须看到同一个值）。
+const BRIDGE_DIR_ENV = "DSH_PET_BRIDGE_DIR";
 const BRIDGE_PROTOCOL_VERSION = 1;
 // 版本必须每个模块实例独立读取：CJS 的 require(package.json) 会命中
 // require.cache（跨热重载实例共享），重装后新实现会读到旧版本号。
@@ -196,8 +199,14 @@ function isModelAccessError(code, message) {
   return /\btimed?\s?out\b|timed out before|connection (reset|refused|aborted|closed|reset by peer)|network (error|unreachable|is unreachable)|socket hang up|eai_again|read ?ec 0|econnreset|etimedout/i.test(m);
 }
 
-// 桥目录必须与桌宠端一致：win32=%APPDATA%，darwin=~/Library/Application Support，其他=~/.config
+// 桥目录必须与桌宠端一致：win32=%APPDATA%，darwin=~/Library/Application Support，
+// 其他=~/.config。**显式覆盖优先**（三平台统一，见 BRIDGE_DIR_ENV）：数据根只有
+// 一个入口，CI/多实例/便携部署能把桥目录指到别处；没有它，POSIX 上想隔离数据根
+// 就只能去改 HOME（那属于拿平台细节绕过产品行为）。桌宠端（pet/bridge_contract.py
+// 的 resolve_bridge_dir）读同一个变量——两边必须同值，否则各自写各自的目录。
 function bridgeDir() {
+  const override = String(process.env[BRIDGE_DIR_ENV] || "").trim();
+  if (override) return path.resolve(override);
   if (process.platform === "win32") {
     return path.join(process.env.APPDATA || os.homedir(), "dsh-pet-bridge");
   }

@@ -4,7 +4,6 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { redirectBridgeDataRoot, assertBridgeDirIsolated } from "./_bridge-test-env.mjs";
 import {
   apply,
   BRIDGE_CAPABILITIES,
@@ -53,28 +52,33 @@ test("the runtime bridge version follows package metadata", () => {
 });
 
 test("every writeRecord output carries the protocol and package envelope", () => {
+  const oldBridgeDir = process.env.DSH_PET_BRIDGE_DIR;
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-bridge-contract-"));
-  const restoreBridgeDataRoot = redirectBridgeDataRoot(tempRoot);
-  assertBridgeDirIsolated(__bridgeTest.bridgeDir(), tempRoot);
+  // 数据根走插件与桌宠共用的显式入口（三平台同一口径 DSH_PET_BRIDGE_DIR）：
+  // 不再依赖 APPDATA/HOME 的平台差异，也不需要知道平台默认路径长什么样。
+  process.env.DSH_PET_BRIDGE_DIR = path.join(tempRoot, "dsh-pet-bridge");
   try {
     __bridgeTest.writeRecord({ event: "contract/test", bridgeProtocolVersion: 999, bridgeVersion: "stale" });
     __bridgeTest.flush();
-    const file = path.join(__bridgeTest.bridgeDir(), __bridgeTest.instanceFile);
+    const file = path.join(tempRoot, "dsh-pet-bridge", __bridgeTest.instanceFile);
     const record = JSON.parse(fs.readFileSync(file, "utf8").trim());
     assert.equal(record.event, "contract/test");
     assert.equal(record.bridgeProtocolVersion, BRIDGE_PROTOCOL_VERSION);
     assert.equal(record.bridgeVersion, BRIDGE_VERSION);
   } finally {
-    restoreBridgeDataRoot();
+    if (oldBridgeDir === undefined) delete process.env.DSH_PET_BRIDGE_DIR;
+    else process.env.DSH_PET_BRIDGE_DIR = oldBridgeDir;
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
 });
 
 test("apply emits one bridge/hello record per application", () => {
+  const oldBridgeDir = process.env.DSH_PET_BRIDGE_DIR;
   const oldWebSocket = globalThis.WebSocket;
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-bridge-hello-"));
-  const restoreBridgeDataRoot = redirectBridgeDataRoot(tempRoot);
-  assertBridgeDirIsolated(__bridgeTest.bridgeDir(), tempRoot);
+  // 数据根走插件与桌宠共用的显式入口（三平台同一口径 DSH_PET_BRIDGE_DIR）：
+  // 不再依赖 APPDATA/HOME 的平台差异，也不需要知道平台默认路径长什么样。
+  process.env.DSH_PET_BRIDGE_DIR = path.join(tempRoot, "dsh-pet-bridge");
   // Avoid a real DSH mux connection in this producer-only contract test.
   globalThis.WebSocket = undefined;
   const ctx = {
@@ -85,7 +89,7 @@ test("apply emits one bridge/hello record per application", () => {
   try {
     apply(ctx);
     __bridgeTest.flush();
-    const file = path.join(__bridgeTest.bridgeDir(), __bridgeTest.instanceFile);
+    const file = path.join(tempRoot, "dsh-pet-bridge", __bridgeTest.instanceFile);
     const records = fs.readFileSync(file, "utf8").trim().split(/\r?\n/).map(JSON.parse);
     const hellos = records.filter((record) => record.event === "bridge/hello");
     assert.equal(hellos.length, 1);
@@ -94,7 +98,8 @@ test("apply emits one bridge/hello record per application", () => {
     assert.deepEqual(hellos[0].capabilities, [...BRIDGE_CAPABILITIES]);
     assert.deepEqual(hellos[0].emittedEvents, [...BRIDGE_EVENT_INVENTORY]);
   } finally {
-    restoreBridgeDataRoot();
+    if (oldBridgeDir === undefined) delete process.env.DSH_PET_BRIDGE_DIR;
+    else process.env.DSH_PET_BRIDGE_DIR = oldBridgeDir;
     if (oldWebSocket === undefined) delete globalThis.WebSocket;
     else globalThis.WebSocket = oldWebSocket;
     fs.rmSync(tempRoot, { recursive: true, force: true });

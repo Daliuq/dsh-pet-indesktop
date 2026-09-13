@@ -4,7 +4,6 @@ import os from "node:os";
 import path from "node:path";
 import { test, before, after } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { redirectBridgeDataRoot, assertBridgeDirIsolated } from "./_bridge-test-env.mjs";
 
 // 热重载行为测试（方案 C 的核心机制）：
 // 1) probeDisk 能读到当前磁盘版本与 impl 实现文件 mtime；
@@ -28,11 +27,6 @@ import { redirectBridgeDataRoot, assertBridgeDirIsolated } from "./_bridge-test-
 // 崩溃/被杀也不污染仓库。临时副本放在桥包内（而不是 os.tmpdir()）是为了让
 // 相对导入与包内 node_modules 解析行为与真实安装一致（当前 impl 只用 Node
 // 内置模块，但这层保险不依赖于"实现层永远零依赖"）。
-//
-// 数据目录隔离：写盘位置是平台相关的（win32=%APPDATA%，POSIX=os.homedir()），
-// 因此必须把 APPDATA 与 HOME 一起重定向——只设 APPDATA 在 POSIX 上是空操作，
-// 记录会写进 runner 的真实家目录而断言去读临时目录（ENOENT）。这段逻辑统一在
-// ./_bridge-test-env.mjs，附隔离自检（assertBridgeDirIsolated）。
 //
 // 注意：before() 内动态 import 而非顶层 await import——Node 24 test runner
 // 对含顶层 await 的测试文件有事件循环不退出问题（nodejs/node#58227）。
@@ -67,11 +61,11 @@ test("repeated apply is idempotent: hello/diagnostic written once, mux not dupli
   // 刷屏 hello 且 approval/question 权威帧散落到多路连接上（「审批变事后」）。
   const oldWebSocket = globalThis.WebSocket;
   globalThis.WebSocket = undefined; // 测试进程不建真实 WS
+  const oldBridgeDir = process.env.DSH_PET_BRIDGE_DIR;
   const tempLogRoot = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-bridge-idem-"));
-  const restoreBridgeDataRoot = redirectBridgeDataRoot(tempLogRoot);
-  // 隔离自检：重定向必须真的生效（POSIX 上只设 APPDATA 是空操作，记录会写到
-  // runner 的真实家目录里，而断言读临时目录 → ENOENT）。
-  assertBridgeDirIsolated(shell.__bridgeTest.bridgeDir(), tempLogRoot);
+  // 数据根走插件与桌宠共用的显式入口（三平台同一口径 DSH_PET_BRIDGE_DIR）：
+  // 不再依赖 APPDATA/HOME 的平台差异，也不需要知道平台默认路径长什么样。
+  process.env.DSH_PET_BRIDGE_DIR = path.join(tempLogRoot, "dsh-pet-bridge");
   try {
     // 重置到未挂载状态（前面测试可能已 apply 过，applied=true）。
     if (shell.__hotReloadTest.disposeActive) shell.__hotReloadTest.disposeActive();
@@ -79,7 +73,7 @@ test("repeated apply is idempotent: hello/diagnostic written once, mux not dupli
     // 首次 apply：写 1 条 hello + 1 条 diagnostic。
     shell.apply(ctx);
     shell.__bridgeTest.flush();
-    const f1 = path.join(shell.__bridgeTest.bridgeDir(), shell.__bridgeTest.instanceFile);
+    const f1 = path.join(tempLogRoot, "dsh-pet-bridge", shell.__bridgeTest.instanceFile);
     const rec1 = fs.readFileSync(f1, "utf8").trim().split(/\r?\n/).map(JSON.parse);
     const hello1 = rec1.filter((r) => r.event === "bridge/hello").length;
     assert.equal(hello1, 1, "首次 apply 必须恰好写一条 hello");
@@ -93,7 +87,8 @@ test("repeated apply is idempotent: hello/diagnostic written once, mux not dupli
     assert.equal(hello2, 1, `重复 apply 不得重复写 hello，实际 ${hello2}`);
     assert.equal(diag2, 1, `重复 apply 不得重复写 diagnostic，实际 ${diag2}`);
   } finally {
-    restoreBridgeDataRoot();
+    if (oldBridgeDir === undefined) delete process.env.DSH_PET_BRIDGE_DIR;
+    else process.env.DSH_PET_BRIDGE_DIR = oldBridgeDir;
     fs.rmSync(tempLogRoot, { recursive: true, force: true });
     if (shell && shell.__hotReloadTest && shell.__hotReloadTest.disposeActive) {
       shell.__hotReloadTest.disposeActive();
@@ -223,10 +218,10 @@ function installTimerCounters() {
   };
 }
 
-/** 读取当前桥目录 dsh.jsonl 中 hello 记录条数（目录由 impl 的 bridgeDir() 决定，三平台一致）。 */
-function countHelloIn() {
+/** 读取某桥目录 dsh.jsonl 中 hello 记录条数（目录由 APPDATA 决定）。 */
+function countHelloIn(appDataRoot) {
   try {
-    const file = path.join(shell.__bridgeTest.bridgeDir(), shell.__bridgeTest.instanceFile);
+    const file = path.join(appDataRoot, "dsh-pet-bridge", shell.__bridgeTest.instanceFile);
     if (!fs.existsSync(file)) return 0;
     return fs.readFileSync(file, "utf8").trim().split(/\r?\n/)
       .filter((line) => line.includes('"bridge/hello"')).length;
@@ -251,8 +246,11 @@ test("checkReload is a no-op when the disk state matches the active stamp", asyn
   // 后数值仍相同，所以只断言 stamp 会漏掉该 bug）。
   const oldWebSocket = globalThis.WebSocket;
   globalThis.WebSocket = undefined;
+  const oldBridgeDir = process.env.DSH_PET_BRIDGE_DIR;
   const tempLogRoot = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-bridge-noop-"));
-  const restoreBridgeDataRoot = redirectBridgeDataRoot(tempLogRoot);
+  // 数据根走插件与桌宠共用的显式入口（三平台同一口径 DSH_PET_BRIDGE_DIR）：
+  // 不再依赖 APPDATA/HOME 的平台差异，也不需要知道平台默认路径长什么样。
+  process.env.DSH_PET_BRIDGE_DIR = path.join(tempLogRoot, "dsh-pet-bridge");
   try {
     const before = shell.__hotReloadTest.activeStamp();
     assert.ok(before, "active implementation must be stamped at bootstrap");
@@ -260,10 +258,11 @@ test("checkReload is a no-op when the disk state matches the active stamp", asyn
     const after = shell.__hotReloadTest.activeStamp();
     assert.deepEqual(after, before, "no disk change must not trigger a reload");
     shell.__bridgeTest.flush();
-    assert.equal(countHelloIn(), 0,
+    assert.equal(countHelloIn(tempLogRoot), 0,
       "no disk change must not re-apply the implementation (hello count must stay 0)");
   } finally {
-    restoreBridgeDataRoot();
+    if (oldBridgeDir === undefined) delete process.env.DSH_PET_BRIDGE_DIR;
+    else process.env.DSH_PET_BRIDGE_DIR = oldBridgeDir;
     fs.rmSync(tempLogRoot, { recursive: true, force: true });
     if (oldWebSocket === undefined) delete globalThis.WebSocket;
     else globalThis.WebSocket = oldWebSocket;
@@ -293,8 +292,11 @@ test("reinstall (version bump + new impl dir) hot-reloads and writes the new hel
   // 定时器 unref；测试进程需要干净退出，这里直接屏蔽网络）。
   const oldWebSocket = globalThis.WebSocket;
   globalThis.WebSocket = undefined;
+  const oldBridgeDir = process.env.DSH_PET_BRIDGE_DIR;
   const tempLogRoot = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-bridge-hr-"));
-  const restoreBridgeDataRoot = redirectBridgeDataRoot(tempLogRoot);
+  // 数据根走插件与桌宠共用的显式入口（三平台同一口径 DSH_PET_BRIDGE_DIR）：
+  // 不再依赖 APPDATA/HOME 的平台差异，也不需要知道平台默认路径长什么样。
+  process.env.DSH_PET_BRIDGE_DIR = path.join(tempLogRoot, "dsh-pet-bridge");
   try {
     // 构造"重装后的磁盘形态"：新版本目录 + package.json 升版（临时副本内）。
     fs.mkdirSync(newImplDir, { recursive: true });
@@ -324,10 +326,10 @@ test("reinstall (version bump + new impl dir) hot-reloads and writes the new hel
     // 直到 DSH 重启不再发；本测试路径未走首次 apply，文件里应一条 hello 都没有）。
     // 新版本信息由**后续每条记录**携带（writeRecord 统一信封带 bridgeVersion），
     // pet 按记录逐条校验，不依赖 hello 刷新。
-    const helloBefore = countHelloIn();
+    const helloBefore = countHelloIn(tempLogRoot);
     await shell.__hotReloadTest.checkReload(fakeCtx());  // 触发重载
     shell.__bridgeTest.flush();
-    const file = path.join(shell.__bridgeTest.bridgeDir(), shell.__bridgeTest.instanceFile);
+    const file = path.join(tempLogRoot, "dsh-pet-bridge", shell.__bridgeTest.instanceFile);
     const records = fs.readFileSync(file, "utf8").trim().split(/\r?\n/).map(JSON.parse);
     const hellos = records.filter((r) => r.event === "bridge/hello");
     assert.equal(hellos.length, helloBefore,
@@ -354,10 +356,11 @@ test("reinstall (version bump + new impl dir) hot-reloads and writes the new hel
     assert.deepEqual(shell.__hotReloadTest.activeStamp(), stampBefore,
       "a second check with no disk change must not re-reload");
     shell.__bridgeTest.flush();
-    assert.equal(countHelloIn(), helloBefore,
+    assert.equal(countHelloIn(tempLogRoot), helloBefore,
       "a second check with no disk change must not re-apply (hello count must not grow)");
   } finally {
-    restoreBridgeDataRoot();
+    if (oldBridgeDir === undefined) delete process.env.DSH_PET_BRIDGE_DIR;
+    else process.env.DSH_PET_BRIDGE_DIR = oldBridgeDir;
     fs.rmSync(tempLogRoot, { recursive: true, force: true });
     // 还原临时副本的 package.json 与 impl 目录（后续测试在 0.3.0 形态上跑）。
     fs.writeFileSync(tempPkgPath, original, "utf8");
@@ -375,8 +378,11 @@ test("same-version repair (content change, version unchanged) hot-reloads via mt
   // probeDisk 的 mtime 判据必须触发重载，且写盘 hello 版本保持原版本。
   const oldWebSocket = globalThis.WebSocket;
   globalThis.WebSocket = undefined;
+  const oldBridgeDir = process.env.DSH_PET_BRIDGE_DIR;
   const tempLogRoot = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-bridge-repair-"));
-  const restoreBridgeDataRoot = redirectBridgeDataRoot(tempLogRoot);
+  // 数据根走插件与桌宠共用的显式入口（三平台同一口径 DSH_PET_BRIDGE_DIR）：
+  // 不再依赖 APPDATA/HOME 的平台差异，也不需要知道平台默认路径长什么样。
+  process.env.DSH_PET_BRIDGE_DIR = path.join(tempLogRoot, "dsh-pet-bridge");
   try {
     const implFile = path.join(tempBridge, "impl", "0.3.0", "index.js");
     const originalProbe = shell.__hotReloadTest.probeDisk();
@@ -385,7 +391,7 @@ test("same-version repair (content change, version unchanged) hot-reloads via mt
     // 首次 apply：建立进程级唯一 hello（tempLogRoot 是独立目录）。
     shell.apply(fakeCtx());
     shell.__bridgeTest.flush();
-    assert.equal(countHelloIn(), 1, "首次 apply 必须恰好写一条 hello");
+    assert.equal(countHelloIn(tempLogRoot), 1, "首次 apply 必须恰好写一条 hello");
     // 模拟"重装副本"：先 touch 时间戳（保证 mtime 变化），再原样写回内容。
     fs.utimesSync(implFile, new Date(Date.now() + 5000), new Date(Date.now() + 5000));
     const changedProbe = shell.__hotReloadTest.probeDisk();
@@ -394,7 +400,7 @@ test("same-version repair (content change, version unchanged) hot-reloads via mt
 
     await shell.__hotReloadTest.checkReload(fakeCtx());
     shell.__bridgeTest.flush();
-    const file = path.join(shell.__bridgeTest.bridgeDir(), shell.__bridgeTest.instanceFile);
+    const file = path.join(tempLogRoot, "dsh-pet-bridge", shell.__bridgeTest.instanceFile);
     const records = fs.readFileSync(file, "utf8").trim().split(/\r?\n/).map(JSON.parse);
     const hellos = records.filter((r) => r.event === "bridge/hello");
     // 修复性重装同样**不重发 hello**（进程级一次性）：hello 数量保持初始 1 条。
@@ -402,7 +408,8 @@ test("same-version repair (content change, version unchanged) hot-reloads via mt
       "repair reload must NOT re-hello (process-level one-time handshake)");
     assert.match(hellos[0].bridgeVersion, /^\d+\.\d+\.\d+/, "hello 版本必须合法 semver");
   } finally {
-    restoreBridgeDataRoot();
+    if (oldBridgeDir === undefined) delete process.env.DSH_PET_BRIDGE_DIR;
+    else process.env.DSH_PET_BRIDGE_DIR = oldBridgeDir;
     fs.rmSync(tempLogRoot, { recursive: true, force: true });
     if (shell && shell.__hotReloadTest && shell.__hotReloadTest.disposeActive) {
       shell.__hotReloadTest.disposeActive();
@@ -425,8 +432,11 @@ test("repeated hot reloads do not accumulate listeners, agent hooks or timers", 
   // 实现侧另有 registerDisposer 兜底清理同一份资源）。
   const oldWebSocket = globalThis.WebSocket;
   globalThis.WebSocket = undefined; // 不建真实 WS（否则 mux 重连定时器会进计数）
+  const oldBridgeDir = process.env.DSH_PET_BRIDGE_DIR;
   const tempLogRoot = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-bridge-leak-"));
-  const restoreBridgeDataRoot = redirectBridgeDataRoot(tempLogRoot);
+  // 数据根走插件与桌宠共用的显式入口（三平台同一口径 DSH_PET_BRIDGE_DIR）：
+  // 不再依赖 APPDATA/HOME 的平台差异，也不需要知道平台默认路径长什么样。
+  process.env.DSH_PET_BRIDGE_DIR = path.join(tempLogRoot, "dsh-pet-bridge");
   const timers = installTimerCounters();
   const { ctx, stats, handlers } = countingCtx();
   const { agent, stats: agentStats } = countingAgent("session-leak-1");
@@ -475,7 +485,8 @@ test("repeated hot reloads do not accumulate listeners, agent hooks or timers", 
     );
   } finally {
     timers.restore();
-    restoreBridgeDataRoot();
+    if (oldBridgeDir === undefined) delete process.env.DSH_PET_BRIDGE_DIR;
+    else process.env.DSH_PET_BRIDGE_DIR = oldBridgeDir;
     fs.rmSync(tempLogRoot, { recursive: true, force: true });
     if (shell && shell.__hotReloadTest && shell.__hotReloadTest.disposeActive) {
       shell.__hotReloadTest.disposeActive();
@@ -493,8 +504,11 @@ test("a contract-mismatching implementation is refused instead of half-installed
   // bridge/diagnostic）。同一份磁盘形态不重复报告（换新构建才重试）。
   const oldWebSocket = globalThis.WebSocket;
   globalThis.WebSocket = undefined;
+  const oldBridgeDir = process.env.DSH_PET_BRIDGE_DIR;
   const tempLogRoot = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-bridge-contract-"));
-  const restoreBridgeDataRoot = redirectBridgeDataRoot(tempLogRoot);
+  // 数据根走插件与桌宠共用的显式入口（三平台同一口径 DSH_PET_BRIDGE_DIR）：
+  // 不再依赖 APPDATA/HOME 的平台差异，也不需要知道平台默认路径长什么样。
+  process.env.DSH_PET_BRIDGE_DIR = path.join(tempLogRoot, "dsh-pet-bridge");
   const driftVersion = "9.9.8";
   const driftImplDir = path.join(tempBridge, "impl", driftVersion);
   const driftImplFile = path.join(driftImplDir, "index.js");
@@ -524,7 +538,7 @@ test("a contract-mismatching implementation is refused instead of half-installed
     assert.equal(shell.BRIDGE_VERSION, beforeVersion, "壳版本常量不得跟随契约不符的实现");
     assert.ok(shell.__hotReloadTest.rejectedStamp, "拒绝必须被记住（否则每 2s 轮询重复报告）");
 
-    const file = path.join(shell.__bridgeTest.bridgeDir(), shell.__bridgeTest.instanceFile);
+    const file = path.join(tempLogRoot, "dsh-pet-bridge", shell.__bridgeTest.instanceFile);
     const readRefusals = () => fs.readFileSync(file, "utf8").trim().split(/\r?\n/)
       .map(JSON.parse)
       .filter((r) => r.event === "bridge/diagnostic" && r.reason === "bridge-contract-mismatch");
@@ -539,7 +553,8 @@ test("a contract-mismatching implementation is refused instead of half-installed
     shell.__bridgeTest.flush();
     assert.equal(readRefusals().length, 1, "同一份被拒绝的形态不得每轮重复报告");
   } finally {
-    restoreBridgeDataRoot();
+    if (oldBridgeDir === undefined) delete process.env.DSH_PET_BRIDGE_DIR;
+    else process.env.DSH_PET_BRIDGE_DIR = oldBridgeDir;
     fs.rmSync(tempLogRoot, { recursive: true, force: true });
     fs.writeFileSync(tempPkgPath, original, "utf8");
     try { fs.rmSync(driftImplDir, { recursive: true, force: true }); } catch {}
@@ -581,8 +596,11 @@ test("reload replays already-live agents into the new implementation", async () 
   // 重放，否则状态聚合与 watchdog 控制会在重载后失效（直到新 agent 创建）。
   const oldWebSocket = globalThis.WebSocket;
   globalThis.WebSocket = undefined;
+  const oldBridgeDir = process.env.DSH_PET_BRIDGE_DIR;
   const tempLogRoot = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-bridge-replay-"));
-  const restoreBridgeDataRoot = redirectBridgeDataRoot(tempLogRoot);
+  // 数据根走插件与桌宠共用的显式入口（三平台同一口径 DSH_PET_BRIDGE_DIR）：
+  // 不再依赖 APPDATA/HOME 的平台差异，也不需要知道平台默认路径长什么样。
+  process.env.DSH_PET_BRIDGE_DIR = path.join(tempLogRoot, "dsh-pet-bridge");
   try {
     // 构造一个"已存在的 agent"：最小桩（id + session.id + ctx.effect/on）。
     const agentStub = {
@@ -614,7 +632,8 @@ test("reload replays already-live agents into the new implementation", async () 
       "reload must replay live agents into the new implementation",
     );
   } finally {
-    restoreBridgeDataRoot();
+    if (oldBridgeDir === undefined) delete process.env.DSH_PET_BRIDGE_DIR;
+    else process.env.DSH_PET_BRIDGE_DIR = oldBridgeDir;
     fs.rmSync(tempLogRoot, { recursive: true, force: true });
     if (shell && shell.__hotReloadTest && shell.__hotReloadTest.disposeActive) {
       shell.__hotReloadTest.disposeActive();

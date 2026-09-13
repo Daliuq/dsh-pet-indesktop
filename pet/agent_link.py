@@ -45,6 +45,7 @@ from .agent_event_normalizer import normalize_event
 from .bridge_contract import (
     BRIDGE_PROTOCOL_VERSION,
     BRIDGE_VERSION,
+    resolve_bridge_dir,
     validate_bridge_record,
 )
 from .model_access_tracker import ModelAccessTracker
@@ -1635,9 +1636,10 @@ class DshMonitor(BaseAgentMonitor):
     def __init__(self, agent_key: str, config_dir: Path, parent=None) -> None:
         super().__init__(agent_key, config_dir, parent)
         # 桥目录与变体无关：config_dir = <base>/dsh-pet-standalone[-variant] → parent = <base>
-        # 不变量：插件写 <base>/dsh-pet-bridge/（win32 即 %APPDATA%），
-        # 若未来数据目录支持自定义根，两侧必须同步改（当前 Config 结构保证 parent==base）。
-        self.events_dir = self.config_dir.parent / "dsh-pet-bridge"
+        # 不变量：插件写 <base>/dsh-pet-bridge/（win32 即 %APPDATA%）。
+        # 两侧同源解析：显式覆盖（DSH_PET_BRIDGE_DIR）优先，未设时等价于
+        # config_dir.parent/"dsh-pet-bridge"——与插件 impl 的 bridgeDir() 同一口径。
+        self.events_dir = resolve_bridge_dir(self.config_dir)
         # 多 DSH 实例分区写入（P0-2）：生产端每个实例写 dsh-{pid}.jsonl，
         # 消费端 glob 全部 dsh*.jsonl（兼容旧版单文件 dsh.jsonl）。
         # events_file 保留为旧字段名（兼容既有调用/测试），实际读取走 DirGlobTailer。

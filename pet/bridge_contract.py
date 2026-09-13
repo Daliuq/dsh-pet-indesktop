@@ -9,12 +9,46 @@ protocol bump.
 
 from __future__ import annotations
 
+import os
 import re
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping
 
 BRIDGE_PROTOCOL_VERSION = 1
 BRIDGE_VERSION = "0.3.0"
+
+# 桥目录的显式覆盖入口：与插件（integrations/dsh-pet-bridge/impl/*/index.js 的
+# BRIDGE_DIR_ENV）同名同语义。设置时**取代**平台默认路径；两边必须看到同一个值，
+# 否则插件写一个目录、桌宠读另一个目录。
+BRIDGE_DIR_ENV = "DSH_PET_BRIDGE_DIR"
+BRIDGE_DIR_NAME = "dsh-pet-bridge"
+
+
+def resolve_bridge_dir(config_dir: str | os.PathLike[str] | None = None) -> Path:
+    """桥目录：显式覆盖 > config_dir 的父目录 > 平台默认。
+
+    为什么需要"显式覆盖"这一层：桥目录是插件与桌宠的**跨侧约定**，平台默认路径
+    在三平台各不相同（win32=%APPDATA%、darwin=~/Library/Application Support、
+    其他=~/.config），于是"把数据根指到别处"这件事（CI/多实例/便携部署/测试隔离）
+    在 POSIX 上只能靠改 HOME 之类的环境技巧——那是在拿平台细节绕过产品行为。
+    给它一个正式入口后，两边读同一个变量、行为与平台无关。
+
+    生产环境里 `config_dir` 的父目录就是平台默认数据根，因此不给 config_dir 时
+    用平台分支、给了就用其父目录，两者在真实运行时等价（保留 config_dir 派生是
+    为了兼容便携/自定义配置目录的部署，以及测试里把配置目录指向临时目录的用法）。
+    """
+    override = os.environ.get(BRIDGE_DIR_ENV, "").strip()
+    if override:
+        return Path(override).expanduser()
+    if config_dir is not None:
+        return Path(config_dir).parent / BRIDGE_DIR_NAME
+    if os.name == "nt":
+        return Path(os.environ.get("APPDATA") or Path.home()) / BRIDGE_DIR_NAME
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / BRIDGE_DIR_NAME
+    return Path.home() / ".config" / BRIDGE_DIR_NAME
 
 # Keep this list in lock-step with integrations/dsh-pet-bridge/index.js.  The
 # bridge's writeRecord helper defaults event to AgentStatus, so that baseline is

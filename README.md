@@ -388,6 +388,7 @@ pythonw -m pet
 - **开机即按配置装配（PR #100 / #102）**：重启后已开启的 Agent 联动与主动识屏直接生效，不再需要手动展开一次菜单或开关一次设置对话框。
 - **首次安装要重启一次 DSH（热安装 ≠ 热生效）**：第一次装桥接插件只把包写进 profile，**运行中的 DSH 不会加载新插件**——必须重启一次 DSH 联动才开始工作（桌宠会在安装成功时冒泡提示「请重启 DSH」）。此后**重装/升级桥接走热重载**：插件壳每 2s 探测磁盘版本，换包后 ≤2s 自动换上新实现，不用再重启；但**协议/事件清单变更例外**——壳的协议常量被 DSH 缓存、热重载只换实现层，壳检测到新实现契约不一致时会拒绝激活（旧实现继续工作）并提示「请重启 DSH 以更新桥接协议」。
 - **自定义联动 Agent**：在 `config.json` 的 `agent_link.custom_agents` 里声明任意 Agent（key / 显示名 / 事件文件路径），桌宠即对其 JSONL 事件文件做只读监听，联动行为与内置 Agent 一致——不改代码即可接入任何能写本地文件的 Agent，协议详见 `docs/AGENT_LINK_PROTOCOL.md`。
+- **桥目录可显式指定**：设环境变量 `DSH_PET_BRIDGE_DIR`（绝对路径）即取代平台默认的桥目录（`%APPDATA%\dsh-pet-bridge` / `~/Library/Application Support/dsh-pet-bridge` / `~/.config/dsh-pet-bridge`）；插件与桌宠读同一个变量、必须同值，用途是 CI 数据隔离／多实例／便携部署——不设时行为不变（详见 `docs/AGENT_LINK_PROTOCOL.md` §2.1.1）。
 - **一键启动 DSH**：本机已在跑 dsh web（含官方 3080）时直接复用，不再拉起第二个实例；Windows 上 node/pnpm 解析覆盖 nvm-windows/nvm/fnm/Volta/scoop 等布局（PR #97 修掉「已装 pnpm 仍装不上插件」，issue #95），也可用 `pnpm_bin` 配置键手动指定 pnpm 入口。
 
 ### 看看屏幕（Chat 版）

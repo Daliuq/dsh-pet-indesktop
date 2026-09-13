@@ -41,6 +41,30 @@ Agent 侧（写方）                          桌宠侧（读方）
 | macOS | `~/Library/Application Support/dsh-pet-standalone[-变体]/agent-events/` |
 | Linux | `~/.config/dsh-pet-standalone[-变体]/agent-events/` |
 
+### 2.1.1 DSH 桥接目录（插件 ↔ 桌宠的跨侧约定）
+
+内置 DSH 桥接插件不写 `agent-events/`，而是写**数据基目录下的桥目录**：
+
+```
+<数据基目录>/dsh-pet-bridge/dsh-{pid}.jsonl          # 多实例分区写入；消费端 glob dsh*.jsonl
+<数据基目录>/dsh-pet-bridge/watchdog-request-*.json  # 探索循环 Watchdog 控制队列（请求/回执）
+```
+
+`<数据基目录>` 的平台默认值与 §2.1 同源，只是少一层应用目录：
+
+| 平台 | 桥目录 |
+|---|---|
+| Windows | `%APPDATA%\dsh-pet-bridge\` |
+| macOS | `~/Library/Application Support/dsh-pet-bridge/` |
+| Linux | `~/.config/dsh-pet-bridge/` |
+
+**显式覆盖**：设置环境变量 `DSH_PET_BRIDGE_DIR`（绝对路径）即**取代**上表的平台默认值。
+插件（`integrations/dsh-pet-bridge/impl/*/index.js::bridgeDir`）与桌宠
+（`pet/bridge_contract.py::resolve_bridge_dir`，被 `DshMonitor`、`DshStateTracker`、
+`dsh_control` 三处消费）读**同一个变量**；两边必须同值，否则插件写一个目录、桌宠读
+另一个目录（表现为"桌宠收不到桥接状态"）。用途：CI/自动化测试的数据隔离、多实例
+部署、便携安装；**不设该变量时行为与平台默认完全一致**。
+
 ### 2.2 JSON 行格式
 
 文件每行一个 JSON 对象（JSON Lines，UTF-8 追加写）：

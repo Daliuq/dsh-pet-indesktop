@@ -11,13 +11,17 @@ from PySide6.QtWidgets import QApplication
 
 from pet.agent_link import DshMonitor
 from pet.agent_link import AgentLinkManager
+from pet import dsh_control
 from pet.bridge_contract import (
     BRIDGE_CAPABILITIES,
+    BRIDGE_DIR_ENV,
     BRIDGE_EVENT_INVENTORY,
     BRIDGE_PROTOCOL_VERSION,
     BRIDGE_VERSION,
+    resolve_bridge_dir,
 )
 from pet.config import Config
+from pet.dsh_state import DshStateTracker
 
 
 def _qapp() -> QApplication:
@@ -544,3 +548,48 @@ def test_first_install_success_prompts_restart(tmp_path):
     assert not any("请重启" in b or "请启动" in b for b in bubbles), \
         f"刷新成功不得提示重启/启动（热重载已接手）: {bubbles}"
     manager.shutdown()
+
+
+def test_bridge_dir_override_wins_over_platform_defaults(tmp_path, monkeypatch):
+    """桥目录的显式覆盖入口：三平台同一口径，优先于 config_dir 派生与平台默认。
+
+    为什么需要它（本次 CI 红的根因）：桥目录是插件与桌宠的**跨侧约定**，平台默认
+    路径三平台各不相同；没有正式入口时"把数据根指到别处"（CI 数据隔离／多实例／
+    便携部署）在 POSIX 上只能靠改 HOME 之类的环境技巧——那是拿平台细节绕过产品
+    行为，测试也就只在部分平台成立（实测：只设 APPDATA 的隔离在 macOS 上等于没设，
+    记录被写进 runner 真实家目录、断言却去临时目录读 → ENOENT）。
+    """
+    target = tmp_path / "custom-bridge"
+    # 与插件（impl/*/index.js 的 BRIDGE_DIR_ENV）同名是契约的一部分：
+    # 两边必须读同一个变量名，否则各自写/读不同的目录而没人报错。
+    assert BRIDGE_DIR_ENV == "DSH_PET_BRIDGE_DIR"
+    monkeypatch.setenv(BRIDGE_DIR_ENV, str(target))
+    assert resolve_bridge_dir() == target
+    assert resolve_bridge_dir(tmp_path / "config") == target
+    assert Path(dsh_control._bridge_dir()) == target
+
+
+def test_bridge_dir_without_override_keeps_the_existing_rules(tmp_path, monkeypatch):
+    """不设覆盖时，桥目录必须与既有规则逐字一致（默认行为零变化）。"""
+    monkeypatch.delenv(BRIDGE_DIR_ENV, raising=False)
+    config_dir = tmp_path / "config"
+    assert resolve_bridge_dir(config_dir) == tmp_path / "dsh-pet-bridge"
+    # 不给 config_dir（dsh_control 的用法）→ 平台默认，且与共享解析同源
+    assert Path(dsh_control._bridge_dir()) == resolve_bridge_dir()
+
+
+def test_bridge_consumers_read_the_overridden_dir(tmp_path, monkeypatch):
+    """覆盖生效时，桌宠两个消费端必须都去同一个目录读——否则插件写一个、桌宠读另一个。"""
+    target = tmp_path / "bridge"
+    monkeypatch.setenv(BRIDGE_DIR_ENV, str(target))
+    _qapp()
+    monitor = DshMonitor("dsh", tmp_path / "config")
+    try:
+        assert Path(monitor.events_dir) == target
+    finally:
+        monitor.stop()
+    tracker = DshStateTracker(tmp_path / "config", parent=None, scan_interval=0.0)
+    try:
+        assert Path(tracker._bridge_dir) == target
+    finally:
+        tracker.stop()
