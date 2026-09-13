@@ -1361,7 +1361,11 @@ let flushTimer = null;
 let bridgeDirReadyPath = "";
 
 function flushPending() {
-  flushTimer = null;
+  // 提前收尾时把还在飞的合批 timer 一起撤掉：只把 flushTimer 置 null 的话，
+  // 那个 handle 仍会在事件循环里活到 80ms 后空转一次——dispose（热重载/插件
+  // 卸载）后留下无主 timer，热重载 N 次的"不残留"断言会把它当泄漏抓出来。
+  // 由 timer 回调调用本函数时 handle 已触发，clearTimeout 是 no-op。
+  if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
   if (writeQueue.length === 0) return;
   const batch = writeQueue.splice(0, writeQueue.length).join("");
   try {
@@ -2006,6 +2010,14 @@ export function apply(ctx, inheritedAgents = null, opts = null) {
 }
 
 export { inject };
+// 壳（index.js）在**拒绝一次契约不符的热重载**时用这个出口把原因送到 Pet 侧：
+// 壳的协议常量被 DSH 缓存住、热重载只换 impl，新 impl 契约不一致时壳拒绝激活
+// 并保留旧实现；此时唯一能让用户知道"需重启 DSH"的通道就是一条桥接记录。
+// 它不是测试 seam，而是与壳约定的公开出口（壳读不到该出口时只剩 DSH 日志，
+// 拒绝行为本身不受影响）；默认 severity=warn，壳拒绝时显式传 "error"。
+export function writeBridgeDiagnostic(payload = {}) {
+  writeRecord({ event: "bridge/diagnostic", severity: "warn", ...payload });
+}
 // Kept private-by-convention: package tests use this surface to exercise the
 // control boundary without starting a DSH host or touching the real queue.
 export const __controlTest = { controlAgent, handleControlRequest, liveAgents, knownSessions };

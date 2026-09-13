@@ -1257,6 +1257,10 @@ class BaseAgentMonitor(QObject):
     # (agent_key, validation-detail) —— 桥接契约校验失败（版本化 hello/记录不
     # 符合 Pet 期望）：Manager 弹「桥接与桌宠版本不对齐」提示。
     bridge_incompatible = Signal(str, object)
+    # (agent_key, record) —— 桥接自诊断记录（bridge/diagnostic）。severity=error
+    # 的必须让用户看见：壳拒绝一次契约不符的热重载时只剩这条通道（否则用户只
+    # 看到"桌宠没反应"）——Manager 弹「需重启 DSH」提示，其余只留日志。
+    bridge_diagnostic = Signal(str, object)
 
     def __init__(self, agent_key: str, config_dir: Path, parent=None) -> None:
         super().__init__(parent)
@@ -1569,6 +1573,11 @@ class BaseAgentMonitor(QObject):
                 # 用户介入信号：user_action（审批决定/回答）→ 关闭对应弹窗
                 if ev == "user_action":
                     self._emit(self.user_action, (self.agent_key, data))
+                # 桥接自诊断：桥进程启动时的常规 diagnostic 只留日志；severity=error
+                # 的（壳拒绝一次契约不符的热重载：需重启 DSH 更新协议）必须让用户
+                # 看见——否则症状只是"桌宠莫名没反应"，日志里也无迹可寻。
+                if ev == "bridge/diagnostic":
+                    self._emit(self.bridge_diagnostic, (self.agent_key, data))
                 # 未知桥接事件：DSH 桥接写出的、Pet 全部识别路径（语义层/状态机/
                 # 直通名单）都不认识的事件名 → 大概率 bridge 与桌宠版本不匹配，
                 # 呈递给 Manager 弹「更新/重装 bridge」提醒。claude/cursor 的
@@ -1609,8 +1618,18 @@ class DshMonitor(BaseAgentMonitor):
     """
 
     PLUGIN_NAME = "@dsh-pet/bridge"
-    # DSH 桥接是随桌宠捆绑的**版本化契约生产者**：hello 携带协议/版本/事件清单，
-    # 记录逐条校验（validate_bridge_record），不兼容即弹「更新/重装 bridge」。
+    # DSH 桥接是随桌宠捆绑的**版本化契约生产者**：每条记录都被逐条校验
+    # （pet/bridge_contract.py::validate_bridge_record），fail-closed——校验不过
+    # 直接拒绝该记录并弹「更新/重装 bridge」。必需字段就地对应如下：
+    #   1) bridgeProtocolVersion：必须存在且 == BRIDGE_PROTOCOL_VERSION（写盘信封
+    #      里每条都带，不是 hello 专属）；
+    #   2) bridgeVersion：必须存在且是合法 semver 的字符串（版本号本身不参与
+    #      比较——热重载后版本前进不误报）；
+    #   3) event：必须是 BRIDGE_EVENT_INVENTORY 内的名字；
+    #   4) 事件清单（emittedEvents 等四个别名之一）：hello **必须**携带，普通记录
+    #      可选，但一旦携带就必须与 Pet 清单作为集合完全相等（无重复项）；
+    #   5) capabilities：仅 hello 校验，必须与 BRIDGE_CAPABILITIES 完全相等。
+    # 契约不符的提示与日志见 _on_bridge_incompatible（含 reason/版本对照）。
     _enforce_bridge_contract = True
 
     def __init__(self, agent_key: str, config_dir: Path, parent=None) -> None:
@@ -2527,6 +2546,7 @@ class AgentLinkManager(QObject):
         self.monitors["dsh"].user_action.connect(self._on_user_action)
         self.monitors["dsh"].unknown_bridge_event.connect(self._on_unknown_bridge_event)
         self.monitors["dsh"].bridge_incompatible.connect(self._on_bridge_incompatible)
+        self.monitors["dsh"].bridge_diagnostic.connect(self._on_bridge_diagnostic)
         # 检测器提醒跨模块节流（N2）：stuck / pattern / exploration watchdog 三个
         # 检测器各有独立 cooldown，但同一 busy 周期可能先后各自弹窗造成连环换弹。
         # 按 agent/session 记最近一次**任一**检测器弹窗时刻与档位，窗口内同档
@@ -4827,12 +4847,20 @@ class AgentLinkManager(QObject):
         捆绑的版本化契约），不兼容即拒绝该记录并弹此事件。**不兼容是必需健康
         反馈，不受事件汇报概率门控制**（门 0 也弹——否则版本不对齐会被静默
         吞掉、桌宠一直收不到状态）；仅按冷却窗口限频（不兼容记录可能成串）。
+
+        为什么必须同时落日志：这条路径此前只有气泡（还带限频），出现"契约
+        fail-closed 后桌宠整体没反应"时用户和排查者都拿不到原因——日志里
+        必须有 reason/收到与期望的版本，才能区分"桥接版本不对齐"与"桥接没跑"。
         """
         if not isinstance(detail, dict):
             return
         now = self._clock()
         last = self._unknown_bridge_reminded_at.get(agent_key)
         if last is not None and now - last < self._UNKNOWN_BRIDGE_REMIND_COOLDOWN_S:
+            log.debug(
+                "[dsh-pet-bridge] 桥接契约校验失败（限频窗口内不再提醒）: %s",
+                json.dumps(detail, ensure_ascii=False, default=str)[:400],
+            )
             return
         self._unknown_bridge_reminded_at[agent_key] = now
         name = self.agent_names.get(agent_key, agent_key)
@@ -4840,6 +4868,16 @@ class AgentLinkManager(QObject):
         expected = detail.get("expectedBridgeVersion")
         recv_proto = detail.get("receivedProtocolVersion")
         expected_proto = detail.get("expectedProtocolVersion")
+        log.warning(
+            "[dsh-pet-bridge] 桥接契约校验失败，已拒绝该记录：reason=%s；"
+            "收到 bridge=%s/协议=%s，期望 bridge=%s/协议=%s；事件清单=%s",
+            detail.get("reason") or "(未标注)",
+            received or "?",
+            recv_proto if recv_proto is not None else "?",
+            expected or "?",
+            expected_proto,
+            json.dumps(detail.get("receivedEventInventory") or [], ensure_ascii=False)[:300],
+        )
         version_hint = ""
         if received or recv_proto:
             version_hint = (
@@ -4853,6 +4891,46 @@ class AgentLinkManager(QObject):
             "请更新或重装 bridge 插件",
             duration_ms=6000,
         )
+
+    def _on_bridge_diagnostic(self, agent_key: str, record: dict) -> None:
+        """桥接自诊断记录（bridge/diagnostic）：error 级必须让用户看见。
+
+        常规 diagnostic 是桥进程启动时写一次的环境信息（bridgeDir/instanceFile/
+        appData），没有 severity——只留 debug 日志。severity=error 的是桥侧主动
+        上报的异常，目前唯一来源是**壳拒绝一次契约不符的热重载**：新实现的协议/
+        事件清单与壳不一致，壳保留旧实现并提示"需重启 DSH 以更新桥接协议"。
+        这条通道必须弹气泡——否则用户侧症状只是"桌宠没反应"，日志里也没有。
+        与 _on_bridge_incompatible 同属**必需健康反馈**：不受事件汇报概率门控制，
+        仅按冷却窗口限频（诊断可能成串上报）。
+        """
+        if not isinstance(record, dict):
+            return
+        severity = str(record.get("severity") or "").strip().lower()
+        reason = str(record.get("reason") or "").strip()
+        message = str(record.get("message") or "").strip()
+        if severity != "error":
+            log.debug(
+                "[dsh-pet-bridge] 桥接诊断（severity=%s）: %s",
+                severity or "(无)",
+                json.dumps(record, ensure_ascii=False, default=str)[:300],
+            )
+            return
+        log.warning(
+            "[dsh-pet-bridge] 桥接自诊断 severity=error reason=%s：%s",
+            reason or "(未标注)",
+            message or json.dumps(record, ensure_ascii=False, default=str)[:400],
+        )
+        # 冷却窗口按 (agent, 诊断) 命名空间计数：不能与"未知事件/不兼容"提醒互相
+        # 挤掉（同一 agent 两类健康反馈可能同时出现）。
+        key = f"{agent_key}:diagnostic"
+        now = self._clock()
+        last = self._unknown_bridge_reminded_at.get(key)
+        if last is not None and now - last < self._UNKNOWN_BRIDGE_REMIND_COOLDOWN_S:
+            return
+        self._unknown_bridge_reminded_at[key] = now
+        name = self.agent_names.get(agent_key, agent_key)
+        text = message or "桥接上报了异常诊断"
+        self.win.show_bubble(f"{name} {text[:200]}", duration_ms=6000)
 
     def _on_unknown_bridge_event(self, agent_key: str, record: dict) -> None:
         """DSH 桥接写出的未知事件 → 提醒用户更新/重装 bridge。

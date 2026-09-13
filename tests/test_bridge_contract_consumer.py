@@ -411,6 +411,108 @@ def test_control_and_diagnostic_events_reach_a_consumer(tmp_path):
     monitor.stop()
 
 
+def test_error_diagnostic_reaches_the_bridge_diagnostic_signal(tmp_path):
+    """severity=error 的 bridge/diagnostic 必须走专用信号（不能只落 raw_record）。
+
+    生产来源：壳拒绝一次"契约不符的热重载"——它保留旧实现（正确），但用户侧
+    症状只是"桌宠没反应"；没有这条通道，原因在 Pet 侧完全不可见。"""
+    _qapp()
+    monitor = DshMonitor("dsh", tmp_path / "config")
+    seen = []
+    monitor.bridge_diagnostic.connect(lambda *args: seen.append(args))
+    monitor.events_file.parent.mkdir(parents=True, exist_ok=True)
+    monitor.events_file.touch()
+    monitor._poll()
+    _append(monitor.events_file, _record(
+        "bridge/diagnostic",
+        severity="error",
+        reason="bridge-contract-mismatch",
+        message="impl 9.9.9 的桥接契约与壳不一致……请重启 DSH 以更新桥接协议。",
+    ))
+    monitor._poll()
+    assert seen, "error 级诊断必须转发到 bridge_diagnostic 信号"
+    assert seen[0][1]["reason"] == "bridge-contract-mismatch"
+    monitor.stop()
+
+
+def test_error_diagnostic_bubbles_once_while_plain_diagnostic_stays_quiet(tmp_path, caplog):
+    """error 级诊断弹气泡并要求重启 DSH；常规诊断只留日志、不打扰用户。"""
+    import logging
+
+    _qapp()
+    bubbles = []
+
+    class DummyWindow:
+        def isVisible(self):
+            return True
+
+        def show_bubble(self, text, duration_ms=3000):
+            bubbles.append(text)
+
+    cfg = Config(base=tmp_path)
+    manager = AgentLinkManager(DummyWindow(), cfg, min_interval=0)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="dsh-pet-standalone"):
+            # 常规诊断（桥进程启动写一次的环境信息，无 severity）：不弹气泡
+            manager._on_bridge_diagnostic("dsh", {"event": "bridge/diagnostic", "bridgeDir": "X"})
+            assert bubbles == [], f"常规诊断不得弹气泡: {bubbles}"
+
+            detail = {
+                "event": "bridge/diagnostic",
+                "severity": "error",
+                "reason": "bridge-contract-mismatch",
+                "message": "impl 9.9.9 的桥接契约与壳不一致，已拒绝激活；请重启 DSH 以更新桥接协议。",
+            }
+            manager._on_bridge_diagnostic("dsh", detail)
+            assert any("重启 DSH" in text for text in bubbles), f"error 诊断必须弹气泡: {bubbles}"
+            assert any(
+                "severity=error" in record.getMessage() and "bridge-contract-mismatch" in record.getMessage()
+                for record in caplog.records
+            ), [record.getMessage() for record in caplog.records]
+
+            # 冷却窗口内不重复弹（诊断可能成串上报）
+            bubbles.clear()
+            manager._on_bridge_diagnostic("dsh", detail)
+            assert bubbles == [], "同一 agent 冷却窗口内不得重复弹诊断气泡"
+    finally:
+        manager.shutdown()
+
+
+def test_bridge_incompatible_leaves_the_reason_in_the_log(tmp_path, caplog):
+    """契约 fail-closed 必须在日志里留下明确原因（否则只剩"桌宠没反应"）。"""
+    import logging
+
+    _qapp()
+    bubbles = []
+
+    class DummyWindow:
+        def isVisible(self):
+            return True
+
+        def show_bubble(self, text, duration_ms=3000):
+            bubbles.append(text)
+
+    cfg = Config(base=tmp_path)
+    manager = AgentLinkManager(DummyWindow(), cfg, min_interval=0)
+    try:
+        with caplog.at_level(logging.WARNING, logger="dsh-pet-standalone"):
+            manager._on_bridge_incompatible("dsh", {
+                "reason": "unsupported bridge protocol version",
+                "receivedBridgeVersion": "0.4.0",
+                "receivedProtocolVersion": 2,
+                "expectedBridgeVersion": BRIDGE_VERSION,
+                "expectedProtocolVersion": BRIDGE_PROTOCOL_VERSION,
+                "receivedEventInventory": [],
+            })
+        assert bubbles, "不兼容仍应弹气泡（既有行为不变）"
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("桥接契约校验失败" in message for message in messages), messages
+        assert any("unsupported bridge protocol version" in message for message in messages), messages
+        assert any("0.4.0" in message and "协议=2" in message for message in messages), messages
+    finally:
+        manager.shutdown()
+
+
 def test_first_install_success_prompts_restart(tmp_path):
     """首次安装成功必须提示重启 DSH（运行中的 DSH 不自动加载新装插件）。
 

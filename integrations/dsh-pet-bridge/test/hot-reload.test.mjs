@@ -24,8 +24,9 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 // 副本（.hr-test-<rand>/），再从副本动态 import 壳——壳的 bridgeBaseDir 由
 // import.meta.url 决定，天然指向副本，生产代码不需要任何测试 seam。所有对
 // package.json/impl 的写操作都发生在副本上，绝不改真实工作区文件——测试
-// 崩溃/被杀也不污染仓库。临时副本放在桥包内是为了让 impl 的 @deepseek-ai/*
-// 依赖沿副本目录向上找到桥包的 node_modules。
+// 崩溃/被杀也不污染仓库。临时副本放在桥包内（而不是 os.tmpdir()）是为了让
+// 相对导入与包内 node_modules 解析行为与真实安装一致（当前 impl 只用 Node
+// 内置模块，但这层保险不依赖于"实现层永远零依赖"）。
 //
 // 注意：before() 内动态 import 而非顶层 await import——Node 24 test runner
 // 对含顶层 await 的测试文件有事件循环不退出问题（nodejs/node#58227）。
@@ -103,6 +104,114 @@ function fakeCtx() {
     on() { return () => {}; },
     effect() {},
     get() { return undefined; },
+  };
+}
+
+// ===== 计数的假上下文/假 agent（泄漏断言用）=====
+// ctx.on 的活跃数由返回的 disposer 递减：这正是壳/实现 dispose 契约要清理的
+// 那一类资源（陈旧回调 + 双重派发）。ctx.effect 的 fiber 级 effect 不在计数内
+// ——它由插件 fiber 卸载统一清理，而热重载不重建 fiber（见测试内说明）。
+function countingCtx() {
+  const stats = { onActive: 0, onPeak: 0 };
+  const handlers = new Map();
+  const track = (event, fn) => {
+    const list = handlers.get(event) || [];
+    list.push(fn);
+    handlers.set(event, list);
+  };
+  return {
+    stats,
+    handlers,
+    ctx: {
+      on(event, fn) {
+        stats.onActive += 1;
+        stats.onPeak = Math.max(stats.onPeak, stats.onActive);
+        track(event, fn);
+        return () => {
+          stats.onActive -= 1;
+          const list = handlers.get(event) || [];
+          const index = list.indexOf(fn);
+          if (index >= 0) list.splice(index, 1);
+        };
+      },
+      effect(fn) {
+        const cleanup = typeof fn === "function" ? fn() : null;
+        return () => { if (typeof cleanup === "function") cleanup(); };
+      },
+      get() { return undefined; },
+    },
+  };
+}
+
+/** 假 agent：agent.ctx 的 on/effect 活跃数同样按 disposer 递减。 */
+function countingAgent(id) {
+  const stats = { onActive: 0, effectActive: 0 };
+  const agent = {
+    id,
+    session: { id },
+    name: "DSH",
+    ctx: {
+      on() {
+        stats.onActive += 1;
+        return () => { stats.onActive -= 1; };
+      },
+      effect(fn) {
+        stats.effectActive += 1;
+        // DSH 语义：effect 回调**立即执行**（登记监听），返回的清理函数在
+        // effect 卸载时调用——因此这里立刻跑 fn()，与生产一致。
+        const cleanup = typeof fn === "function" ? fn() : null;
+        let cleaned = false;
+        return () => {
+          if (cleaned) return;
+          cleaned = true;
+          stats.effectActive -= 1;
+          if (typeof cleanup === "function") cleanup();
+        };
+      },
+    },
+  };
+  return { agent, stats };
+}
+
+/** 统计"未清理的 timer"：回调已触发的 timeout 视为已完结，不再计入。 */
+function installTimerCounters() {
+  const originals = {
+    setInterval: globalThis.setInterval,
+    setTimeout: globalThis.setTimeout,
+    clearInterval: globalThis.clearInterval,
+    clearTimeout: globalThis.clearTimeout,
+  };
+  const pending = new Set();
+  const stats = { created: 0 };
+  globalThis.setInterval = (...args) => {
+    const handle = originals.setInterval(...args);
+    pending.add(handle);
+    stats.created += 1;
+    return handle;
+  };
+  globalThis.setTimeout = (fn, ms, ...rest) => {
+    const handle = originals.setTimeout((...cbArgs) => {
+      pending.delete(handle);
+      return typeof fn === "function" ? fn(...cbArgs) : undefined;
+    }, ms, ...rest);
+    pending.add(handle);
+    stats.created += 1;
+    return handle;
+  };
+  globalThis.clearInterval = (handle) => { pending.delete(handle); return originals.clearInterval(handle); };
+  globalThis.clearTimeout = (handle) => { pending.delete(handle); return originals.clearTimeout(handle); };
+  return {
+    stats,
+    pendingCount: () => pending.size,
+    /** 打点：之后用 pendingSince() 统计"本窗口内新建且仍未清掉"的 timer。 */
+    mark: () => new Set(pending),
+    pendingSince: (mark) => [...pending].filter((handle) => !mark.has(handle)).length,
+    restore() {
+      globalThis.setInterval = originals.setInterval;
+      globalThis.setTimeout = originals.setTimeout;
+      globalThis.clearInterval = originals.clearInterval;
+      globalThis.clearTimeout = originals.clearTimeout;
+    },
   };
 }
 
@@ -296,6 +405,171 @@ test("same-version repair (content change, version unchanged) hot-reloads via mt
     if (oldWebSocket === undefined) delete globalThis.WebSocket;
     else globalThis.WebSocket = oldWebSocket;
   }
+});
+
+test("repeated hot reloads do not accumulate listeners, agent hooks or timers", async () => {
+  // 为什么必须有这条断言：import(`?t=`) 破坏的是 ESM 缓存命中，**不能卸载**
+  // 已 import 的模块——每次重载都新增一份模块图。次数少（几次重装/会话）时
+  // 无害，但它把 dispose() 从"好习惯"变成正确性前提：漏解一个监听器/timer/
+  // 订阅，就会陈旧回调 + 双重派发，而且症状是"用久了才犯"的慢性病。这里反复
+  // 重载（含存活 agent 的重放路径）后断言：
+  //   1) 活跃 ctx.on 监听数、agent 级 on/effect 活跃数不随重载次数增长；
+  //   2) 全部 dispose 之后，本测试窗口内由实现创建的 timer 一个不剩。
+  // 计数口径：ctx.on 的活跃数由返回的 disposer 递减；ctx.effect 注册的 fiber
+  // 级 effect 不计入（它由插件 fiber 卸载统一清理，而热重载不重建 fiber——
+  // 实现侧另有 registerDisposer 兜底清理同一份资源）。
+  const oldWebSocket = globalThis.WebSocket;
+  globalThis.WebSocket = undefined; // 不建真实 WS（否则 mux 重连定时器会进计数）
+  const oldAppData = process.env.APPDATA;
+  const tempLogRoot = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-bridge-leak-"));
+  process.env.APPDATA = tempLogRoot;
+  const timers = installTimerCounters();
+  const { ctx, stats, handlers } = countingCtx();
+  const { agent, stats: agentStats } = countingAgent("session-leak-1");
+  const implFile = path.join(tempBridge, "impl", "0.3.0", "index.js");
+  let mtime = Date.now() + 60000;
+  const reloadOnce = async () => {
+    fs.utimesSync(implFile, new Date(mtime), new Date(mtime));
+    mtime += 1000;
+    await shell.__hotReloadTest.checkReload(ctx);
+    shell.__bridgeTest.flush();
+  };
+  const snapshot = () => ({
+    ctxListeners: stats.onActive,
+    agentListeners: agentStats.onActive,
+    agentEffects: agentStats.effectActive,
+  });
+  try {
+    if (shell.__hotReloadTest.disposeActive) shell.__hotReloadTest.disposeActive();
+    const mark = timers.mark();
+    // 基线：一份实现实例 + 一个存活 agent（后续重载经壳的 agent 快照重放）。
+    await reloadOnce();
+    const created = handlers.get("agent/created") || [];
+    assert.ok(created.length > 0, "impl must register an agent/created handler");
+    for (const fn of created) fn({ agent });
+    const baseline = snapshot();
+    assert.ok(baseline.ctxListeners > 0, "基线必须包含活跃监听（否则断言空转）");
+    assert.ok(
+      baseline.agentListeners > 0 && baseline.agentEffects > 0,
+      "基线必须包含 agent 级监听/effect（否则断言空转）",
+    );
+
+    for (let i = 0; i < 20; i += 1) await reloadOnce();
+
+    assert.deepEqual(
+      snapshot(),
+      baseline,
+      "热重载 20 次后活跃监听/effect 数必须回到同一水平（不漏解、也不累积）",
+    );
+
+    // dispose 全部收尾：窗口内创建的 timer 必须一个不剩。
+    shell.__hotReloadTest.disposeActive();
+    assert.equal(
+      timers.pendingSince(mark),
+      0,
+      "dispose 后不得留下本实例创建的 timer（合批 flush / control queue / 元数据刷新）",
+    );
+  } finally {
+    timers.restore();
+    process.env.APPDATA = oldAppData;
+    fs.rmSync(tempLogRoot, { recursive: true, force: true });
+    if (shell && shell.__hotReloadTest && shell.__hotReloadTest.disposeActive) {
+      shell.__hotReloadTest.disposeActive();
+    }
+    if (oldWebSocket === undefined) delete globalThis.WebSocket;
+    else globalThis.WebSocket = oldWebSocket;
+  }
+});
+
+test("a contract-mismatching implementation is refused instead of half-installed", async () => {
+  // 壳的协议常量被 DSH 缓存（热重载只换 impl/<version>/）。若新 impl 改了
+  // 协议/事件清单，旧行为是"把新实现挂上 → Pet 逐条严格校验拒收 → 该 agent
+  // 联动整体失效"，用户只看到一条限频气泡。现在必须在 apply 之前比对并拒绝：
+  // 旧实现继续工作、版本常量不前进，且原因要送到 Pet 侧（severity=error 的
+  // bridge/diagnostic）。同一份磁盘形态不重复报告（换新构建才重试）。
+  const oldWebSocket = globalThis.WebSocket;
+  globalThis.WebSocket = undefined;
+  const oldAppData = process.env.APPDATA;
+  const tempLogRoot = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-bridge-contract-"));
+  process.env.APPDATA = tempLogRoot;
+  const driftVersion = "9.9.8";
+  const driftImplDir = path.join(tempBridge, "impl", driftVersion);
+  const driftImplFile = path.join(driftImplDir, "index.js");
+  try {
+    const source = fs.readFileSync(path.join(tempBridge, "impl", "0.3.0", "index.js"), "utf8");
+    const tampered = source.replace(
+      '"agent_reasoning_raw_content",',
+      '"agent_reasoning_raw_content_v2",',
+    );
+    assert.notEqual(tampered, source, "篡改必须命中事件清单（否则本用例自欺）");
+    fs.mkdirSync(driftImplDir, { recursive: true });
+    fs.writeFileSync(driftImplFile, tampered, "utf8");
+    const pkg = JSON.parse(original);
+    pkg.version = driftVersion;
+    fs.writeFileSync(tempPkgPath, JSON.stringify(pkg, null, 2) + "\n", "utf8");
+
+    const beforeStamp = shell.__hotReloadTest.activeStamp();
+    const beforeVersion = shell.BRIDGE_VERSION;
+    await shell.__hotReloadTest.checkReload(fakeCtx());
+    shell.__bridgeTest.flush();
+
+    assert.deepEqual(
+      shell.__hotReloadTest.activeStamp(),
+      beforeStamp,
+      "契约不符必须拒绝激活：活动实现的 stamp 不得前进",
+    );
+    assert.equal(shell.BRIDGE_VERSION, beforeVersion, "壳版本常量不得跟随契约不符的实现");
+    assert.ok(shell.__hotReloadTest.rejectedStamp, "拒绝必须被记住（否则每 2s 轮询重复报告）");
+
+    const file = path.join(tempLogRoot, "dsh-pet-bridge", shell.__bridgeTest.instanceFile);
+    const readRefusals = () => fs.readFileSync(file, "utf8").trim().split(/\r?\n/)
+      .map(JSON.parse)
+      .filter((r) => r.event === "bridge/diagnostic" && r.reason === "bridge-contract-mismatch");
+    const refusals = readRefusals();
+    assert.equal(refusals.length, 1, `拒绝原因必须写出一条诊断记录，实际 ${refusals.length}`);
+    assert.equal(refusals[0].severity, "error");
+    assert.match(refusals[0].message, /重启 DSH/, "提示必须明确要求重启 DSH");
+    assert.match(refusals[0].message, /BRIDGE_EVENT_INVENTORY/, "提示必须带上具体不一致项");
+
+    // 同一份磁盘形态再次轮询：不重复报告。
+    await shell.__hotReloadTest.checkReload(fakeCtx());
+    shell.__bridgeTest.flush();
+    assert.equal(readRefusals().length, 1, "同一份被拒绝的形态不得每轮重复报告");
+  } finally {
+    process.env.APPDATA = oldAppData;
+    fs.rmSync(tempLogRoot, { recursive: true, force: true });
+    fs.writeFileSync(tempPkgPath, original, "utf8");
+    try { fs.rmSync(driftImplDir, { recursive: true, force: true }); } catch {}
+    if (shell && shell.__hotReloadTest && shell.__hotReloadTest.disposeActive) {
+      shell.__hotReloadTest.disposeActive();
+    }
+    if (oldWebSocket === undefined) delete globalThis.WebSocket;
+    else globalThis.WebSocket = oldWebSocket;
+  }
+});
+
+test("compareImplContract flags protocol, inventory and capability drift", () => {
+  const compare = shell.__hotReloadTest.compareImplContract;
+  const good = {
+    BRIDGE_PROTOCOL_VERSION: shell.BRIDGE_PROTOCOL_VERSION,
+    BRIDGE_EVENT_INVENTORY: [...shell.BRIDGE_EVENT_INVENTORY],
+    BRIDGE_CAPABILITIES: [...shell.BRIDGE_CAPABILITIES],
+  };
+  assert.deepEqual(compare(good), [], "与壳一致的实现不得被判为不符");
+
+  assert.match(compare({ ...good, BRIDGE_PROTOCOL_VERSION: 2 }).join("；"), /协议版本/);
+  assert.match(
+    compare({
+      ...good,
+      BRIDGE_EVENT_INVENTORY: [...good.BRIDGE_EVENT_INVENTORY, "brand/new"],
+    }).join("；"),
+    /BRIDGE_EVENT_INVENTORY 不一致/,
+  );
+  assert.match(
+    compare({ ...good, BRIDGE_CAPABILITIES: good.BRIDGE_CAPABILITIES.slice(1) }).join("；"),
+    /BRIDGE_CAPABILITIES 不一致/,
+  );
+  assert.match(compare({}).join("；"), /协议版本/);
 });
 
 test("reload replays already-live agents into the new implementation", async () => {

@@ -54,10 +54,11 @@ class ClickSoundPool:
     """
 
     _PLAYER_POOL_SIZE = 4
-    # 闲置重建阈值（秒）：QSoundEffect 实例长时间不播放后，Windows 音频会话
-    # 可能被系统回收/休眠，同一实例再 play() 不报错但无声（用户实测：长时间
-    # 放置后点击音效消失）。按最后播放时刻判定闲置，超阈值播放前**重建**实例
-    #（effect_for 会新建并重新加载），自愈「无声」且不牺牲预热的低延迟开局。
+    # 闲置重建阈值（秒）：QSoundEffect / QMediaPlayer 实例长时间不播放后，Windows
+    # 音频会话可能被系统回收/休眠，同一实例再 play() 不报错但无声（用户实测：
+    # 长时间放置后**全部**音效消失——点哪个都没声）。按最后播放时刻判定闲置，
+    # 超阈值时把缓存音频对象整体重建（effect 缓存 + 播放器池 + 共享 QAudioOutput），
+    # 自愈「无声」且不牺牲预热后的低延迟开局。
     _EFFECT_IDLE_REBUILD_S = 300.0
 
     def __init__(self) -> None:
@@ -73,6 +74,11 @@ class ClickSoundPool:
         self._click_pair_state: dict[tuple[str, str], dict[str, Any]] = {}
         # effect 路径 → 最后一次 play 的 time.monotonic()（闲置重建判定用）。
         self._effect_last_play: dict[str, float] = {}
+        # 本池最后一次播放时刻（任意音频入口）：闲置判定用。初始化为当前时刻，
+        # 否则"自开机起 elapsed 巨大"会让第一次播放就误判闲置、把预热白做。
+        self._last_play_at = time.monotonic()
+        # 已进行的闲置重建次数（测试/诊断可观测；不参与播放逻辑）。
+        self._idle_rebuild_count = 0
 
     # ---------------- QtMultimedia 探测与对象创建（GUI 线程） ----------------
 
@@ -150,21 +156,66 @@ class ClickSoundPool:
                 effect = classes[4]()
                 effect.setSource(QUrl.fromLocalFile(str(path)))
                 self._qt_effects[key] = effect
+                # 创建即记时刻：预热（warm_click_sound_effects）建的实例不该在
+                # 首次点击时被当成"自开机起一直闲置"而丢弃重建——那会让预热
+                # 白做、首次点击重新背上加载延迟。
+                self._effect_last_play[key] = time.monotonic()
             except Exception:
                 log.exception("创建 QSoundEffect 失败: %s", path)
                 return None
         return effect
 
+    def _reset_idle_audio_objects(self) -> bool:
+        """闲置超阈值 → 重建全部缓存音频对象；任何播放入口先调用。
+
+        为什么必须覆盖播放器池：QSoundEffect 是每路径一份缓存，而压缩音频
+        （mp3/ogg/flac/m4a）在解码缓存未就绪时走 QMediaPlayer 池 + 各自的
+        QAudioOutput——Windows 上闲置久了这批对象的音频会话同样会被系统回收/
+        休眠。只重建 effect 的话，用户看到的仍是「全部音效消失」（用户实测：
+        长期放置后点哪个都没声，且点击响应卡顿）。未闲置（含刚重建过）时复用
+        对象，保持预热后的低延迟开局。返回 True 表示本次真的重建了。
+        """
+        now = time.monotonic()
+        previous = self._last_play_at
+        self._last_play_at = now
+        if previous <= 0.0 or now - previous < self._EFFECT_IDLE_REBUILD_S:
+            return False
+        for effect in list(self._qt_effects.values()):
+            try:
+                effect.stop()
+            except Exception:
+                pass
+        for player, _audio in list(self._qt_player_pool):
+            try:
+                player.stop()
+            except Exception:
+                pass
+        self._qt_effects.clear()
+        self._effect_last_play.clear()
+        self._qt_player_pool.clear()
+        # 共享播放器/音频输出也一并丢弃：ensure_qt_player / warm_player_pool 会
+        # 按需重建（否则池里第一份仍是那对已被系统休眠的旧对象）。
+        self._qt_player = None
+        self._qt_audio = None
+        self._qt_player_index = 0
+        self._idle_rebuild_count += 1
+        log.info(
+            "音效对象闲置超 %.0fs，已重建全部缓存（自愈长时间放置后无声）",
+            self._EFFECT_IDLE_REBUILD_S,
+        )
+        return True
+
     def play_with_effect(self, path: Path, volume: float) -> bool:
-        # 闲置自愈：effect 实例超过 _EFFECT_IDLE_REBUILD_S 未播放就丢弃重建。
-        # QtMultimedia 在 Windows 上会把长期不播的音频会话休眠/回收，同一
-        # QSoundEffect 实例再 play() 不报错但无声——用户实测「长时间放置后
-        # 点击音效消失」。重建对象会走 effect_for 的新建 + 重新加载路径。
+        # 闲置自愈（本路径）：该 effect 超过 _EFFECT_IDLE_REBUILD_S 未播放就丢弃
+        # 重建（其他音效在响也不算它"活着"——每个路径各自判定）。
+        # 缺条目（理论上不会，创建时即登记）按"不闲置"处理：宁可复用刚建好的
+        # 实例，也不要在首次点击时白扔一次预热。
         try:
-            idle = time.monotonic() - self._effect_last_play.get(str(path.resolve()), 0.0)
-            if idle >= self._EFFECT_IDLE_REBUILD_S:
-                self._qt_effects.pop(str(path.resolve()), None)
-                self._effect_last_play[str(path.resolve())] = time.monotonic()
+            key = str(path.resolve())
+            last = self._effect_last_play.get(key)
+            if last is not None and time.monotonic() - last >= self._EFFECT_IDLE_REBUILD_S:
+                self._qt_effects.pop(key, None)
+                self._effect_last_play[key] = time.monotonic()
         except Exception:
             pass
         effect = self.effect_for(path)
@@ -455,6 +506,8 @@ class ClickSoundPool:
 
         # WAV and decoded short effects use QSoundEffect; compressed sources use
         # the decoder/cache path and a small player pool while warming up.
+        # 播放前先做闲置自愈（覆盖 effect 与播放器池两条路径）。
+        self._reset_idle_audio_objects()
         if self.play_with_qt(target, volume):
             return True
 
@@ -500,6 +553,9 @@ class ClickSoundPool:
         self._qt_player = None
         self._qt_audio = None
         self._qt_player_index = 0
+        self._effect_last_play.clear()
+        # 清完即视为"刚用过"：紧接着的第一次播放不该再触发一次闲置重建。
+        self._last_play_at = time.monotonic()
         self._wav_duration_cache.clear()
         self._click_pair_state.clear()
 

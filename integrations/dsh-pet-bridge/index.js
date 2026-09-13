@@ -124,6 +124,9 @@ let pollTimer = null;
 // 因此由壳在模块级持有（activeStamp / checkReload 对比用）。
 let activeVersion = "";
 let activeMtime = 0;
+// 因**契约不符**被拒绝激活的磁盘形态（版本+mtime）。opts：可复现的拒绝不
+// 每轮重试（2s 一次刷屏），换新构建（版本或 mtime 变）后自动重新尝试。
+let rejectedStamp = null;
 
 // 探测磁盘当前实现文件：返回
 //   { version, implFile, mtimeMs, exists }
@@ -180,9 +183,59 @@ function snapshotAgents(mod) {
   }
 }
 
+// 运行期契约比对：新实现的协议版本/事件清单/能力清单必须与壳自身的常量完全
+// 一致。为什么必须有这一层——壳的协议常量是被 DSH 缓存住的（热重载只换
+// impl/<version>/，壳本身只能靠重启 DSH 更新）。若某天新 impl 改了协议或事件
+// 清单，热重载会把新实现挂上，而 Pet 侧按自己的清单逐条严格校验 → 每条记录
+// 被拒收、该 agent 联动整体失效，用户只看到一条限频气泡（"挂上但不可用"）。
+// 契约不符时拒绝激活，让旧实现继续工作，比"换了但全废"好得多。
+function compareImplContract(mod) {
+  const problems = [];
+  const protocol = mod?.BRIDGE_PROTOCOL_VERSION;
+  if (protocol !== BRIDGE_PROTOCOL_VERSION) {
+    problems.push(`协议版本 ${protocol ?? "(缺失)"} != 壳 ${BRIDGE_PROTOCOL_VERSION}`);
+  }
+  for (const [name, expected] of [
+    ["BRIDGE_EVENT_INVENTORY", BRIDGE_EVENT_INVENTORY],
+    ["BRIDGE_CAPABILITIES", BRIDGE_CAPABILITIES],
+  ]) {
+    const actual = mod?.[name];
+    if (!Array.isArray(actual) || actual.length === 0) {
+      problems.push(`${name} 缺失或为空`);
+      continue;
+    }
+    const incoming = new Set(actual);
+    const missing = expected.filter((item) => !incoming.has(item));
+    const extra = actual.filter((item) => !expected.includes(item));
+    if (missing.length > 0 || extra.length > 0) {
+      problems.push(
+        `${name} 不一致（缺 ${missing.join(",") || "-"}；多 ${extra.join(",") || "-"}）`,
+      );
+    }
+  }
+  return problems;
+}
+
+// 把"拒绝激活"的原因送到 Pet 侧：经**仍在运行的旧实现**的公开出口写一条
+// severity=error 的 bridge/diagnostic（Pet 收到后弹气泡"需重启 DSH"）。
+// 旧版包没有该出口时只剩 DSH 日志这一条通道——绝不因此影响拒绝本身。
+function reportContractRefusal(message) {
+  try {
+    const write = activeImpl && activeImpl.writeBridgeDiagnostic;
+    if (typeof write === "function") {
+      write({ severity: "error", reason: "bridge-contract-mismatch", message });
+    }
+  } catch (err) {
+    console.warn(`[dsh-pet-bridge] contract refusal report failed: ${String(err?.message || err)}`);
+  }
+}
+
 // 异步加载目标实现并挂载（热重载专用）。query 直接加在实现文件 URL 上：
 // Node 对带不同 query 的 URL 视为不同模块，绕过 loadCache，保证拿到新代码。
 // 顺序（swap 语义，避免窗口期双写）：
+//   0) 先做**契约比对**——协议版本/事件清单/能力清单与壳不一致时拒绝激活
+//      （见 compareImplContract）：挂上一个契约不符的新实现，结果是"看起来
+//      正常、Pet 逐条拒收"的桥接，用户只看到一条限频气泡；
 //   1) 纯加载新模块——失败（语法错/文件损坏/缺 apply）直接抛，旧实现保持可用，
 //      下轮轮询带着同一 probe 重试（自愈）；
 //   2) 加载成功后才 dispose 旧实现，再 apply 新实现；
@@ -193,6 +246,19 @@ async function loadImplementationAsync(probe, ctx, inheritedAgents = null) {
   const mod = await import(`${url}?t=${probe.mtimeMs}`);
   if (!mod || typeof mod.apply !== "function") {
     throw new Error(`impl ${probe.version} has no apply export`);
+  }
+  const contractProblems = compareImplContract(mod);
+  if (contractProblems.length > 0) {
+    // 拒绝激活（旧实现继续工作），并记住这次被判定的磁盘形态：同一份文件不再
+    // 每轮重试刷屏；换新构建（版本或 mtime 变）会自动重试。
+    rejectedStamp = { version: probe.version, mtime: probe.mtimeMs };
+    const message =
+      `impl ${probe.version} 的桥接契约与壳不一致，已拒绝激活（旧实现继续工作）：` +
+      `${contractProblems.join("；")}。壳的协议常量被 DSH 缓存、热重载无法更新，` +
+      `请重启 DSH 以更新桥接协议。`;
+    console.error(`[dsh-pet-bridge] ${message}`);
+    reportContractRefusal(message);
+    return null;
   }
   if (typeof activeImpl.dispose === "function") {
     try { activeImpl.dispose(); } catch {}
@@ -219,6 +285,14 @@ async function checkReload(ctx) {
     // undefined，导致该比较永远 false → 磁盘零变化也每轮触发热重载
     // （dispose+re-apply+重写 hello），这是 P0 实测 bug，必须用 mtimeMs 比较。
     if (stamp && probe.version === stamp.version && probe.mtimeMs === stamp.mtime) return;
+    // 因契约不符被拒绝过的同一份磁盘形态：不再每 2s 重试（换新构建才重试）。
+    if (
+      rejectedStamp
+      && probe.version === rejectedStamp.version
+      && probe.mtimeMs === rejectedStamp.mtime
+    ) {
+      return;
+    }
     // 磁盘变化：先取旧实例的 agent 快照（供新实例无 agents 服务时兜底重放），
     // 再进入 swap 加载（dispose 在 loadImplementationAsync 内部、新实现挂好后才切换）。
     const inherited = snapshotAgents(activeImpl);
@@ -309,8 +383,12 @@ export const __hotReloadTest = {
   activeStamp,
   checkReload,
   disposeActive,
+  compareImplContract,
   packageJsonPath,
   get activeApplied() {
     return Boolean(activeImpl);
+  },
+  get rejectedStamp() {
+    return rejectedStamp;
   },
 };
