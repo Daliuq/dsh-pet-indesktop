@@ -50,6 +50,7 @@ from .library import MovieLibrary
 from .window import PetWindow
 from .fun_image_popup import restore_ojingjing_windows
 from .runtime_cleanup import cleanup_stale_runtime_dirs
+from .session_watcher import install_session_watcher
 from .collision_ipc import CollisionIpcSession
 from .decode_fanout import DecodeFanoutHub
 from .todo_reminder import TodoReminderService
@@ -90,6 +91,25 @@ class _BalanceBridge(_BackgroundResult):
         _show_balance_payload(self.win, payload)
         if self.owner is not None and hasattr(self.owner, "_update_island_balance"):
             self.owner._update_island_balance(payload)
+
+
+class _QuietBalanceBridge(_BackgroundResult):
+    """灵动岛卡片展开时的静默余额查询：只更新岛卡片，不冒泡、不播余额动画。"""
+
+    def __init__(self, owner):
+        super().__init__()
+        self.owner = owner
+        self.done.connect(self._apply)
+
+    def _apply(self, ok: bool, payload) -> None:
+        owner = self.owner
+        island = getattr(owner, "island", None) if owner is not None else None
+        if island is None or not shiboken6.isValid(island):
+            return
+        if ok:
+            owner._update_island_balance(payload, animate=False)
+        else:
+            island.set_balance_info(owner._island_tier_hint(), "余额查询失败")
 
 
 def _persona_picker(win):
@@ -933,8 +953,13 @@ class AppShell:
         self._notification_click_callback = None
         self._toast_windows: list[DesktopNotification] = []
         self.island = None
+        self.island_collision = None  # 果冻墙：岛的静态碰撞体（island_collision.py）
         self._spawned_pet_count = 0
         self._balance_busy = False
+        # 静默余额查询（岛卡片展开）独立忙标志与节流时间戳；
+        # None = 从未查询过（不用 monotonic 绝对值做回拨算术）
+        self._quiet_balance_busy = False
+        self._quiet_balance_last: float | None = None
         self._balance_cache = None
         self._balance_bridge = None
         self._on_about_to_quit_connected = False
@@ -1092,6 +1117,73 @@ class AppShell:
         self._sync_todo_service()
         QTimer.singleShot(3500, self.instance._check_autostart_wanted)
         QTimer.singleShot(4000, self._maybe_autostart_harness)
+        # issue #111：会话结束（Windows 关机/注销）探测器。必须在窗口就绪后安装
+        # ——它要在关机窗口期到来**之前**就位，才能抢在会话拆除前关掉 ffmpeg
+        # 派生（否则系统会弹 0xc0000142 阻塞关机）。
+        self._install_session_watcher()
+
+    def _install_session_watcher(self) -> None:
+        """安装会话结束探测器（幂等；实例属性强引用保活，不跨实例共享）。"""
+        if getattr(self, "_session_watcher", None) is not None:
+            return
+        try:
+            self._session_watcher = install_session_watcher(
+                app=self.app, on_session_end=self._on_session_end,
+            )
+        except Exception:
+            logging.exception("安装会话结束探测器失败")
+
+    def _on_session_end(self) -> None:
+        """会话结束（关机/注销）：冻结各窗并停止全部 ffmpeg reader（issue #111）。
+
+        幂等：重复的会话结束信号（WM_QUERYENDSESSION 之后又有 WM_ENDSESSION、
+        Qt 的 commitDataRequest/aboutToQuit）只收口一次。
+
+        只做正常退出路径（``_on_about_to_quit``）不做、且关机场景必需的三件事：
+        关 ffmpeg spawn 闸门、冻结窗口动画（``match_shutdown``）、把各窗素材库
+        里**已建的全部 clip** 一起停掉（不只是各窗当前在播的那个：圈末软停驻留
+        的 clip 仍持有一个存活但空闲的 ffmpeg 进程，关机时一并收口）、留一行日志。
+
+        刻意**不**做会话保存/写盘/槽位解锁：关机时登录会话已在拆除，那些收尾
+        既非必需（多开文件锁由操作系统在进程退出时释放）又会拉长清理窗口，
+        与「静默、快速、不再派生任何进程」的目标相反。
+        """
+        if getattr(self, "_session_end_done", False):
+            return
+        self._session_end_done = True
+        self._mark_session_ending()
+        stopped = 0
+        for inst in self._instances:
+            win = getattr(inst, "win", None)
+            match_shutdown = getattr(win, "match_shutdown", None)
+            if callable(match_shutdown):
+                try:
+                    match_shutdown()
+                except Exception:
+                    logging.exception("会话结束时冻结窗口失败")
+            lib = getattr(win, "lib", None)
+            stop_all = getattr(lib, "stop_all_clips", None)
+            if callable(stop_all):
+                try:
+                    stop_all()
+                    stopped += 1
+                except Exception:
+                    logging.exception("会话结束时停止素材库 clip 失败")
+        logging.info(
+            "会话结束：已停止全部 ffmpeg reader（%d 个素材库收口），进入静默退出", stopped,
+        )
+
+    def _mark_session_ending(self) -> None:
+        """置位进程级 ffmpeg spawn 闸门（webm_clip.set_session_ending）。
+
+        覆盖「已进入退出流程、但原生 WM_QUERYENDSESSION 未被观测到」的路径
+        （如托盘退出、Qt aboutToQuit、测试直接调收口）。
+        """
+        try:
+            webm_clip_mod.set_session_ending(True)
+        except Exception:
+            logging.exception("置位会话结束闸门失败")
+
 
     def _create_ui_with_character_fallback(self, character_id: str) -> None:
         """启动路径创建主窗；配置记住的角色素材目录已被删/搬走（如 DLC 卸载）
@@ -1144,6 +1236,9 @@ class AppShell:
           thinking 由 dsh_state 收敛后经联动管线补思考气泡/动画——对话开始的
           稳定触发点之一（与真人消息双保险，呈现管线自带同态去重）。
         """
+        island = getattr(self, "island", None)
+        if island is not None and shiboken6.isValid(island):
+            island.set_agent_active(to_state in ("working", "thinking"))
         if to_state == "offline":
             alm = self._dsh_link_manager()
             if alm is not None and hasattr(alm, "dismiss_all_interactions"):
@@ -1179,6 +1274,9 @@ class AppShell:
         （这也是「退出这只」与「全部退出」的核心差异）。
         """
         from .chat import session_store as _session_store
+        # issue #111：先关 ffmpeg spawn 闸门，再走正常退出收口——正常退出路径
+        # （托盘退出/最后窗口关闭）同样落在关机前后，绝不能在里面再派生 reader。
+        self._mark_session_ending()
         # 窗级收口：逐窗保存位置、停本窗预热与 Agent、提交本窗会话、释放本窗 slot 锁
         for inst in self._instances:
             win = inst.win
@@ -1221,6 +1319,24 @@ class AppShell:
                 inst.collision_ipc.stop()
             except Exception:
                 logging.exception("退出时停止碰撞会话失败")
+        # 果冻墙：岛的静态碰撞体随「全部退出」收口（主动 leave 即时移出碰撞世界）
+        body = getattr(self, "island_collision", None)
+        if body is not None:
+            try:
+                body.stop()
+            except Exception:
+                logging.exception("退出时停止灵动岛碰撞体失败")
+        # 进程级全局订阅注销：类级 list 长期持有本 shell 强引用，不注销会
+        # 阻碍 GC（no-chat 变体无 ChatService，导入守卫与注册处同口径）
+        try:
+            from .chat.service import ChatService as _ChatService
+        except ImportError:
+            _ChatService = None
+        if _ChatService is not None:
+            try:
+                _ChatService.unregister_global_finished(self._on_global_chat_finished)
+            except Exception:
+                logging.exception("退出时注销全局聊天订阅失败")
         # 会话异步写盘（B8）：全部会话已保存，再永久关闭写盘 worker
         #（关掉后迟到的 queued 回调提交会被明确拒绝）。
         if self.todo_service is not None:
@@ -1256,7 +1372,8 @@ class AppShell:
         - 停待办提醒服务定时器（其 ``_app`` 反向强引用 shell，且无主 QTimer 的
           timeout 连接从 Qt C++ 侧强引用住整个对象图，Python gc 回收不掉）；
         - 共享子系统经 ``SharedSubsystems._shutdown_live_for_tests`` 收口；
-        - 断开 shell → app 的 aboutToQuit 连接并释放反向引用。
+        - 断开 shell → app 的 aboutToQuit 连接并释放反向引用；
+        - 停灵动岛碰撞体定时器并注销全局聊天订阅（同生产收口口径）。
 
         不做 ``_on_about_to_quit`` 的退出语义（保存位置/永久关闭写盘 worker）：
         那是「全部退出」，测试收口不得触发。
@@ -1283,6 +1400,19 @@ class AppShell:
                     except (RuntimeError, TypeError):
                         pass
                     shell._on_about_to_quit_connected = False
+                # 灵动岛碰撞体 30Hz 定时器与全局聊天订阅（同生产收口口径，
+                # 不停会在后续测试里打异常循环/阻碍 GC）
+                body = getattr(shell, "island_collision", None)
+                if body is not None:
+                    try:
+                        body.stop()
+                    except Exception:
+                        logging.debug("测试收口灵动岛碰撞体失败", exc_info=True)
+                try:
+                    from .chat.service import ChatService as _ChatService
+                    _ChatService.unregister_global_finished(shell._on_global_chat_finished)
+                except Exception:
+                    pass
                 shell._instances = []
             except Exception:
                 logging.debug("测试收口 AppShell 失败", exc_info=True)
@@ -1340,20 +1470,99 @@ class AppShell:
     def _sync_dynamic_island(self) -> None:
         """按配置创建/隐藏灵动岛；桌宠隐藏后灵动岛仍可常驻。"""
         island_cfg = self.config.get("dynamic_island", {})
-        enabled = bool(island_cfg.get("enabled", False)) if isinstance(island_cfg, dict) else False
+        enabled = bool(island_cfg.get("enabled", True)) if isinstance(island_cfg, dict) else False
         if not enabled:
             if getattr(self, "island", None) is not None:
                 self.island.hide()
+            body = getattr(self, "island_collision", None)
+            if body is not None:
+                body.stop()
             return
         if getattr(self, "island", None) is None:
             from .dynamic_island import DynamicIsland
 
             self.island = DynamicIsland(self.config)
             self.island.clicked.connect(self._toggle_pet_from_island)
+            self.island.toggle_pet_requested.connect(self._toggle_pet_from_island)
+            self.island.open_chat_requested.connect(self._open_chat_from_island)
+            self.island.open_settings_requested.connect(self._open_settings_from_island)
+            # 卡片展开 → 静默刷新余额（不冒泡、不播动画，只更新岛卡片）
+            self.island.card_expanded.connect(self._quiet_balance_refresh)
+            # 进程级聊天完成订阅：AI 回复到达 → 岛播事件动效并记录最近消息。
+            # 无聊天功能的打包变体会排除 pet.chat（参照 config.py 的同款守卫），
+            # 那里跳过订阅即可，灵动岛本体照常可用。
+            try:
+                from .chat.service import ChatService
+            except ImportError as exc:
+                if str(getattr(exc, "name", "") or "").startswith("pet.chat"):
+                    ChatService = None  # 无聊天打包变体：跳过订阅，岛本体照常
+                else:
+                    raise
+            if ChatService is not None:
+                ChatService.register_global_finished(self._on_global_chat_finished)
         self.island.refresh_from_config()
         # 批5.2a：灵动岛按**聚合**可见态同步（任一窗可见 = 可见），替代只看主窗。
         self.island.set_pet_visible(self._aggregate_pet_visible())
         self.island.show()
+        self._sync_island_collision(island_cfg)
+
+    def _sync_island_collision(self, island_cfg) -> None:
+        """果冻墙：按配置创建/启停岛的本进程碰撞体（island_collision.py）。
+
+        本进程直连检测（30Hz 圆链扫掠 + 本地结算），不走碰撞 IPC——
+        IPC 版的保活/快照时序在 GUI 卡顿时会让岛掉出碰撞世界（实机教训）。
+        岛的位置永远由用户拖拽决定；拖拽中岛速参与结算（岛=移动的拍子）。
+        """
+        enabled = bool(island_cfg.get("collision_enabled", True)) \
+            if isinstance(island_cfg, dict) else True
+        body = getattr(self, "island_collision", None)
+        if not enabled:
+            if body is not None:
+                body.stop()
+            return
+        if self.island is None:
+            return
+        if body is None:
+            from .island_collision import IslandCollisionBody
+
+            body = IslandCollisionBody(
+                self.island, self.config,
+                pets_provider=lambda: [
+                    inst.win for inst in self._instances if inst.win is not None
+                ])
+            self.island_collision = body
+            self.island.on_geometry_changed = body.submit
+            self.island.on_pet_visibility_changed = body.set_own_pet_visible
+        try:
+            body.start()
+        except Exception:
+            # 岛对象异常（如测试桩无 geometry）时碰撞体降级为不启用，
+            # 不影响灵动岛本体功能。
+            logging.exception("启动灵动岛碰撞体失败")
+
+    def _open_chat_from_island(self) -> None:
+        if not getattr(self, "enable_chat", True):
+            # no-chat 打包变体：给可见反馈（岛弹跳），不静默 no-op
+            island = getattr(self, "island", None)
+            if island is not None and shiboken6.isValid(island):
+                island.bump(1.5, 0.0, -1.0)
+            return
+        inst = self.instance
+        if inst is not None and callable(getattr(inst, "open_quick_chat", None)):
+            inst.open_quick_chat()
+
+    def _open_settings_from_island(self) -> None:
+        inst = self.instance
+        if inst is not None and callable(getattr(inst, "open_modern_settings", None)):
+            inst.open_modern_settings()
+
+    def _on_global_chat_finished(self, text: str) -> None:
+        """ChatService 全局完成回调（GUI 线程）：驱动灵动岛事件动效。"""
+        island = getattr(self, "island", None)
+        if island is None or not shiboken6.isValid(island):
+            return
+        island.set_last_message(text)
+        island.notify_event("reply")
 
     def _aggregate_pet_visible(self) -> bool:
         """是否有任一窗可见（聚合可见态——灵动岛按它同步 set_pet_visible）。"""
@@ -1384,24 +1593,88 @@ class AppShell:
         if minutes:
             self._balance_timer.start(minutes * 60000)
 
-    def _update_island_balance(self, payload) -> None:
-        """把余额文本/峰谷提示同步给灵动岛（若有）。"""
-        if getattr(self, "island", None) is None:
-            return
-        text = "余额 --"
-        info = {}
-        if isinstance(payload, dict):
-            text = str(payload.get("text") or "余额 --")
-            info = payload.get("info") or {}
+    def _island_tier_hint(self) -> str:
+        """灵动岛余额峰谷提示文案（与 _update_island_balance / 静默查询共用）。"""
         peak_label, idle_label = balance_mod.resolve_tier_labels(
             str(self.config.get("balance_tier_labels_mode", "default") or "default"),
             str(self.config.get("balance_tier_label_peak", "") or ""),
             str(self.config.get("balance_tier_label_idle", "") or ""),
         )
-        hint = balance_mod.deepseek_pricing_hint(
+        return balance_mod.deepseek_pricing_hint(
             peak_label=peak_label, idle_label=idle_label,
         )
-        self.island.set_balance_info(hint, text)
+
+    def _update_island_balance(self, payload, *, animate: bool = True) -> None:
+        """把余额文本/峰谷提示同步给灵动岛（若有）。
+
+        animate=False 用于静默刷新路径（卡片展开后的缓存命中/后台查询）：
+        只更新文本不播余额弹跳动画——弹跳会把展开卡片顶出窗口截边。
+        """
+        if getattr(self, "island", None) is None:
+            return
+        text = "余额 --"
+        if isinstance(payload, dict):
+            text = str(payload.get("text") or "余额 --")
+        self.island.set_balance_info(self._island_tier_hint(), text)
+        if animate:
+            self.island.notify_event("balance")
+
+    def _quiet_balance_refresh(self, *, force: bool = False) -> None:
+        """灵动岛卡片展开时的静默余额刷新：不冒泡、不播动画，只更新岛卡片。
+
+        30s 内存/文件缓存命中直接用；否则后台查询（60s 节流，查询忙时跳过）。
+        未配置 API Key 时明确提示，不再停留 "余额 --"。
+        """
+        island = getattr(self, "island", None)
+        if island is None or getattr(self, "_quiet_balance_busy", False):
+            return
+        if not getattr(self, "enable_chat", True):
+            island.set_balance_info(self._island_tier_hint(), "此版本无余额查询")
+            return
+        now = time.monotonic()
+        import hashlib
+        settings = self.config.chat_settings()
+        provider = settings.active_config
+        provider.api_key = self.config.resolve_api_key(provider)
+        if not provider.api_key:
+            island.set_balance_info(
+                self._island_tier_hint(), "未配置 API Key（设置 → 聊天）")
+            return
+        key_digest = hashlib.sha256(str(provider.api_key or '').encode()).hexdigest()[:12]
+        provider_key = '|'.join([
+            str(getattr(provider, 'id', '') or ''),
+            str(provider.base_url or ''),
+            key_digest,
+        ])
+        if self._balance_cache is not None and now - self._balance_cache[0] < 30.0 \
+                and self._balance_cache[2] == provider_key:
+            self._update_island_balance(self._balance_cache[1], animate=False)
+            return
+        file_payload = self._read_balance_file_cache(provider_key)
+        if file_payload is not None:
+            self._balance_cache = (now, file_payload, provider_key)
+            self._update_island_balance(file_payload, animate=False)
+            return
+        last = getattr(self, "_quiet_balance_last", None)
+        if not force and last is not None and now - last < 60.0:
+            # 节流命中且缓存已过期：明示状态，不停留在旧值上装死
+            island.set_balance_info(self._island_tier_hint(), "刚刚查询过，稍后自动更新")
+            return
+        self._quiet_balance_last = now
+        island.set_balance_info(self._island_tier_hint(), "查询中…")
+        bridge = _QuietBalanceBridge(owner=self)
+        self._quiet_balance_bridge = bridge
+        self._quiet_balance_busy = True  # 独立忙标志：不占显式查询的闸门
+        try:
+            threading.Thread(
+                target=self._balance_worker,
+                args=(bridge, provider.base_url, provider.api_key, provider.verify_ssl, provider_key),
+                kwargs={"quiet": True},
+                daemon=True, name='pet-balance-quiet',
+            ).start()
+        except Exception as exc:  # noqa: BLE001 - 启动失败也必须释放忙状态
+            self._quiet_balance_busy = False
+            QTimer.singleShot(0, lambda message=str(exc): bridge.done.emit(False, message))
 
     # ------------------------------------------------------------ 余额
     def show_balance(self, parent=None) -> None:
@@ -1450,7 +1723,7 @@ class AppShell:
             error_message = f'余额查询失败：{exc}'
             QTimer.singleShot(0, lambda message=error_message: bridge.done.emit(False, message))
 
-    def _balance_worker(self, bridge, base_url: str, api_key: str, verify_ssl: bool, provider_key: str = '') -> None:
+    def _balance_worker(self, bridge, base_url: str, api_key: str, verify_ssl: bool, provider_key: str = '', *, quiet: bool = False) -> None:
         try:
             info = balance_mod.fetch_balance(base_url, api_key, verify_ssl=verify_ssl)
             text = balance_mod.format_balance(info)
@@ -1461,7 +1734,10 @@ class AppShell:
         except Exception as exc:  # noqa: BLE001 - 任何失败走气泡提示
             bridge.done.emit(False, f'余额查询失败：{exc}')
         finally:
-            self._balance_busy = False
+            if quiet:
+                self._quiet_balance_busy = False
+            else:
+                self._balance_busy = False
 
     def _read_balance_file_cache(self, provider_key: str = '') -> dict | None:
         """读取跨实例共享的余额缓存（30s 内有效，且必须是同一 provider 的缓存）。

@@ -148,6 +148,10 @@ exact breakpoint there; see `docs/agents/handoff.md`.
 
 - Read `docs/ISSUE-42-POSIX-COLLISION-IPC-2026-08-31.md` when changing collision
   election, QLocal IPC, coordinator locking, or their process-level tests.
+- Read `docs/ISSUE-111-WINDOWS-SESSION-END-FFMPEG-2026-09-12.md` when changing
+  ffmpeg spawning (`webm_clip` reader/first-frame/meta/exe probes), warm
+  scheduling, or anything that runs during Windows shutdown/logoff
+  (`session_watcher`, `match_shutdown`, `AppShell._on_session_end`).
 - Read `docs/ONEDIR_PACKAGING.md` when changing PyInstaller specs, bundled
   resources, or platform build scripts.
 - Read `docs/STABLE_BUILDS.md` when changing release/build workflows.
@@ -159,5 +163,9 @@ exact breakpoint there; see `docs/agents/handoff.md`.
   dialogue preset files (`pet/persona_presets/*.json`), phrase loading
   (`persona_phrases.py`), or expression-style semantics
   (`dialogue_mode`/`dialogue_phrases`).
+- Read `docs/PR-MERGE-LESSONS-2026-09-12.md` before merging PRs: stacked-PR
+  conflicts after squashing the parent, budget/red-line changes that only break
+  when two PRs combine, and timing-test flake discipline (poll state with a wide
+  budget instead of fixed sleeps).
 - Treat `assets/characters/<id>/videos/` plus its manifest as one character
   package; preserve relative paths and case because packaged platforms differ.

@@ -339,7 +339,15 @@ class CollisionClient(QObject):
         radius_x = max(1.0, rect.width() / 2.0)
         radius_y = max(1.0, rect.height() / 2.0)
         hit_dv = math.hypot(dvx, dvy)
-        is_real_hit = hit_dv >= self._hit_min_dv
+        # 撞静态布景（灵动岛果冻墙）放宽命中阈值：岛的语义就是"撞上去会弹"，
+        # 漫游/走路蹭到（dv 常在 60~300 之间）也该有看得见的反弹，
+        # 而不是被 300 的通用阈值吃掉只剩缓慢推出。
+        other_id = str(message.get('b') if message.get('a') == runtime_id
+                       else message.get('a') or '')
+        other = self.peer_snapshots.get(other_id) or {}
+        hit_floor = 60.0 if int(other.get('flags', 0)) & collision.FLAG_STATIC \
+            else self._hit_min_dv
+        is_real_hit = hit_dv >= hit_floor
         has_velocity_impulse = abs(dvx) > 1e-9 or abs(dvy) > 1e-9
         # 偏差豁免的本意是"协调者眼中的我已经过期就别瞬移我"——直接比较
         # 协调者 tick 时认定的我方中心（ax/ay 或 bx/by）与当前实际中心，
@@ -371,16 +379,24 @@ class CollisionClient(QObject):
         if egg is not None and egg.active:
             egg.on_pet_contact(math.hypot(*win._phys_vel))
         if abs(dx) > 1e-9 or abs(dy) > 1e-9:
-            win._cancel_move()
-            win._cancel_animation_gap()
-            clamped_x, clamped_y = win._collision_clamp_pos(win.x() + dx, win.y() + dy)
-            left, top = win._collision_clamp_pos(float('-inf'), float('-inf'))
-            right, bottom = win._collision_clamp_pos(float('inf'), float('inf'))
-            win.move(
-                min(max(int(round(clamped_x)), math.ceil(left)), math.floor(right)),
-                min(max(int(round(clamped_y)), math.ceil(top)), math.floor(bottom)),
-            )
-            win._phys_pos[:] = [float(win.x()), float(win.y())]
+            # 边缘探头会话期间位置归探头控制器管（PEEKING 稳态无 timer，
+            # 被位移顶偏后不会自动归位，会"卡"在错误的露出量上），软撞的
+            # 分离位移直接丢弃；真实撞击下方会进入 throw 并取消探头会话，
+            # 位移照常应用。
+            probe_holds_pose = bool(
+                getattr(getattr(win, '_edge_probe', None), 'active', False)
+            ) and not (is_real_hit and not contact_deviation)
+            if not probe_holds_pose:
+                win._cancel_move()
+                win._cancel_animation_gap()
+                clamped_x, clamped_y = win._collision_clamp_pos(win.x() + dx, win.y() + dy)
+                left, top = win._collision_clamp_pos(float('-inf'), float('-inf'))
+                right, bottom = win._collision_clamp_pos(float('inf'), float('inf'))
+                win.move(
+                    min(max(int(round(clamped_x)), math.ceil(left)), math.floor(right)),
+                    min(max(int(round(clamped_y)), math.ceil(top)), math.floor(bottom)),
+                )
+                win._phys_pos[:] = [float(win.x()), float(win.y())]
         if has_velocity_impulse:
             win._just_dragged = True
             QTimer.singleShot(120, win, win._clear_just_dragged)
@@ -496,7 +512,7 @@ class CollisionClient(QObject):
                     radius_x, radius_y,
                     scale=float(raw_peer.get('scale', collision.DEFAULT_BASE_SCALE) or collision.DEFAULT_BASE_SCALE),
                     collision_mass_scale=float(win.cfg.get('collision_mass_scale', 1.0))),
-                is_infinite_mass=bool(flags & (collision.FLAG_DRAGGING | collision.FLAG_LOCK_POSITION)),
+                is_infinite_mass=bool(flags & (collision.FLAG_DRAGGING | collision.FLAG_LOCK_POSITION | collision.FLAG_STATIC)),
                 flags=flags,
                 circles=peer_circles,
             )

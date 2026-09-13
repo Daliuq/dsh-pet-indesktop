@@ -1567,8 +1567,11 @@ def test_modern_settings_toggle_dependencies_hide_complete_setting_groups(tmp_pa
         row(key) for key in (
             "dynamic_island_icon", "dynamic_island_name", "dynamic_island_info",
             "dynamic_island_status", "dynamic_island_info_mode",
-            "dynamic_island_style", "dynamic_island_icon_value",
-            "dynamic_island_custom_text",
+            "dynamic_island_style", "dynamic_island_opacity",
+            "dynamic_island_accent", "dynamic_island_icon_value",
+            "dynamic_island_custom_text", "dynamic_island_click_action",
+            "dynamic_island_event_effects", "dynamic_island_edge_dock",
+            "dynamic_island_collision",
         )
     ]
     dialog.island_enabled_check.setChecked(False)
@@ -2813,12 +2816,16 @@ def test_pet_app_binds_about_to_quit_once_to_current_window(tmp_path, monkeypatc
     owner.instance.win = old
     owner.start()
     owner.start()  # 重复 start 不得叠加 connect
-    assert len(owner.app.connections) == 1
-    assert owner.app.connections[0] == owner._on_about_to_quit
+    # 本用例的被测对象是 AppShell 的**自有**接线：只统计它自己的槽——start()
+    # 还会让会话结束探测器（issue #111）接一条 aboutToQuit 兜底，那是另一个
+    # 组件的一次性接线（由 pet/session_watcher 自测覆盖），不参与本计数。
+    shell_connections = [c for c in owner.app.connections
+                         if c == owner._on_about_to_quit]
+    assert len(shell_connections) == 1, "AppShell 重复 start 不得叠加 aboutToQuit 接线"
 
     current = FakeWin()
     owner.instance.win = current
-    owner.app.connections[0]()  # 触发 aboutToQuit
+    owner._on_about_to_quit()  # 触发 aboutToQuit（直接调用同样的槽）
     assert current.saved == 1
     assert old.saved == 0  # 旧窗口不再被保存
 
