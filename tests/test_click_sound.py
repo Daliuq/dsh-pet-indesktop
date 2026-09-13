@@ -165,6 +165,10 @@ def test_idle_reset_rebuilds_the_player_pool_too(monkeypatch, tmp_path):
     monkeypatch.setattr(click_sound._pool, "qt_multimedia_classes", _fake_classes)
     monkeypatch.setattr(click_sound, "_sound_cache_dir", lambda: tmp_path / "cache")
     path = _make_file(tmp_path, "click.mp3")
+    # 计数器是**进程级**的（单例池跨用例共享）：只能按基线增量断言。写成
+    # `== 1` 会让结果取决于本用例之前有没有别的用例触发过闲置重建
+    # （CI 上慢跑时，任何一次 >5 分钟的播放空档都会先加一次 → 本地绿、CI 红）。
+    rebuilds_before = click_sound._pool._idle_rebuild_count
 
     assert click_sound.play_click_sound(path) is True
     pool_before = [player for player, _audio in click_sound._pool._qt_player_pool]
@@ -182,7 +186,8 @@ def test_idle_reset_rebuilds_the_player_pool_too(monkeypatch, tmp_path):
     assert pool_after, "闲置后仍须有可用播放器"
     assert all(p not in pool_before for p in pool_after), \
         "闲置超阈值后播放器池必须整体重建（旧对象可能已被系统休眠）"
-    assert click_sound._pool._idle_rebuild_count == 1, "闲置重建只应发生一次"
+    assert click_sound._pool._idle_rebuild_count == rebuilds_before + 1, \
+        "本用例应恰好触发一次闲置重建"
 
 
 def test_first_play_after_warmup_reuses_the_warmed_effect(monkeypatch, tmp_path):
@@ -196,6 +201,11 @@ def test_first_play_after_warmup_reuses_the_warmed_effect(monkeypatch, tmp_path)
     monkeypatch.setattr(click_sound._pool, "_qt_effects", {})
     monkeypatch.setattr(click_sound._pool, "_effect_last_play", {})
     monkeypatch.setattr(click_sound._pool, "qt_multimedia_classes", _fake_classes)
+    # 钉住"整池闲置"时钟：本用例只验证**每路径**判定，不允许全局闲置重建插手。
+    # 不钉的话结果取决于会话里距上次播放多久（CI 上慢跑 >5 分钟就会触发整池
+    # 重建、把刚预热的实例清掉，本地 3 分钟的套件则永远不触发——正是"本地绿、
+    # CI 红"的时间依赖）。
+    monkeypatch.setattr(click_sound._pool, "_last_play_at", time.monotonic())
     path_wav = _make_file(tmp_path, "click.wav")
 
     click_sound._pool.effect_for(path_wav)  # 预热：创建并登记

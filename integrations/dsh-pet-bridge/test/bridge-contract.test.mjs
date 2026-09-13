@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { redirectBridgeDataRoot, assertBridgeDirIsolated } from "./_bridge-test-env.mjs";
 import {
   apply,
   BRIDGE_CAPABILITIES,
@@ -52,29 +53,28 @@ test("the runtime bridge version follows package metadata", () => {
 });
 
 test("every writeRecord output carries the protocol and package envelope", () => {
-  const oldAppData = process.env.APPDATA;
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-bridge-contract-"));
-  process.env.APPDATA = tempRoot;
+  const restoreBridgeDataRoot = redirectBridgeDataRoot(tempRoot);
+  assertBridgeDirIsolated(__bridgeTest.bridgeDir(), tempRoot);
   try {
     __bridgeTest.writeRecord({ event: "contract/test", bridgeProtocolVersion: 999, bridgeVersion: "stale" });
     __bridgeTest.flush();
-    const file = path.join(tempRoot, "dsh-pet-bridge", __bridgeTest.instanceFile);
+    const file = path.join(__bridgeTest.bridgeDir(), __bridgeTest.instanceFile);
     const record = JSON.parse(fs.readFileSync(file, "utf8").trim());
     assert.equal(record.event, "contract/test");
     assert.equal(record.bridgeProtocolVersion, BRIDGE_PROTOCOL_VERSION);
     assert.equal(record.bridgeVersion, BRIDGE_VERSION);
   } finally {
-    if (oldAppData === undefined) delete process.env.APPDATA;
-    else process.env.APPDATA = oldAppData;
+    restoreBridgeDataRoot();
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
 });
 
 test("apply emits one bridge/hello record per application", () => {
-  const oldAppData = process.env.APPDATA;
   const oldWebSocket = globalThis.WebSocket;
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-bridge-hello-"));
-  process.env.APPDATA = tempRoot;
+  const restoreBridgeDataRoot = redirectBridgeDataRoot(tempRoot);
+  assertBridgeDirIsolated(__bridgeTest.bridgeDir(), tempRoot);
   // Avoid a real DSH mux connection in this producer-only contract test.
   globalThis.WebSocket = undefined;
   const ctx = {
@@ -85,7 +85,7 @@ test("apply emits one bridge/hello record per application", () => {
   try {
     apply(ctx);
     __bridgeTest.flush();
-    const file = path.join(tempRoot, "dsh-pet-bridge", __bridgeTest.instanceFile);
+    const file = path.join(__bridgeTest.bridgeDir(), __bridgeTest.instanceFile);
     const records = fs.readFileSync(file, "utf8").trim().split(/\r?\n/).map(JSON.parse);
     const hellos = records.filter((record) => record.event === "bridge/hello");
     assert.equal(hellos.length, 1);
@@ -94,8 +94,7 @@ test("apply emits one bridge/hello record per application", () => {
     assert.deepEqual(hellos[0].capabilities, [...BRIDGE_CAPABILITIES]);
     assert.deepEqual(hellos[0].emittedEvents, [...BRIDGE_EVENT_INVENTORY]);
   } finally {
-    if (oldAppData === undefined) delete process.env.APPDATA;
-    else process.env.APPDATA = oldAppData;
+    restoreBridgeDataRoot();
     if (oldWebSocket === undefined) delete globalThis.WebSocket;
     else globalThis.WebSocket = oldWebSocket;
     fs.rmSync(tempRoot, { recursive: true, force: true });
