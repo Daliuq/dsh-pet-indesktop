@@ -516,6 +516,15 @@ def _manifest_has_plugin(pkg: dict) -> bool:
     return DSH_PLUGIN_NAME in ((pkg.get("dependencies") or {}) or {})
 
 
+def _manifest_bundle_enabled(pkg: dict) -> bool:
+    """插件是否在 `dsh.profile.bundles` 里（不在 = DSH 根本不会加载它）。"""
+    try:
+        bundles = ((pkg.get("dsh") or {}).get("profile") or {}).get("bundles") or []
+    except AttributeError:
+        return False
+    return DSH_PLUGIN_NAME in bundles
+
+
 def _manifest_set_bundle(pkg: dict, profile_dir: Path, present: bool) -> bool:
     """保持 dsh.profile.bundles 与插件安装状态一致，返回是否发生写入。"""
     bundles = (
@@ -1619,6 +1628,10 @@ class DshMonitor(BaseAgentMonitor):
     """
 
     PLUGIN_NAME = "@dsh-pet/bridge"
+    # 桥接健康自检发现问题：(agent_key, reason, message)。reason 是稳定的短码
+    # （not-installed / disabled / link-missing / not-loaded），message 是给用户看
+    # 的可操作结论（例如"重启 DSH"）。Manager 据此弹气泡并落日志。
+    bridge_health_issue = Signal(str, str, str)
     # DSH 桥接是随桌宠捆绑的**版本化契约生产者**：每条记录都被逐条校验
     # （pet/bridge_contract.py::validate_bridge_record），fail-closed——校验不过
     # 直接拒绝该记录并弹「更新/重装 bridge」。必需字段就地对应如下：
@@ -1752,14 +1765,97 @@ class DshMonitor(BaseAgentMonitor):
         ).start()
 
     def _refresh_links_worker(self) -> None:
-        """后台刷新陈旧 link：失败只记日志（自检是静默修复，不打扰用户）。"""
+        """后台自检：刷新陈旧 link（静默修复）+ 桥接健康检查（必要时提示重启 DSH）。
+
+        为什么两步都要：刷新 link 只解决"profile 里的路径已经不对"，而**正在运行的
+        DSH 仍然不会加载**刚修好的插件——2026-09-14 实测的故障正是这一类：打包失败
+        清空了插件目录 → DSH 启动时解析不到就跳过 → 桌宠再也收不到桥接事件，而桌宠
+        只在"首次安装"时提示过重启，对这种状态毫无感知，用户只能看到"联动突然没了"。
+        健康检查把这种状态变成一条明确的、可操作的提示。
+        """
         try:
             refreshed = self.refresh_stale_bridge_links()
         except Exception:
             log.exception("桥接 link 自检失败")
+        else:
+            if refreshed:
+                log.info("桥接 link 已刷新为当前构建: %s", ", ".join(refreshed))
+        try:
+            ok, reason, message = self.bridge_health()
+        except Exception:
+            log.exception("桥接健康自检失败")
             return
-        if refreshed:
-            log.info("桥接 link 已刷新为当前构建: %s", ", ".join(refreshed))
+        if ok:
+            log.info("[dsh-pet-bridge] 桥接健康自检通过：profile 已启用插件且运行中的 DSH 已加载")
+            return
+        log.warning("[dsh-pet-bridge] 桥接健康自检发现问题（%s）：%s", reason, message)
+        self._emit(self.bridge_health_issue, (self.agent_key, reason, message))
+
+    def bridge_health(self, *, profile_dirs=None, pids=None) -> tuple[bool, str, str]:
+        """桥接健康自检：返回 `(ok, reason, message)`。
+
+        判据按优先级（任一命中即返回），全部只依赖"可观测事实"，不猜：
+          not-installed  没有任何 profile 声明桥接插件（用户还没装）
+          disabled       声明了但不在 `dsh.profile.bundles`（DSH 不会加载它）
+          link-missing   link 目标不存在（换构建目录 / 打包失败清空目录后常见）
+          not-loaded     有 DSH 服务进程在跑，但桥目录里没有它自己那份
+                         `dsh-<pid>.jsonl`——插件 apply 必写 hello+diagnostic，
+                         没有就说明"这个 DSH 根本没加载插件"（多半是它启动时
+                         插件还没就位）。这一条是本次故障的核心缺口。
+
+        `profile_dirs` / `pids` 仅为测试注入；默认走真实探测。
+        桥目录用 `self.events_dir`（= bridge_contract.resolve_bridge_dir(config_dir)），
+        与插件侧 `bridgeDir()` 同一口径，两侧不会各看各的目录。
+        """
+        profiles = list(profile_dirs) if profile_dirs is not None else _real_profiles()
+        declaring: list[tuple[Path, dict]] = []
+        for profile in profiles:
+            pkg = _read_manifest(Path(profile))
+            if pkg is not None and _manifest_has_plugin(pkg):
+                declaring.append((Path(profile), pkg))
+        if not declaring:
+            return (
+                False,
+                "not-installed",
+                "桥接插件还没装到 DSH——在「Agent 联动」菜单里安装一次，然后重启一次 DSH",
+            )
+        for profile, pkg in declaring:
+            if not _manifest_bundle_enabled(pkg):
+                return (
+                    False,
+                    "disabled",
+                    f"桥接插件在 profile「{profile.name}」里没有启用（DSH 不会加载它）——"
+                    "重启一次 DSH，或把联动开关关掉再打开一次",
+                )
+        for profile, pkg in declaring:
+            spec = str((pkg.get("dependencies") or {}).get(DSH_PLUGIN_NAME) or "")
+            target = _path_spec_target(spec, profile)
+            if target is not None and not target.exists():
+                return (
+                    False,
+                    "link-missing",
+                    "桥接插件文件缺失（换构建目录或打包中断后常见）——请重新安装桥接，再重启一次 DSH",
+                )
+        names = [profile.name for profile, _pkg in declaring]
+        if pids is not None:
+            running = list(pids)
+        else:
+            # 局部导入：与文件内其它 harness_launcher 用法保持一致（避免模块级循环导入）。
+            from . import harness_launcher
+
+            running = harness_launcher.dsh_server_pids(names)
+        if running:
+            bridge_dir = Path(self.events_dir)
+            missing = [pid for pid in running if not (bridge_dir / f"dsh-{pid}.jsonl").exists()]
+            if missing:
+                listed = "、".join(str(pid) for pid in missing)
+                return (
+                    False,
+                    "not-loaded",
+                    f"检测到 DSH（pid {listed}）没有加载桥接插件——"
+                    "通常是它在插件就位之前就已经启动；重启一次 DSH 即可恢复联动",
+                )
+        return True, "", ""
 
     @staticmethod
     def _summarize_install_error(output: str) -> str:
@@ -2549,6 +2645,7 @@ class AgentLinkManager(QObject):
         self.monitors["dsh"].unknown_bridge_event.connect(self._on_unknown_bridge_event)
         self.monitors["dsh"].bridge_incompatible.connect(self._on_bridge_incompatible)
         self.monitors["dsh"].bridge_diagnostic.connect(self._on_bridge_diagnostic)
+        self.monitors["dsh"].bridge_health_issue.connect(self._on_bridge_health_issue)
         # 检测器提醒跨模块节流（N2）：stuck / pattern / exploration watchdog 三个
         # 检测器各有独立 cooldown，但同一 busy 周期可能先后各自弹窗造成连环换弹。
         # 按 agent/session 记最近一次**任一**检测器弹窗时刻与档位，窗口内同档
@@ -4933,6 +5030,26 @@ class AgentLinkManager(QObject):
         name = self.agent_names.get(agent_key, agent_key)
         text = message or "桥接上报了异常诊断"
         self.win.show_bubble(f"{name} {text[:200]}", duration_ms=6000)
+
+    def _on_bridge_health_issue(self, agent_key: str, reason: str, message: str) -> None:
+        """桥接健康自检发现问题 → 必须让用户看见（否则用户只看到"联动突然没了"）。
+
+        与 _on_bridge_incompatible / _on_bridge_diagnostic 同属**必需健康反馈**：
+        不受事件汇报概率门控制，仅按冷却窗口限频（按 reason 命名空间分开计，避免
+        不同原因互相挤掉）。自检目前每监视器实例只跑一次，限频是为将来改成周期
+        自检时仍不刷屏。
+        """
+        if not message:
+            return
+        key = f"{agent_key}:health:{reason or 'unknown'}"
+        now = self._clock()
+        last = self._unknown_bridge_reminded_at.get(key)
+        if last is not None and now - last < self._UNKNOWN_BRIDGE_REMIND_COOLDOWN_S:
+            return
+        self._unknown_bridge_reminded_at[key] = now
+        log.warning("[dsh-pet-bridge] 桥接健康提示（%s）：%s", reason or "?", message)
+        name = self.agent_names.get(agent_key, agent_key)
+        self.win.show_bubble(f"{name} {message[:200]}", duration_ms=8000)
 
     def _on_unknown_bridge_event(self, agent_key: str, record: dict) -> None:
         """DSH 桥接写出的未知事件 → 提醒用户更新/重装 bridge。

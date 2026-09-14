@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QApplication
 from pet.agent_link import DshMonitor
 from pet.agent_link import AgentLinkManager
 from pet import dsh_control
+from pet.harness_launcher import parse_dsh_server_pids
 from pet.bridge_contract import (
     BRIDGE_CAPABILITIES,
     BRIDGE_DIR_ENV,
@@ -593,3 +594,125 @@ def test_bridge_consumers_read_the_overridden_dir(tmp_path, monkeypatch):
         assert Path(tracker._bridge_dir) == target
     finally:
         tracker.stop()
+
+
+# ---------------------------------------------------------------- 桥接健康自检
+# 2026-09-14 事故：打包失败清空了插件目录 → 运行中的 DSH 启动时解析不到插件就跳过 →
+# 桌宠再也收不到桥接事件，而桌宠只在"首次安装"时提示过重启，对这种状态毫无感知。
+# 下面这组用例把"健康自检能识别哪些状态"钉死。
+
+def _write_profile(profile_dir: Path, *, declared: bool, bundled: bool, target: Path | None) -> None:
+    """造一个假 profile：可控制"声明依赖 / 在 bundles 里 / link 目标指向哪"。"""
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    deps = {"@dsh-pet/bridge": f"link:{target}"} if declared else {}
+    bundles = ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"]
+    if bundled:
+        bundles.append("@dsh-pet/bridge")
+    (profile_dir / "package.json").write_text(
+        json.dumps({"name": f"profile-{profile_dir.name}", "dependencies": deps,
+                    "dsh": {"profile": {"bundles": bundles}}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def test_dsh_server_pid_parser_only_picks_the_target_profile(tmp_path):
+    """进程清单解析：只认"跑目标 profile 的 DSH"，别的 node 进程一律不算。"""
+    listing = "\n".join([
+        '4242 "E:\\nodejs\\node.exe" "E:\\nodejs\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js" web',
+        '5150 /usr/bin/node /usr/lib/node_modules/@deepseek-ai/dsh/lib/bin.js web',
+        "6161 /usr/bin/python -m pet",                      # 桌宠自己
+        "7171 /usr/bin/node /opt/other/bin.js worker",       # 别的 bin.js
+        "8181 /usr/bin/node /usr/lib/node_modules/@deepseek-ai/dsh/lib/bin.js other-profile",
+        "not-a-pid /usr/bin/node x/bin.js web",              # pid 非法
+    ])
+    assert parse_dsh_server_pids(listing, ["web"]) == [4242, 5150]
+    assert parse_dsh_server_pids(listing, ["other-profile"]) == [8181]
+    assert parse_dsh_server_pids(listing, []) == []
+
+
+def test_bridge_health_flags_a_dsh_that_never_loaded_the_plugin(tmp_path):
+    """核心缺口：已装好、已启用，但运行中的 DSH 没写出自己那份实例文件 → 要提示重启。"""
+    plugin = tmp_path / "bridge-plugin"
+    plugin.mkdir()
+    profile = tmp_path / "profiles" / "web"
+    _write_profile(profile, declared=True, bundled=True, target=plugin)
+    # 监视器的桥目录 = resolve_bridge_dir(config_dir) = config_dir.parent/"dsh-pet-bridge"
+    bridge_dir = tmp_path / "dsh-pet-bridge"
+    bridge_dir.mkdir(parents=True)
+    monitor = DshMonitor("dsh", tmp_path / "config")
+    try:
+        ok, reason, message = monitor.bridge_health(profile_dirs=[profile], pids=[4242])
+        assert ok is False
+        assert reason == "not-loaded"
+        assert "重启" in message and "4242" in message, message
+    finally:
+        monitor.stop()
+
+
+def test_bridge_health_passes_once_the_dsh_wrote_its_instance_file(tmp_path):
+    """同一条路径，出现 `dsh-<pid>.jsonl` 即视为已加载（不打扰用户）。"""
+    plugin = tmp_path / "bridge-plugin"
+    plugin.mkdir()
+    profile = tmp_path / "profiles" / "web"
+    _write_profile(profile, declared=True, bundled=True, target=plugin)
+    bridge_dir = tmp_path / "dsh-pet-bridge"
+    bridge_dir.mkdir(parents=True)
+    (bridge_dir / "dsh-4242.jsonl").write_text('{"event":"bridge/hello"}\n', encoding="utf-8")
+    monitor = DshMonitor("dsh", tmp_path / "config")
+    try:
+        ok, reason, message = monitor.bridge_health(profile_dirs=[profile], pids=[4242])
+        assert ok is True, (reason, message)
+        assert reason == "" and message == ""
+    finally:
+        monitor.stop()
+
+
+def test_bridge_health_names_the_other_three_states(tmp_path):
+    """未安装 / 未启用 / link 目标缺失：各自给出可操作结论，且不互相掩盖。"""
+    monitor = DshMonitor("dsh", tmp_path / "config")
+    try:
+        plugin = tmp_path / "bridge-plugin"
+        plugin.mkdir()
+        # 未安装
+        empty_profile = tmp_path / "profiles" / "web"
+        empty_profile.mkdir(parents=True)
+        (empty_profile / "package.json").write_text('{"dependencies": {}}', encoding="utf-8")
+        assert monitor.bridge_health(profile_dirs=[empty_profile], pids=[])[1] == "not-installed"
+        # 已安装但不在 bundles（DSH 不会加载）
+        unbundled = tmp_path / "profiles2" / "web"
+        _write_profile(unbundled, declared=True, bundled=False, target=plugin)
+        ok, reason, message = monitor.bridge_health(profile_dirs=[unbundled], pids=[])
+        assert ok is False and reason == "disabled" and "启用" in message
+        # link 目标不存在
+        broken = tmp_path / "profiles3" / "web"
+        _write_profile(broken, declared=True, bundled=True, target=tmp_path / "gone")
+        ok, reason, message = monitor.bridge_health(profile_dirs=[broken], pids=[])
+        assert ok is False and reason == "link-missing" and "缺失" in message
+    finally:
+        monitor.stop()
+
+
+def test_manager_bubbles_one_restart_hint_per_reason(tmp_path):
+    """健康问题必须弹气泡（不受概率门控制），同一原因不重复刷屏。"""
+    _qapp()
+    bubbles = []
+
+    class DummyWindow:
+        def isVisible(self):
+            return True
+
+        def show_bubble(self, text, duration_ms=3000):
+            bubbles.append(text)
+
+    cfg = Config(base=tmp_path)
+    manager = AgentLinkManager(DummyWindow(), cfg, min_interval=0)
+    try:
+        manager._on_bridge_health_issue("dsh", "not-loaded", "DSH 没有加载桥接插件——重启一次 DSH")
+        assert len(bubbles) == 1 and "重启" in bubbles[0], bubbles
+        manager._on_bridge_health_issue("dsh", "not-loaded", "DSH 没有加载桥接插件——重启一次 DSH")
+        assert len(bubbles) == 1, "同一原因在冷却窗口内不得重复弹"
+        # 不同原因各自提示（不会被上一个原因挤掉）
+        manager._on_bridge_health_issue("dsh", "link-missing", "桥接插件文件缺失——请重新安装桥接")
+        assert len(bubbles) == 2, bubbles
+    finally:
+        manager.shutdown()
