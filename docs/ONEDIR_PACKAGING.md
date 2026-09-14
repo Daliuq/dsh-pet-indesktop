@@ -107,3 +107,18 @@ python -m pytest -q tests/test_config_key_migration.py
 会按系统 ANSI（本机 GBK）解码中文，字节序列可能吃掉引号/反引号并把函数签名解析坏
 （症状是莫名的 `Parameter set cannot be resolved`）。仓库有回归测试
 `tests/test_desktop_pet_features.py::test_windows_build_script_keeps_its_utf8_bom` 守着这条。
+
+### 5.2 冒烟"启动成功"的判据：轮询 45s + 应用日志标记（2026-09-14 两次误判）
+
+原实现是启动 exe 后 `Start-Sleep -Seconds 10`、只看一次 `MainWindowHandle`，两次把**成功**的
+构建判成失败：
+
+1. **冷启动慢于 10 秒**：全新产物的 `_internal` 要经过 Defender/索引器扫描，实测冷启动 >10s、
+   热启动恰好 ~10s；日志显示应用启动完全正常，只是窗口还没出来。
+2. **窗口句柄依赖会话/桌面状态**：构建跑在"目标屏幕暂不在线"的会话里时
+   （日志实测 `目标屏幕 \\.\DISPLAY1 暂不在线`、`avail=(0,0,799,799) dpr=1.0`），窗口可能创建在
+   查不到句柄的桌面上。
+
+现在：轮询最多 **45 秒**，命中任一信号即通过 ——（a）进程主窗口句柄出现；或（b）**应用自己的
+日志**出现 `[VIS] 桌宠显示`（`pet/window.py`）或 `进入事件循环`（`pet/app.py`）。失败时错误信息
+会附上该实例 `%APPDATA%\<name>\pet-<pid>.log` 的尾部，便于区分"启动崩了"与"只是慢/显示会话异常"。

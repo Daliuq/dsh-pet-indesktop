@@ -2112,6 +2112,25 @@ def test_windows_build_refuses_to_wipe_a_locked_output_dir():
     assert "Get-BridgeLinkedProfile" in script
 
 
+def test_windows_build_smoke_polls_for_a_cold_start_instead_of_a_fixed_wait():
+    """冒烟等待启动必须轮询，且不能只信窗口句柄（2026-09-14 两次误判回归）。
+
+    原实现是 `Start-Sleep -Seconds 10` 后只看一次 MainWindowHandle：
+    1) 全新构建产物第一次启动时 Defender/索引器要扫描数百 MB 的 `_internal`——冷启动
+       实测 >10s、热启动恰好 ~10s，于是"构建其实成功"被误判成"启动失败"；
+    2) 窗口句柄还依赖会话/桌面显示状态：构建跑在"目标屏幕暂不在线"的会话里时
+       （实测 avail=(0,0,799,799) dpr=1.0），窗口创建在查不到句柄的桌面上，同样误判。
+    现在轮询到 45 秒，并接受应用自己日志里的启动标记（pet/window.py 的 "[VIS] 桌宠显示"
+    / pet/app.py 的 "进入事件循环"）作为通过证据；失败时附上应用日志尾部。
+    """
+    script = Path("scripts/build_onedir.ps1").read_text(encoding="utf-8-sig")
+    assert "Start-Sleep -Seconds 10" not in script, "冒烟不得再用固定 10 秒等待"
+    assert "$smokeDeadline" in script and "AddSeconds(45)" in script
+    assert "[VIS] 桌宠显示" in script and "进入事件循环" in script, \
+        "冒烟必须接受应用日志里的启动标记（窗口句柄依赖显示会话，不可靠）"
+    assert "Get-AppLogTail" in script, "冒烟失败必须带上应用日志尾部（否则无法区分崩溃与慢启动）"
+
+
 def test_modern_animation_leaf_icons_are_loaded_only_when_category_opens(monkeypatch):
     import time
 

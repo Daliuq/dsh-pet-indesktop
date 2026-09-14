@@ -190,6 +190,20 @@ function Get-BridgeLinkedProfile {
     }
 }
 
+# 冒烟失败时把应用**自己的**日志尾部带进错误信息：只报一句"没出现主窗口"时无法
+# 区分"启动崩了"和"还在加载资产 / 被杀毒软件拖慢"，实测就误判过一次（见下方轮询
+# 说明）。日志是 UTF-8，必须显式指定编码，否则 PS 5.1 按 ANSI 读出乱码。
+function Get-AppLogTail {
+    param([string]$AppName, [int]$Lines = 15)
+    $dir = Join-Path $env:APPDATA $AppName
+    if (-not (Test-Path -LiteralPath $dir)) { return "  (no log dir: $dir)" }
+    $log = Get-ChildItem -LiteralPath $dir -Filter 'pet-*.log' -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if (-not $log) { return "  (no pet-*.log in $dir)" }
+    $tail = (Get-Content -LiteralPath $log.FullName -Tail $Lines -Encoding UTF8) -join "`n  "
+    return "  $($log.FullName)`n  $tail"
+}
+
 if (-not $SkipBuild) {
     Write-Host "[0/3] Generating app icon..." -ForegroundColor Cyan
     python scripts\make_icon.py
@@ -437,17 +451,49 @@ Write-Host "[smoke] bundle DLL chain OK" -ForegroundColor Green
 
 Write-Host "[smoke] Launching $exePath ..." -ForegroundColor Cyan
 $proc = Start-Process -FilePath $exePath -PassThru
-Start-Sleep -Seconds 10
-if ($proc.HasExited) {
-    throw "[smoke] exe exited early (code $($proc.ExitCode)) - runtime dependency broken"
+# 轮询等待启动证据，**不要固定 sleep**：全新构建产物第一次启动时，Defender/索引器要
+# 扫描数百 MB 的 _internal，冷启动实测 >10s（热启动约 10s）——固定 10 秒会把一次成功
+# 的构建误判为"启动失败"（2026-09-14 实测）。
+#
+# 判据用两个信号，任一成立即通过：
+#   a) 进程主窗口句柄出现；
+#   b) **应用自己的日志**出现 "桌宠显示" / "进入事件循环"（pet/window.py、pet/app.py 写）。
+# 为什么必须加 b)：窗口句柄依赖当前会话/桌面的显示状态——构建跑在"目标屏幕暂不在线"的
+# 会话里时（实测日志 avail=(0,0,799,799) dpr=1.0），窗口可能创建在查询不到句柄的桌面上，
+# 于是"包其实是好的"被判成启动失败，还把人往 'Failed to execute script' 方向带。应用
+# 日志里的这两个标记才是不依赖显示会话的权威证据。
+$smokeDeadline = (Get-Date).AddSeconds(45)
+$smokeStarted = $false
+$smokeSignal = ''
+$smokeLog = Join-Path (Join-Path $env:APPDATA $name) "pet-$($proc.Id).log"
+while ((Get-Date) -lt $smokeDeadline) {
+    Start-Sleep -Milliseconds 500
+    if ($proc.HasExited) { break }
+    $proc.Refresh()
+    if ($proc.MainWindowHandle -ne 0) {
+        $smokeStarted = $true
+        $smokeSignal = "main window (handle $($proc.MainWindowHandle))"
+        break
+    }
+    if (Test-Path -LiteralPath $smokeLog) {
+        $appLogText = ''
+        try { $appLogText = Get-Content -LiteralPath $smokeLog -Raw -Encoding UTF8 -ErrorAction Stop } catch { $appLogText = '' }
+        if ($appLogText -and ($appLogText.Contains('[VIS] 桌宠显示') -or $appLogText.Contains('进入事件循环'))) {
+            $smokeStarted = $true
+            $smokeSignal = "app log marker (pet-$($proc.Id).log)"
+            break
+        }
+    }
 }
-$proc.Refresh()
-if ($proc.MainWindowHandle -eq 0) {
+if ($proc.HasExited) {
+    throw "[smoke] exe exited early (code $($proc.ExitCode)) - runtime dependency broken`n  app log tail:`n$(Get-AppLogTail -AppName $name)"
+}
+if (-not $smokeStarted) {
     Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-    throw "[smoke] exe running but no main window appeared - startup failed (likely 'Failed to execute script')"
+    throw "[smoke] no main window and no startup marker in the app log within 45s - startup failed`n  app log tail:`n$(Get-AppLogTail -AppName $name)"
 }
 Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-Write-Host "[smoke] exe started OK" -ForegroundColor Green
+Write-Host "[smoke] exe started OK ($smokeSignal)" -ForegroundColor Green
 
 if (-not $SkipZip) {
     Write-Host "[2/3] Packing portable zip..." -ForegroundColor Cyan
