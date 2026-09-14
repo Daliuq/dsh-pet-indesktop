@@ -81,3 +81,29 @@ python -m pytest -q tests/test_config_key_migration.py
 - **旧 onefile 遗留清理**：`pet/app.py` 启动时的 `_cleanup_stale_runtime_dirs` 保留，会顺带清掉旧 onefile 版本在系统 Temp 留下的 `_MEI` 目录
 - **本机遗留旧自启项**：注册表 `HKCU\...\Run` 里的 `DesktopPet = E:\software\AI\AI的有用工具\打字统计\dist\DesktopPet.exe` 是 7 月的旧 onefile 构建（无 `start /D`、解压在 C 盘 Temp），建议删除或替换，避免开机双桌宠 + 继续污染 C 盘
 - GIF 变体体积大（800MB+），zip/安装包较慢；WebM 变体约 124MB
+
+### 5.1 输出目录被占用 = 打包失败会连带毁掉上一次安装（2026-09-14 事故）
+
+`PyInstaller --noconfirm --clean` 会**先清空** `dist-onedir\<name>\`。若该目录被别的程序占着，
+删除失败并抛 `WinError 32（另一个程序正在使用此文件）`，而此时目录内容**已经被清空**：
+一次构建失败同时毁掉上一次的在线安装。桌宠/DSH 联动插件就装在
+`<产物>\_internal\integrations\dsh-pet-bridge`——目录一空，`dsh web` 连启动都会失败
+（`cannot resolve profile bundle "@dsh-pet/bridge"`，因为用户 profile 里是
+`"@dsh-pet/bridge": "link:<产物>/_internal/integrations/dsh-pet-bridge"`）。
+
+**典型占用者**（按常见度）：
+
+1. **一个停在 `dist-onedir\<name>\` 里的资源管理器窗口**——Windows 登录时会恢复上次的资源管理器
+   窗口，所以**重启电脑完全无效**（这是最坑的一点）；
+2. 正在运行的桌宠 `<name>.exe`（脚本会按进程名尝试结束它）；
+3. 正在运行的 DSH 本身（profile 把桥接插件 link 到该目录内，插件加载即握住这里的文件）。
+
+**脚本行为**（`scripts/build_onedir.ps1`）：调用 PyInstaller 之前先 `Assert-OutputDirNotLocked`
+（用"改名再改回"探测目录句柄——资源管理器持有的是目录句柄，Restart Manager 只能看到文件级占用者），
+锁着就**中止并保留上一次的安装**，同时打印可操作提示；若发现某个 DSH profile 把
+`@dsh-pet/bridge` link 到构建输出，会额外提示先停 DSH。打包前请关掉该目录的资源管理器窗口。
+
+**另外**：`scripts/build_onedir.ps1` 必须保存为 **UTF-8 with BOM**。PowerShell 5.1 读无 BOM 的 `.ps1`
+会按系统 ANSI（本机 GBK）解码中文，字节序列可能吃掉引号/反引号并把函数签名解析坏
+（症状是莫名的 `Parameter set cannot be resolved`）。仓库有回归测试
+`tests/test_desktop_pet_features.py::test_windows_build_script_keeps_its_utf8_bom` 守着这条。
