@@ -181,7 +181,7 @@ class TodoPanelDialog(QDialog):
     def _build_agent_entry(self) -> QDialog:
         dialog = QDialog(self)
         dialog.setObjectName("todoAgentDialog")
-        dialog.setWindowTitle("新建待办")
+        dialog.setWindowTitle("文字生成待办")
         dialog.setModal(True)
         dialog.resize(560, 420)
         dialog.setMinimumSize(440, 360)
@@ -339,7 +339,9 @@ class TodoPanelDialog(QDialog):
         self._scroll.setWidget(self._rows_host)
         card_layout.addWidget(self._scroll, stretch=1)
 
-        self._empty_label = QLabel("还没有待办，点下方「新建待办」添加一条。")
+        self._empty_label = QLabel(
+            "还没有待办，可点「新建待办」手动添加，或用「文本生成」识别。"
+        )
         self._empty_label.setObjectName("todoEmptyLabel")
         self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._empty_label.setWordWrap(True)
@@ -353,8 +355,20 @@ class TodoPanelDialog(QDialog):
         self._add_btn = QPushButton("新建待办")
         self._add_btn.setObjectName("todoAddButton")
         self._add_btn.setProperty("accent", True)
-        self._add_btn.clicked.connect(self.open_agent_dialog)
+        self._add_btn.setAccessibleName("新建待办")
+        self._add_btn.setAccessibleDescription("展开原有手动待办表单。")
+        self._add_btn.clicked.connect(self.begin_add)
         footer.addWidget(self._add_btn)
+
+        self._agent_open_btn = QPushButton("文本生成")
+        self._agent_open_btn.setObjectName("todoAgentOpenButton")
+        self._agent_open_btn.setToolTip("粘贴包含事情和时间的文本，自动识别并添加待办")
+        self._agent_open_btn.setAccessibleName("从文字生成待办")
+        self._agent_open_btn.setAccessibleDescription(
+            "打开独立窗口，使用当前内置 AI 对话模型识别并添加待办。"
+        )
+        self._agent_open_btn.clicked.connect(self.open_agent_dialog)
+        footer.addWidget(self._agent_open_btn)
         footer.addStretch(1)
         hint = QLabel("提醒开关与提前量在 桌宠设置 → 自动化与联动")
         hint.setObjectName("todoHintLabel")
@@ -564,6 +578,7 @@ class TodoPanelDialog(QDialog):
         self._sync_date_visibility()
         self._editor_card.setVisible(True)
         self._add_btn.setEnabled(False)
+        self._agent_open_btn.setEnabled(False)
         self._title_edit.setFocus()
         self._sync_save_enabled()
 
@@ -584,6 +599,7 @@ class TodoPanelDialog(QDialog):
         self._sync_date_visibility()
         self._editor_card.setVisible(True)
         self._add_btn.setEnabled(False)
+        self._agent_open_btn.setEnabled(False)
         self._title_edit.setFocus()
         self._sync_save_enabled()
 
@@ -591,6 +607,7 @@ class TodoPanelDialog(QDialog):
         self._editing_id = None
         self._editor_card.setVisible(False)
         self._add_btn.setEnabled(True)
+        self._agent_open_btn.setEnabled(True)
 
     def save_editor(self) -> None:
         title = self._title_edit.text().strip()

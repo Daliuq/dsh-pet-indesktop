@@ -67,7 +67,7 @@ def _qapp():
     return QApplication.instance() or QApplication([])
 
 
-def test_new_todo_button_opens_text_agent_popup_with_manual_entry_fallback():
+def test_new_todo_button_keeps_manual_flow_and_agent_button_opens_popup():
     from pet.todo_panel import TodoPanelDialog
 
     app = _qapp()
@@ -77,14 +77,26 @@ def test_new_todo_button_opens_text_agent_popup_with_manual_entry_fallback():
         app.processEvents()
         popup = panel.findChild(QDialog, "todoAgentDialog")
         new_todo = panel.findChild(QPushButton, "todoAddButton")
+        generate = panel.findChild(QPushButton, "todoAgentOpenButton")
         manual = panel.findChild(QPushButton, "todoManualAddButton")
 
         assert popup is not None
         assert new_todo is not None
+        assert generate is not None
         assert manual is not None
         assert not popup.isVisible()
 
         new_todo.click()
+        app.processEvents()
+        assert not popup.isVisible()
+        assert panel._editor_card.isVisible()
+        assert not generate.isEnabled()
+
+        panel.close_editor()
+        app.processEvents()
+        assert generate.isEnabled()
+
+        generate.click()
         app.processEvents()
         assert popup.isVisible()
         assert not panel._editor_card.isVisible()
@@ -93,6 +105,7 @@ def test_new_todo_button_opens_text_agent_popup_with_manual_entry_fallback():
         app.processEvents()
         assert not popup.isVisible()
         assert panel._editor_card.isVisible()
+        assert not generate.isEnabled()
     finally:
         panel.close()
 
