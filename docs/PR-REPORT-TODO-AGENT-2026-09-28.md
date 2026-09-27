@@ -2,7 +2,7 @@
 
 > **基线**：`2786c156dc61774a4195d6930806bb0471b59884`（origin/main，Merge PR #190）
 > **分支**：`codex/todo-agent-entry-packaging`　**日期**：2026-09-28
-> **范围**：10 个文件（实现/工具 5、测试 3、文档 2）
+> **范围**：11 个文件（实现/工具 5、测试 4、文档 2）
 > **关联**：[`ONEDIR_PACKAGING.md`](ONEDIR_PACKAGING.md)
 
 ## 一、核心特性
@@ -33,6 +33,7 @@
 |---|---:|---|
 | `tests/test_desktop_pet_features.py` | +2 / −0 | 将 PR 报告排除在产品文案品牌扫描之外；报告记录分支与验证工具，不属于产品文案。 |
 | `tests/test_requested_regressions.py` | +16 / −0 | 锁定打包依赖预检与应用就绪检查。 |
+| `tests/test_session_end_ffmpeg_guard.py` | +6 / −0 | 用事件同步对照组的 reader 与后台元数据探测，避免主线程立即断言造成 Windows 竞态失败。 |
 | `tests/test_todo_agent.py` | +226 / −0 | 覆盖原有手动入口、独立文本生成弹窗、模型提示刷新、提交状态、清空条件与结果写入。 |
 
 ### 文档
@@ -40,7 +41,7 @@
 | 文件 | 增删 | 改动意图 |
 |---|---:|---|
 | `docs/INDEX.md` | +1 / −0 | 登记本报告。 |
-| `docs/PR-REPORT-TODO-AGENT-2026-09-28.md` | +88 / −0 | 本文件；新增本次 PR 的三项交付证据。 |
+| `docs/PR-REPORT-TODO-AGENT-2026-09-28.md` | +89 / −0 | 本文件；新增本次 PR 的三项交付证据。 |
 
 ## 三、实现要点
 
@@ -78,7 +79,7 @@
 | 定向 | `python -m pytest -q tests/test_todo_agent.py tests/test_requested_regressions.py::test_onedir_build_preflights_lunar_python_and_waits_for_app_readiness` | 6 passed |
 | 静态 | `python -m ruff check pet tests scripts` | All checks passed |
 | 基准 | `python -m scripts.benchmark_todo_agent --samples 1000 --idle-seconds 5` | 1,000 accepted；无网络；数值见性能表 |
-| 全量（PR 文件范围） | CI 同款 pytest 命令（排除四个隔离时序测试）；本地额外忽略一项未跟踪测试文件 | 2907 passed, 11 skipped, 3 warnings（199.02 s） |
+| 全量（PR 文件范围） | CI 同款 pytest 命令（排除四个隔离时序测试）；本地额外忽略一项未跟踪测试文件 | 2907 passed, 11 skipped, 3 warnings（200.01 s） |
 | 本地额外忽略 | `tests/test_dsh_control_cross_language.py` | 该文件在当前工作区未跟踪、不属于 PR；复测按 PR 提交文件范围运行，CI 使用实际提交文件集合 |
 | 打包 | `scripts/build_onedir.ps1 -Variant webm-chat`；`python -m zipfile -t dist-onedir/dsh-pet-standalone-webm-chat-portable.zip` | 启动、设置窗口、DLL、编码检查与 ZIP CRC 均通过 |
 
