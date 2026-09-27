@@ -83,6 +83,8 @@ def test_new_todo_button_keeps_manual_flow_and_agent_button_opens_popup():
         assert popup is not None
         assert new_todo is not None
         assert generate is not None
+        assert generate.property("accent") is True
+        assert generate.property("accent") == new_todo.property("accent")
         assert manual is not None
         assert not popup.isVisible()
 

@@ -362,6 +362,7 @@ class TodoPanelDialog(QDialog):
 
         self._agent_open_btn = QPushButton("文本生成")
         self._agent_open_btn.setObjectName("todoAgentOpenButton")
+        self._agent_open_btn.setProperty("accent", True)
         self._agent_open_btn.setToolTip("粘贴包含事情和时间的文本，自动识别并添加待办")
         self._agent_open_btn.setAccessibleName("从文字生成待办")
         self._agent_open_btn.setAccessibleDescription(
