@@ -772,6 +772,16 @@ class ModernSettingsDialog(QDialog):
                     SettingRow(
                         "todo_reminder_lead_minutes", "提前提醒", "到点前提前提醒的分钟数（0~60，0 = 不提前，仅准点提醒一次）。", self.todo_reminder_lead_spin
                     ),
+                    SettingRow(
+                        "todo_schedule_work_hours", "工作时段",
+                        "会议、工作任务等在此范围安排；结合已有待办时间习惯与冲突挑选空档。默认 09:00–17:00，按整点且包含结束整点。",
+                        self.todo_schedule_work_hours, stacked=True,
+                    ),
+                    SettingRow(
+                        "todo_schedule_rest_hours", "非工作时段",
+                        "学习、技术阅读和个人提升等在此范围安排；结合已有待办时间习惯与冲突挑选空档。默认 18:00–22:00，按整点且包含结束整点。",
+                        self.todo_schedule_rest_hours, stacked=True,
+                    ),
                 ],
                 behavior_content,
             )
@@ -1846,7 +1856,10 @@ class ModernSettingsDialog(QDialog):
         gate_rows = claim_prefix("report_gate_")
         automation = page_content(
             [
-                ("待办提醒", claim("todo_reminder_enabled", "todo_reminder_lead_minutes")),
+                ("待办提醒", claim(
+                    "todo_reminder_enabled", "todo_reminder_lead_minutes",
+                    "todo_schedule_work_hours", "todo_schedule_rest_hours",
+                )),
                 ("主动感知", proactive_rows),
                 ("循环检测", loop_rows),
                 ("卡住检测", stuck_rows),
@@ -2246,6 +2259,12 @@ class ModernSettingsDialog(QDialog):
         self.config.set("agent_link", agent_cfg)
         self.config.set("todo_reminder_enabled", self.todo_reminder_check.isChecked())
         self.config.set("todo_reminder_lead_minutes", int(self.todo_reminder_lead_spin.value()))
+        self.config.set_todo_schedule_windows(
+            int(self.todo_schedule_work_start.value()),
+            int(self.todo_schedule_work_end.value()),
+            int(self.todo_schedule_rest_start.value()),
+            int(self.todo_schedule_rest_end.value()),
+        )
         # 语音报时设置页写回（仅写 voice_chime_* 11 键）
         if self.voice_chime_page is not None:
             self.voice_chime_page.apply_to_config()

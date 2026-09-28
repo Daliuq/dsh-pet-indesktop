@@ -12,10 +12,12 @@ import sys
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -59,6 +61,44 @@ from .settings_widgets import (
     _line_edit,
 )
 from .speech_bubble import BUBBLE_STYLE_PRESETS
+
+
+def _todo_schedule_period_control(host, period: str, title: str, default_start: int, default_end: int):
+    start = BrowserSpinBox(host)
+    start.setObjectName(f"todoSchedule{period.title()}StartHour")
+    start.setRange(0, 22)
+    start.setSuffix(" 时")
+    start.setValue(int(host.config.get(f"todo_schedule_{period}_start_hour", default_start)))
+    start.setAccessibleName(f"{title}开始")
+    start.setAccessibleDescription("文本生成待办自动选择时间的起点，精确到整点。")
+
+    end = BrowserSpinBox(host)
+    end.setObjectName(f"todoSchedule{period.title()}EndHour")
+    end.setRange(1, 23)
+    end.setSuffix(" 时")
+    end.setValue(int(host.config.get(f"todo_schedule_{period}_end_hour", default_end)))
+    end.setAccessibleName(f"{title}结束")
+    end.setAccessibleDescription("文本生成待办自动选择时间的终点，精确到整点，包含结束整点。")
+
+    start.valueChanged.connect(lambda value: end.setMinimum(value + 1))
+    end.valueChanged.connect(lambda value: start.setMaximum(value - 1))
+
+    control = QWidget(host)
+    control.setObjectName(f"todoSchedule{period.title()}HoursControl")
+    control.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+    layout = QHBoxLayout(control)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(6)
+    layout.addWidget(QLabel("开始", control))
+    layout.addWidget(start)
+    layout.addSpacing(8)
+    layout.addWidget(QLabel("结束", control))
+    layout.addWidget(end)
+    control.setAccessibleName(title)
+    setattr(host, f"todo_schedule_{period}_start", start)
+    setattr(host, f"todo_schedule_{period}_end", end)
+    return control
+
 
 def build_pet_controls(host) -> None:
     from .modern_settings_dialog import dialogue_params_hint
@@ -495,6 +535,12 @@ def build_pet_controls(host) -> None:
     host.todo_reminder_lead_spin.setRange(0, 60)
     host.todo_reminder_lead_spin.setSuffix(" 分钟")
     host.todo_reminder_lead_spin.setValue(int(host.config.get("todo_reminder_lead_minutes", 5) or 0))
+    host.todo_schedule_work_hours = _todo_schedule_period_control(
+        host, "work", "工作时间", 9, 17
+    )
+    host.todo_schedule_rest_hours = _todo_schedule_period_control(
+        host, "rest", "非工作时间", 18, 22
+    )
 
     appearance = host.config.get("context_menu_appearance", DEFAULT_CONTEXT_MENU_APPEARANCE)
     host.menu_theme_select = ModernSelect(host, width=132)

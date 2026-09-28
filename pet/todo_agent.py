@@ -32,14 +32,15 @@ _SYSTEM_PROMPT = """你是待办事项抽取器。只分析用户消息中用户
 可以从自然语言理解日期和时间，包括今天/明天/后天、星期、具体日期、上午/下午、相对时间；
 用用户给出的当前本地时间解析相对日期。把用户明确说出的日期标为 date_is_explicit=true，
 明确说出的钟点标为 time_is_explicit=true；没有明确日期/钟点时，date/time 留空并标为 false，
-由本地待办调度器查询现有待办后选择空档，不要擅自填 09:00 或伪称查过外部日历。
+没有明确钟点时，每项都单独判断 schedule_period，不要把整条消息统一归类：会议、工作事项、赶进度、完成任务/交付归 work；学习新技术/技术阅读、自我提升和个人安排归 rest，即使学习内容与工作相关；明确的休息安排也归 rest；语义不清楚才归 any。
+由本地待办调度器结合对应时段、现有待办时间习惯与冲突选择空档，不要擅自填时间或伪称查过外部日历。
 所有事项都沿用用户当前设置的全局提醒提前量，不根据事项类型单独调整。“中午”按 12:00 解析；“下午/下班前”按语境理解。
 “每周/每天”等明确重复安排只支持 daily（每天）；不支持的重复周期不要伪装成单次待办。
 忽略已经完成、纯假设、泛泛讨论、没有未来行动意图的内容。最多抽取 5 项，每项标题简短且以行动为中心。
 严格只返回 JSON，不要 Markdown 或解释，格式：
-{"todos":[{"title":"事项","kind":"once","date":"YYYY-MM-DD","date_is_explicit":true,"time":"HH:MM","time_is_explicit":true}]}
+{"todos":[{"title":"事项","kind":"once","date":"YYYY-MM-DD","date_is_explicit":true,"time":"HH:MM","time_is_explicit":true,"schedule_period":"work"}]}
 kind 只能为 once 或 daily；daily 的 date 留空。所有明确时间的 once 项必须给出有效 date；
-time_is_explicit=false 时 time 留空，date_is_explicit=false 时 date 留空。"""
+time_is_explicit=false 时 time 留空，date_is_explicit=false 时 date 留空。schedule_period 只能为 work、rest、any。"""
 
 
 def _normalise_schedule(existing_todos) -> tuple[tuple[str, str, str], ...]:
@@ -90,11 +91,41 @@ def _format_schedule_context(existing_todos, now: datetime) -> str:
 
 
 def find_available_todo_slot(
-    existing_todos, now: datetime | None = None, *, requested_date: str = ""
+    existing_todos,
+    now: datetime | None = None,
+    *,
+    requested_date: str = "",
+    schedule_period: str = "any",
+    work_start_hour: int = 9,
+    work_end_hour: int = 17,
+    rest_start_hour: int = 18,
+    rest_end_hour: int = 22,
 ) -> tuple[str, str] | None:
-    """从启用待办中找相对空闲的一小时格；只看本地待办，不代表外部日历空闲。"""
+    """按事项所属时段、本地待办占用与时间习惯选择空档，不代表外部日历空闲。"""
     now = (now or datetime.now()).replace(tzinfo=None)
     schedule = list(_normalise_schedule(existing_todos))
+
+    def clean_window(start, end, defaults):
+        try:
+            start, end = int(start), int(end)
+        except (TypeError, ValueError):
+            return defaults
+        return (start, end) if 0 <= start < end <= 23 else defaults
+
+    work_start_hour, work_end_hour = clean_window(work_start_hour, work_end_hour, (9, 17))
+    rest_start_hour, rest_end_hour = clean_window(rest_start_hour, rest_end_hour, (18, 22))
+    schedule_period = str(schedule_period or "any").strip().lower()
+    if schedule_period not in {"work", "rest", "any"}:
+        schedule_period = "any"
+    work_hours = range(work_start_hour, work_end_hour + 1)
+    rest_hours = range(rest_start_hour, rest_end_hour + 1)
+    if schedule_period == "work":
+        candidate_hours = tuple(work_hours)
+    elif schedule_period == "rest":
+        candidate_hours = tuple(rest_hours)
+    else:
+        candidate_hours = tuple(sorted(set(work_hours) | set(rest_hours)))
+    candidate_hour_set = set(candidate_hours)
     if requested_date:
         if not _ISO_DATE.fullmatch(requested_date):
             return None
@@ -108,8 +139,20 @@ def find_available_todo_slot(
 
     day_set = set(candidate_days)
     busy_by_day: dict[date, list[datetime]] = {day: [] for day in candidate_days}
+    habit_weights: dict[int, int] = {}
     for kind, date_text, time_text in schedule:
         hour, minute = (int(part) for part in time_text.split(":"))
+        if kind == "daily" and hour in candidate_hour_set:
+            habit_weights[hour] = habit_weights.get(hour, 0) + 2
+        elif (
+            kind == "once"
+            and hour in candidate_hour_set
+            and date.fromisoformat(date_text) in day_set
+        ):
+            day = date.fromisoformat(date_text)
+            due = datetime(day.year, day.month, day.day, hour, minute)
+            if due > now:
+                habit_weights[hour] = habit_weights.get(hour, 0) + 1
         if kind == "daily":
             for day in candidate_days:
                 due = datetime(day.year, day.month, day.day, hour, minute)
@@ -124,17 +167,27 @@ def find_available_todo_slot(
 
     candidates = []
     buffer = timedelta(minutes=_AUTO_SCHEDULE_BUFFER_MINUTES)
+    total_habit_weight = sum(habit_weights.values())
+    habit_affinity_by_hour = {
+        hour: (
+            sum(weight / (1 + abs(hour - habit_hour)) for habit_hour, weight in habit_weights.items())
+            / total_habit_weight
+            if total_habit_weight
+            else 0.0
+        )
+        for hour in candidate_hours
+    }
     for day in candidate_days:
         busy = busy_by_day[day]
-        for hour in range(9, 18):
+        for hour in candidate_hours:
             slot = datetime(day.year, day.month, day.day, hour)
             if slot <= now:
                 continue
             nearby = sum(abs(slot - due) <= buffer for due in busy)
-            candidates.append((nearby, len(busy), day, slot))
+            candidates.append((nearby, len(busy), -habit_affinity_by_hour[hour], day, slot))
     if not candidates:
         return None
-    _, _, day, slot = min(candidates)
+    _, _, _, day, slot = min(candidates)
     return day.isoformat(), slot.strftime("%H:%M")
 
 
@@ -166,6 +219,10 @@ def parse_todo_response(
     now: datetime | None = None,
     *,
     existing_todos=None,
+    work_start_hour: int = 9,
+    work_end_hour: int = 17,
+    rest_start_hour: int = 18,
+    rest_end_hour: int = 22,
 ) -> list[dict]:
     """校验模型输出，并用现有待办为未标时间的事项选择本地空档。"""
     payload = _decode_json(text)
@@ -202,6 +259,9 @@ def parse_todo_response(
         if not _HHMM.fullmatch(time_text):
             time_is_explicit = False
         date_selected_by_scheduler = not time_is_explicit
+        schedule_period = str(raw.get("schedule_period") or "any").strip().lower()
+        if schedule_period not in {"work", "rest", "any"}:
+            schedule_period = "any"
         if time_is_explicit:
             hour, minute = (int(part) for part in time_text.split(":"))
             time_text = f"{hour:02d}:{minute:02d}"
@@ -211,6 +271,11 @@ def parse_todo_response(
                 schedule,
                 now,
                 requested_date=date_text if date_is_explicit else "",
+                schedule_period=schedule_period,
+                work_start_hour=work_start_hour,
+                work_end_hour=work_end_hour,
+                rest_start_hour=rest_start_hour,
+                rest_end_hour=rest_end_hour,
             )
             if slot is None:
                 continue
@@ -276,7 +341,17 @@ class TodoAgent(QObject):
             return False
         schedule = _normalise_schedule(existing_todos)
         try:
-            self._queue.put_nowait((str(session_id or ""), message, provider, schedule))
+            work_start_hour = int(self._config.get("todo_schedule_work_start_hour", 9))
+            work_end_hour = int(self._config.get("todo_schedule_work_end_hour", 17))
+            rest_start_hour = int(self._config.get("todo_schedule_rest_start_hour", 18))
+            rest_end_hour = int(self._config.get("todo_schedule_rest_end_hour", 22))
+        except (AttributeError, TypeError, ValueError):
+            work_start_hour, work_end_hour, rest_start_hour, rest_end_hour = 9, 17, 18, 22
+        try:
+            self._queue.put_nowait((
+                str(session_id or ""), message, provider, schedule,
+                work_start_hour, work_end_hour, rest_start_hour, rest_end_hour,
+            ))
         except queue.Full:
             logger.info("待办 Agent 队列已满，跳过一条消息")
             return False
@@ -307,7 +382,10 @@ class TodoAgent(QObject):
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                session_id, message, provider, schedule = self._queue.get(timeout=0.2)
+                (
+                    session_id, message, provider, schedule,
+                    work_start_hour, work_end_hour, rest_start_hour, rest_end_hour,
+                ) = self._queue.get(timeout=0.2)
             except queue.Empty:
                 continue
             if self._stop.is_set():
@@ -344,7 +422,13 @@ class TodoAgent(QObject):
                             self._active_cancel = None
                             self._active_responses = []
                 todos = parse_todo_response(
-                    response, local_now, existing_todos=schedule
+                    response,
+                    local_now,
+                    existing_todos=schedule,
+                    work_start_hour=work_start_hour,
+                    work_end_hour=work_end_hour,
+                    rest_start_hour=rest_start_hour,
+                    rest_end_hour=rest_end_hour,
                 )
                 if not self._stop.is_set():
                     self.todos_extracted.emit(session_id, todos)
