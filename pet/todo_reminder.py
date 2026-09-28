@@ -31,6 +31,7 @@ TODO_TITLE_LIMIT = 80
 TODO_KINDS = ("once", "daily")
 DEFAULT_GRACE_MINUTES = 10
 DEFAULT_TODO_TIME = "09:00"
+TODO_ITEM_LEAD_MINUTES_MAX = 60
 
 _HHMM_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
@@ -53,7 +54,13 @@ def _normalize_iso_date(value) -> str:
         return ""
 
 
-def new_todo_item(title, kind, time_text, date_text: str = "") -> dict:
+def new_todo_item(
+    title,
+    kind,
+    time_text,
+    date_text: str = "",
+    reminder_lead_minutes: int | None = None,
+) -> dict:
     """构造一条新待办（面板新建入口用）；非法字段按默认值钳制。"""
     kind = str(kind or "").strip()
     item = {
@@ -68,6 +75,10 @@ def new_todo_item(title, kind, time_text, date_text: str = "") -> dict:
     }
     if item["kind"] == "once":
         item["date"] = _normalize_iso_date(date_text) or date.today().isoformat()
+    if (isinstance(reminder_lead_minutes, int)
+            and not isinstance(reminder_lead_minutes, bool)
+            and 0 <= reminder_lead_minutes <= TODO_ITEM_LEAD_MINUTES_MAX):
+        item["reminder_lead_minutes"] = reminder_lead_minutes
     return item
 
 
@@ -93,6 +104,10 @@ def clean_todo_items(value) -> list[dict]:
         for key in ("fired_lead_slot", "fired_due_slot"):
             slot = raw.get(key)
             item[key] = slot if isinstance(slot, str) and slot else None
+        lead = raw.get("reminder_lead_minutes")
+        if (isinstance(lead, int) and not isinstance(lead, bool)
+                and 0 <= lead <= TODO_ITEM_LEAD_MINUTES_MAX):
+            item["reminder_lead_minutes"] = lead
         items.append(item)
     return items
 
@@ -112,6 +127,10 @@ def _fire_datetimes(item: dict, lead_minutes: int, now: datetime):
         day = date.fromisoformat(day_text)
     hour, minute = (int(part) for part in time_text.split(":"))
     due = datetime(day.year, day.month, day.day, hour, minute)
+    item_lead = item.get("reminder_lead_minutes")
+    if (isinstance(item_lead, int) and not isinstance(item_lead, bool)
+            and 0 <= item_lead <= TODO_ITEM_LEAD_MINUTES_MAX):
+        lead_minutes = item_lead
     lead = due - timedelta(minutes=lead_minutes) if lead_minutes > 0 else None
     return lead, due
 
@@ -123,7 +142,8 @@ def advance_todo_state(items, prefs, now: datetime, *,
     - prefs = {"enabled": bool, "lead_minutes": int}；总开关关闭时原样返回；
     - 触发窗口 [触发时刻, +grace] 内产生 fire 并盖戳；出窗静默盖戳；
     - once 条目过 due+grace 自动归档（enabled=False）。
-    fires 元素：{"id", "title", "time", "phase"}，phase ∈ {"lead", "due"}。
+    fires 元素：{"id", "title", "time", "phase", "lead_minutes"}，phase ∈ {"lead", "due"}；
+    lead 档携带实际提前量，due 档的 lead_minutes 为 0。
     """
     if not bool(prefs.get("enabled", True)):
         return [], list(items)
@@ -139,7 +159,14 @@ def advance_todo_state(items, prefs, now: datetime, *,
         if not isinstance(item, dict) or not item.get("enabled"):
             new_items.append(item)
             continue
-        lead_dt, due_dt = _fire_datetimes(item, lead_minutes, now)
+        item_lead = item.get("reminder_lead_minutes")
+        effective_lead = (
+            item_lead
+            if (isinstance(item_lead, int) and not isinstance(item_lead, bool)
+                and 0 <= item_lead <= TODO_ITEM_LEAD_MINUTES_MAX)
+            else lead_minutes
+        )
+        lead_dt, due_dt = _fire_datetimes(item, effective_lead, now)
         time_text = _normalize_hhmm(item.get("time")) or str(item.get("time") or "")
         for phase, fire_dt, slot_key in (
             ("lead", lead_dt, "fired_lead_slot"),
@@ -157,6 +184,7 @@ def advance_todo_state(items, prefs, now: datetime, *,
                     "title": item["title"],
                     "time": item["time"],
                     "phase": phase,
+                    "lead_minutes": effective_lead if phase == "lead" else 0,
                 })
         if (item.get("kind") == "once" and due_dt is not None
                 and now > due_dt + grace):
@@ -331,7 +359,9 @@ class TodoReminderService:
 
     def _notify_fire(self, fire: dict) -> None:
         app = self._app
-        text = f"⏰ 待办提醒：{fire['title']}（{fire['time']}）"
+        lead = int(fire.get("lead_minutes") or 0)
+        suffix = f"，提前{lead}分钟提醒" if fire.get("phase") == "lead" and lead else ""
+        text = f"⏰ 待办提醒：{fire['title']}（{fire['time']}{suffix}）"
         win = getattr(app, "win", None)
         if win is not None and win.isVisible() and not self._bubble_suppressed():
             win.show_bubble(text, duration_ms=self.BUBBLE_DURATION_MS)
@@ -340,7 +370,7 @@ class TodoReminderService:
             return
         notify = getattr(app, "system_notify", None)
         if callable(notify):
-            notify("待办提醒", f"{fire['title']}（{fire['time']}）",
+            notify("待办提醒", f"{fire['title']}（{fire['time']}{suffix}）",
                    on_click=getattr(app, "open_todo_panel", None))
 
     def _bubble_suppressed(self) -> bool:

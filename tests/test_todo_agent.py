@@ -2,11 +2,24 @@
 from __future__ import annotations
 
 import os
+import json
+import threading
 from types import SimpleNamespace
+from datetime import datetime, timedelta
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QDialog, QLabel, QPlainTextEdit, QPushButton
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QFrame,
+    QLabel,
+    QPlainTextEdit,
+    QPushButton,
+)
+from PySide6.QtCore import Qt
+
+from pet.todo_agent import TodoAgent, find_available_todo_slot, parse_todo_response
 
 
 class _TodoService:
@@ -28,8 +41,8 @@ class _TodoAgent:
         self.accepted = accepted
         self.requests = []
 
-    def submit(self, session_id, text):
-        self.requests.append((session_id, text))
+    def submit(self, session_id, text, *, existing_todos=None):
+        self.requests.append((session_id, text, existing_todos))
         return self.accepted
 
 
@@ -42,7 +55,10 @@ class _App:
 
 class _Config:
     def __init__(self):
-        self.provider = SimpleNamespace(name="DeepSeek", model="deepseek-v4-flash")
+        self.provider = SimpleNamespace(
+            name="DeepSeek", model="deepseek-v4-flash", timeout=20,
+            max_tokens=700, api_key="",
+        )
 
     def get(self, key, default=None):
         return default
@@ -79,8 +95,16 @@ def test_new_todo_button_keeps_manual_flow_and_agent_button_opens_popup():
         new_todo = panel.findChild(QPushButton, "todoAddButton")
         generate = panel.findChild(QPushButton, "todoAgentOpenButton")
         manual = panel.findChild(QPushButton, "todoManualAddButton")
+        hint = panel.findChild(QLabel, "todoAgentHint")
 
         assert popup is not None
+        assert popup.accessibleName() == "用文字生成待办"
+        assert popup.windowModality() == Qt.WindowModality.WindowModal
+        assert popup.minimumSize().width() == 440
+        assert popup.findChild(QFrame, "todoAgentCard") is None
+        assert hint is not None
+        assert "已有待办安排空档" in hint.text()
+        assert "提前30分钟" in hint.text()
         assert new_todo is not None
         assert generate is not None
         assert generate.property("accent") is True
@@ -101,13 +125,22 @@ def test_new_todo_button_keeps_manual_flow_and_agent_button_opens_popup():
         generate.click()
         app.processEvents()
         assert popup.isVisible()
+        assert popup.focusWidget() is panel._agent_text
         assert not panel._editor_card.isVisible()
 
         manual.click()
         app.processEvents()
         assert not popup.isVisible()
         assert panel._editor_card.isVisible()
+        assert panel.focusWidget() is panel._title_edit
         assert not generate.isEnabled()
+
+        panel.close_editor()
+        generate.click()
+        app.processEvents()
+        popup.reject()
+        app.processEvents()
+        assert panel.focusWidget() is generate
     finally:
         panel.close()
 
@@ -120,10 +153,13 @@ def test_todo_panel_submits_freeform_text_to_agent_and_reports_result():
     panel = TodoPanelDialog(_App(agent))
     try:
         message = panel.findChild(QPlainTextEdit, "todoAgentInput")
+        input_label = panel.findChild(QLabel, "todoAgentInputLabel")
         submit = panel.findChild(QPushButton, "todoAgentSubmitButton")
         status = panel.findChild(QLabel, "todoAgentStatus")
         model_note = panel.findChild(QLabel, "todoAgentModelNote")
         assert message is not None
+        assert input_label is not None
+        assert input_label.buddy() is message
         assert submit is not None
         assert status is not None
         assert model_note is not None
@@ -136,6 +172,8 @@ def test_todo_panel_submits_freeform_text_to_agent_and_reports_result():
         assert not submit.isEnabled()
 
         message.setPlainText("明天下午三点给客户回电话，然后周五上午提交周报")
+        existing = [{"kind": "once", "date": "2099-09-05", "time": "14:00", "enabled": True}]
+        panel._app.todo_service._items = existing
         panel._app.config.provider.name = "OpenAI-Compatible"
         panel._app.config.provider.model = "gpt-4.1-mini"
         assert submit.isEnabled()
@@ -145,9 +183,10 @@ def test_todo_panel_submits_freeform_text_to_agent_and_reports_result():
         assert "gpt-4.1-mini" in model_note.text()
 
         assert len(agent.requests) == 1
-        session_id, submitted_text = agent.requests[0]
+        session_id, submitted_text, schedule = agent.requests[0]
         assert session_id.startswith("todo-panel:")
         assert submitted_text == message.toPlainText()
+        assert schedule == existing
         assert not submit.isEnabled()
         assert not message.isEnabled()
         assert "正在识别" in status.text()
@@ -206,11 +245,13 @@ def test_app_stores_agent_results_and_completes_the_matching_panel_request():
     AppShell._accept_agent_todos(
         shell,
         session_id,
-        [{"title": "提交周报", "kind": "once", "date": "2026-12-31", "time": "09:00"}],
+        [{"title": "项目会议", "kind": "once", "date": "2026-12-31", "time": "09:00",
+          "reminder_lead_minutes": 30}],
     )
 
     assert len(service.items()) == 1
-    assert service.items()[0]["title"] == "提交周报"
+    assert service.items()[0]["title"] == "项目会议"
+    assert service.items()[0]["reminder_lead_minutes"] == 30
     assert panel.reloaded
     assert panel.completed == [(session_id, "success", 1)]
 
@@ -226,3 +267,161 @@ def test_app_reports_empty_agent_results_to_the_matching_panel_request():
     AppShell._accept_agent_todos(shell, session_id, [])
 
     assert panel.completed == [(session_id, "empty", 0)]
+
+
+def test_dsh_message_passes_current_todo_snapshot_to_agent():
+    from pet.app import AppShell
+
+    agent = _TodoAgent()
+    schedule = [{"kind": "once", "date": "2099-09-05", "time": "14:00", "enabled": True}]
+    shell = AppShell.__new__(AppShell)
+    shell._dsh_link_manager = lambda: None
+    shell._todo_items_for_agent = lambda: schedule
+    shell.todo_agent = agent
+
+    AppShell._on_dsh_user_message(shell, "session-1", "明天有会议")
+
+    assert agent.requests == [("session-1", "明天有会议", schedule)]
+
+
+def test_meeting_response_gets_per_item_30_minute_reminder():
+    now = datetime(2026, 9, 4, 8, 0)
+    result = parse_todo_response(
+        json.dumps({"todos": [{
+            "title": "项目会议",
+            "kind": "once",
+            "date": "2026-09-05",
+            "date_is_explicit": True,
+            "time": "10:00",
+            "time_is_explicit": True,
+            "is_meeting": True,
+        }]}),
+        now,
+    )
+
+    assert result == [{
+        "title": "项目会议",
+        "kind": "once",
+        "date": "2026-09-05",
+        "time": "10:00",
+        "reminder_lead_minutes": 30,
+    }]
+
+
+def test_missing_time_uses_a_free_slot_from_existing_todos():
+    now = datetime(2026, 9, 4, 8, 0)
+    existing = [
+        {"kind": "once", "date": "2026-09-05", "time": time, "enabled": True}
+        for time in ("09:00", "11:00", "13:00")
+    ]
+    result = parse_todo_response(
+        json.dumps({"todos": [{
+            "title": "项目会议",
+            "kind": "once",
+            "date": "2026-09-05",
+            "date_is_explicit": True,
+            "time": "",
+            "time_is_explicit": False,
+            "is_meeting": True,
+        }]}),
+        now,
+        existing_todos=existing,
+    )
+
+    assert result == [{
+        "title": "项目会议",
+        "kind": "once",
+        "date": "2026-09-05",
+        "time": "15:00",
+        "reminder_lead_minutes": 30,
+    }]
+
+
+def test_missing_date_and_time_keep_the_scheduled_open_day():
+    now = datetime(2026, 9, 4, 8, 0)
+    result = parse_todo_response(
+        json.dumps({"todos": [{
+            "title": "准备汇报",
+            "kind": "once",
+            "date": "",
+            "date_is_explicit": False,
+            "time": "",
+            "time_is_explicit": False,
+        }]}),
+        now,
+        existing_todos=[
+            {"kind": "once", "date": "2026-09-04", "time": time, "enabled": True}
+            for time in ("09:00", "10:00", "11:00")
+        ],
+    )
+
+    assert result == [{
+        "title": "准备汇报",
+        "kind": "once",
+        "date": "2026-09-05",
+        "time": "09:00",
+    }]
+
+
+def test_multiple_missing_times_get_distinct_free_slots():
+    now = datetime(2026, 9, 4, 8, 0)
+    result = parse_todo_response(
+        json.dumps({"todos": [
+            {
+                "title": title,
+                "kind": "once",
+                "date": "2026-09-05",
+                "date_is_explicit": True,
+                "time": "",
+                "time_is_explicit": False,
+            }
+            for title in ("准备会议", "整理资料")
+        ]}),
+        now,
+        existing_todos=[
+            {"kind": "once", "date": "2026-09-05", "time": time, "enabled": True}
+            for time in ("09:00", "11:00", "13:00")
+        ],
+    )
+
+    assert [item["date"] for item in result] == ["2026-09-05", "2026-09-05"]
+    assert [item["time"] for item in result] == ["15:00", "17:00"]
+
+
+def test_available_slot_prefers_a_less_busy_day_and_ignores_disabled_items():
+    now = datetime(2026, 9, 4, 8, 0)
+    existing = [
+        {"kind": "once", "date": "2026-09-04", "time": "09:00", "enabled": True},
+        {"kind": "once", "date": "2026-09-04", "time": "10:00", "enabled": True},
+        {"kind": "once", "date": "2026-09-05", "time": "10:00", "enabled": False},
+    ]
+
+    assert find_available_todo_slot(existing, now) == ("2026-09-05", "09:00")
+
+
+def test_agent_includes_existing_schedule_in_model_prompt(monkeypatch):
+    from pet.chat import providers
+
+    received = {}
+    called = threading.Event()
+
+    class _Provider:
+        def stream(self, messages, *_args, **_kwargs):
+            received["messages"] = messages
+            called.set()
+            return iter(['{"todos":[]}'])
+
+    monkeypatch.setattr(providers, "OpenAICompatibleProvider", _Provider)
+    config = _Config()
+    config.resolve_api_key = lambda _provider: "test-only"
+    agent = TodoAgent(config, lambda *_args: None)
+    next_day = (datetime.now() + timedelta(days=1)).date().isoformat()
+    existing = [{"kind": "once", "date": next_day, "time": "14:00", "enabled": True}]
+    try:
+        assert agent.submit("s", "明天开会", existing_todos=existing)
+        assert called.wait(3.0)
+        user_prompt = received["messages"][1]["content"]
+        assert f"{next_day} 14:00" in user_prompt
+        assert "不代表外部日历" in user_prompt
+    finally:
+        agent.shutdown()

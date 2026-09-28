@@ -64,15 +64,20 @@ def _stylesheet(widget: QWidget) -> str:
     QLabel[muted="true"] {{
         color: {hint};
     }}
-    QFrame#todoAgentCard, QFrame#todoEditorCard, QFrame#todoListCard {{
+    QFrame#todoEditorCard, QFrame#todoListCard {{
         background: {card};
         border: 1px solid {border};
         border-radius: 12px;
     }}
     QLabel#todoAgentTitle {{
         color: {text};
-        font-size: 13px;
+        font-size: 20px;
         font-weight: 600;
+        background: transparent;
+    }}
+    QLabel#todoAgentHint {{
+        color: {hint};
+        font-size: 12px;
         background: transparent;
     }}
     QFrame[divider="true"] {{
@@ -182,29 +187,30 @@ class TodoPanelDialog(QDialog):
         dialog = QDialog(self)
         dialog.setObjectName("todoAgentDialog")
         dialog.setWindowTitle("文字生成待办")
-        dialog.setModal(True)
-        dialog.resize(560, 420)
-        dialog.setMinimumSize(440, 360)
+        dialog.setAccessibleName("用文字生成待办")
+        dialog.setAccessibleDescription(
+            "根据消息识别待办；缺少时间时参考现有待办安排空档，会议提前30分钟提醒。"
+        )
+        dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        dialog.resize(560, 480)
+        dialog.setMinimumSize(440, 440)
 
         dialog_layout = QVBoxLayout(dialog)
-        dialog_layout.setContentsMargins(16, 16, 16, 14)
+        dialog_layout.setContentsMargins(22, 20, 22, 18)
         dialog_layout.setSpacing(10)
-
-        card = QFrame()
-        card.setObjectName("todoAgentCard")
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(6)
 
         title = QLabel("用文字生成待办")
         title.setObjectName("todoAgentTitle")
-        layout.addWidget(title)
+        dialog_layout.addWidget(title)
 
-        hint = QLabel("粘贴或输入包含事情和时间的消息，Agent 会识别后直接加入列表。")
+        hint = QLabel(
+            "粘贴包含事情和时间的消息，识别后直接加入待办；未标时间时会参考已有待办安排空档，"
+            "会议类提前30分钟提醒。"
+        )
         hint.setObjectName("todoAgentHint")
         hint.setProperty("muted", True)
         hint.setWordWrap(True)
-        layout.addWidget(hint)
+        dialog_layout.addWidget(hint)
 
         self._agent_model_note = QLabel()
         self._agent_model_note.setObjectName("todoAgentModelNote")
@@ -213,8 +219,12 @@ class TodoPanelDialog(QDialog):
         self._agent_model_note.setAccessibleDescription(
             "说明待办 Agent 使用的内置 AI 对话服务商、模型和额度来源。"
         )
-        layout.addWidget(self._agent_model_note)
+        dialog_layout.addWidget(self._agent_model_note)
         self._refresh_agent_model_note()
+
+        input_label = QLabel("消息内容")
+        input_label.setObjectName("todoAgentInputLabel")
+        dialog_layout.addWidget(input_label)
 
         self._agent_text = QPlainTextEdit()
         self._agent_text.setObjectName("todoAgentInput")
@@ -223,20 +233,24 @@ class TodoPanelDialog(QDialog):
             "输入聊天消息或自然语言描述，提取未来事项和时间并生成待办。"
         )
         self._agent_text.setPlaceholderText(
-            "例如：明天下午三点给客户回电话；每天下午六点拉伸。"
+            "例如：明天下午三点跟客户开会；周五提交周报；每天下午六点拉伸。"
         )
         self._agent_text.setTabChangesFocus(True)
-        self._agent_text.setMinimumHeight(76)
+        self._agent_text.setMinimumHeight(140)
+        input_label.setBuddy(self._agent_text)
         self._agent_text.textChanged.connect(self._sync_agent_submit_enabled)
-        layout.addWidget(self._agent_text)
+        dialog_layout.addWidget(self._agent_text, stretch=1)
 
-        actions = QHBoxLayout()
-        actions.setSpacing(8)
-        self._agent_status = QLabel("识别到的事项会直接显示在下方列表。")
+        self._agent_status = QLabel("识别到的事项会直接加入当前列表。")
         self._agent_status.setObjectName("todoAgentStatus")
         self._agent_status.setProperty("muted", True)
         self._agent_status.setWordWrap(True)
-        actions.addWidget(self._agent_status, stretch=1)
+        self._agent_status.setAccessibleName("待办识别状态")
+        dialog_layout.addWidget(self._agent_status)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        actions.addStretch(1)
 
         manual = QPushButton("手动填写")
         manual.setObjectName("todoManualAddButton")
@@ -252,14 +266,15 @@ class TodoPanelDialog(QDialog):
         self._agent_submit_btn.setAccessibleDescription(
             "分析上方文本中的未来事项和时间，并将识别出的内容添加到待办列表。"
         )
+        self._agent_submit_btn.setDefault(True)
         self._agent_submit_btn.clicked.connect(self.submit_agent_text)
         actions.addWidget(self._agent_submit_btn)
-        layout.addLayout(actions)
+        dialog_layout.addLayout(actions)
 
         shortcut = QShortcut(QKeySequence("Ctrl+Return"), self._agent_text)
         shortcut.activated.connect(self.submit_agent_text)
         self._sync_agent_submit_enabled()
-        dialog_layout.addWidget(card)
+        dialog.finished.connect(self._restore_agent_dialog_focus)
         return dialog
 
     def _build_editor(self) -> QFrame:
@@ -435,6 +450,7 @@ class TodoPanelDialog(QDialog):
         text_col.addWidget(title_label)
         badge = QLabel(self._badge_text(item))
         badge.setObjectName("todoBadgeLabel")
+        badge.setWordWrap(True)
         if not item["enabled"]:
             badge.setProperty("muted", True)
         text_col.addWidget(badge)
@@ -453,15 +469,22 @@ class TodoPanelDialog(QDialog):
     def _badge_text(self, item: dict) -> str:
         time_text = str(item.get("time") or "")
         if item.get("kind") == "daily":
-            return f"每天 {time_text}"
-        expired = str(item.get("date") or "") < date.today().isoformat()
-        if expired:
-            return "已过期"
-        try:
-            day = date.fromisoformat(str(item.get("date")))
-        except ValueError:
-            return time_text
-        return f"{day.month}月{day.day}日 {time_text}"
+            badge = f"每天 {time_text}"
+        else:
+            expired = str(item.get("date") or "") < date.today().isoformat()
+            if expired:
+                badge = "已过期"
+            else:
+                try:
+                    day = date.fromisoformat(str(item.get("date")))
+                except ValueError:
+                    badge = time_text
+                else:
+                    badge = f"{day.month}月{day.day}日 {time_text}"
+        lead = item.get("reminder_lead_minutes")
+        if isinstance(lead, int) and not isinstance(lead, bool) and lead > 0:
+            badge += f" · 提前{lead}分钟提醒"
+        return badge
 
     def _refresh_next_label(self, items: list[dict]) -> None:
         config = getattr(self._app, "config", None)
@@ -484,6 +507,10 @@ class TodoPanelDialog(QDialog):
         self._refresh_agent_model_note()
         self._agent_dialog.open()
         self._agent_text.setFocus()
+
+    def _restore_agent_dialog_focus(self, *_args) -> None:
+        if self.isVisible() and not self._editor_card.isVisible():
+            self._agent_open_btn.setFocus()
 
     def _switch_to_manual_editor(self) -> None:
         self._agent_dialog.close()
@@ -528,7 +555,7 @@ class TodoPanelDialog(QDialog):
         self._agent_status.setText("正在识别并添加…")
         self._agent_text.setEnabled(False)
         self._sync_agent_submit_enabled()
-        if not agent.submit(session_id, text):
+        if not agent.submit(session_id, text, existing_todos=self._items()):
             self._agent_session_id = None
             self._agent_text.setEnabled(True)
             self._agent_status.setText("Agent 暂时不可用，请检查 AI 模型配置后重试。")

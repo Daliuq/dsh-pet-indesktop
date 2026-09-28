@@ -2,16 +2,19 @@
 from __future__ import annotations
 
 import argparse
+import json
 import statistics
 import threading
 import time
 import tracemalloc
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import psutil
 
 import pet.chat.providers as chat_providers
-from pet.todo_agent import TodoAgent
+from pet.todo_agent import TodoAgent, _format_schedule_context, parse_todo_response
+from pet.todo_reminder import TODO_ITEMS_LIMIT
 
 
 class _ProbeProvider:
@@ -57,13 +60,25 @@ def benchmark(samples: int, idle_seconds: float) -> None:
     provider = _ProbeProvider()
     chat_providers.OpenAICompatibleProvider = lambda: provider
     agent = TodoAgent(_ProbeConfig(), lambda *_args: None)
+    today = datetime.now().date()
+    existing_todos = [
+        {
+            "kind": "once",
+            "date": (today + timedelta(days=index % 14 + 1)).isoformat(),
+            "time": f"{9 + index % 9:02d}:00",
+            "enabled": True,
+        }
+        for index in range(TODO_ITEMS_LIMIT)
+    ]
     latencies_ms = []
 
     for sample in range(samples):
         with provider.condition:
             expected_calls = provider.calls + 1
         started = time.perf_counter_ns()
-        accepted = agent.submit(str(sample), "明天上午十点提交周报")
+        accepted = agent.submit(
+            str(sample), "明天上午十点提交周报", existing_todos=existing_todos
+        )
         latencies_ms.append((time.perf_counter_ns() - started) / 1_000_000)
         if not accepted:
             raise RuntimeError(f"request {sample} was not accepted")
@@ -98,7 +113,9 @@ def benchmark(samples: int, idle_seconds: float) -> None:
     tracemalloc.start()
     before = tracemalloc.take_snapshot()
     queued = sum(
-        queued_agent.submit(str(index), "x" * 8000)
+        queued_agent.submit(
+            str(index), "x" * 8000, existing_todos=existing_todos
+        )
         for index in range(queued_agent._queue.maxsize)
     )
     after = tracemalloc.take_snapshot()
@@ -108,9 +125,35 @@ def benchmark(samples: int, idle_seconds: float) -> None:
     tracemalloc.stop()
     print(
         f"queue accepted={queued} queued_chars={queued * 8000} "
-        f"heap_delta_bytes={heap_delta} capacity={queued_agent._queue.maxsize}"
+        f"snapshot_items={len(existing_todos)} heap_delta_bytes={heap_delta} "
+        f"capacity={queued_agent._queue.maxsize}"
     )
     queued_agent._closed = True
+
+    response = json.dumps({
+        "todos": [{
+            "title": "新事项",
+            "kind": "once",
+            "date": "",
+            "date_is_explicit": False,
+            "time": "",
+            "time_is_explicit": False,
+        }]
+    })
+    parse_latencies_ms = []
+    for _sample in range(samples):
+        started = time.perf_counter_ns()
+        parsed = parse_todo_response(response, existing_todos=existing_todos)
+        parse_latencies_ms.append((time.perf_counter_ns() - started) / 1_000_000)
+        if not parsed:
+            raise RuntimeError("missing-time parser did not find a slot")
+    parse_ordered = sorted(parse_latencies_ms)
+    print(
+        f"missing-time parse samples={samples} snapshot_items={len(existing_todos)} "
+        f"context_chars={len(_format_schedule_context(existing_todos, datetime.now()))} "
+        f"median_ms={statistics.median(parse_ordered):.4f} "
+        f"p95_ms={parse_ordered[p95_index]:.4f} max_ms={max(parse_ordered):.4f}"
+    )
 
 
 def main() -> None:

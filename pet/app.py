@@ -1863,7 +1863,17 @@ class AppShell:
         alm = self._dsh_link_manager()
         if alm is not None:
             alm.notify_dsh_state("thinking")
-        self.todo_agent.submit(session_id, text)
+        self.todo_agent.submit(
+            session_id, text, existing_todos=self._todo_items_for_agent()
+        )
+
+    def _todo_items_for_agent(self):
+        """在 GUI 线程查询待办服务，给 Agent 一份不可变调度快照。"""
+        service = getattr(self, "todo_service", None)
+        if service is None:
+            service = self._ensure_todo_service()
+            service.apply_config()
+        return service.items()
 
     def _finish_todo_panel_agent_request(
         self, session_id: str, status: str, *, added_count: int = 0
@@ -1908,7 +1918,13 @@ class AppShell:
             key = (title.casefold(), kind, date_text if kind == "once" else "", time_text)
             if not title or key in keys:
                 continue
-            item = new_todo_item(title, kind, time_text, date_text)
+            item = new_todo_item(
+                title,
+                kind,
+                time_text,
+                date_text,
+                reminder_lead_minutes=candidate.get("reminder_lead_minutes"),
+            )
             added.append(item)
             keys.add(key)
         if not added:

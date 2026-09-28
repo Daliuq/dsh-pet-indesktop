@@ -62,6 +62,28 @@ def test_new_once_item_keeps_date():
     assert item["date"] == "2026-09-05"
 
 
+def test_clean_preserves_valid_per_item_reminder_lead():
+    items = clean_todo_items([
+        {"title": "项目会议", "kind": "once", "time": "10:00",
+         "date": "2026-09-05", "reminder_lead_minutes": 30},
+        {"title": "无效提前量", "kind": "once", "time": "10:00",
+         "date": "2026-09-05", "reminder_lead_minutes": 999},
+    ])
+
+    assert items[0]["reminder_lead_minutes"] == 30
+    assert "reminder_lead_minutes" not in items[1]
+
+
+def test_store_roundtrip_preserves_per_item_reminder_lead(tmp_path):
+    store = TodoStore(todo_items_path(tmp_path))
+    meeting = new_todo_item(
+        "项目会议", "once", "10:00", "2026-09-05", reminder_lead_minutes=30
+    )
+
+    assert store.save([meeting]) is True
+    assert store.load()[0]["reminder_lead_minutes"] == 30
+
+
 def test_clean_drops_garbage_and_clamps():
     raw = [
         "junk",
@@ -138,6 +160,21 @@ def test_fire_payload_fields():
 def test_no_lead_fire_when_lead_zero():
     fires, _ = advance_todo_state([_daily()], _prefs(lead=0), datetime(2026, 9, 4, 9, 55))
     assert fires == []
+
+
+def test_per_item_lead_overrides_global_reminder_preference():
+    meeting = _once(time="10:00", reminder_lead_minutes=30)
+
+    fires_before, _ = advance_todo_state(
+        [meeting], _prefs(lead=5), datetime(2026, 9, 4, 9, 29)
+    )
+    fires_at_meeting_lead, _ = advance_todo_state(
+        [meeting], _prefs(lead=5), datetime(2026, 9, 4, 9, 30)
+    )
+
+    assert fires_before == []
+    assert [fire["phase"] for fire in fires_at_meeting_lead] == ["lead"]
+    assert fires_at_meeting_lead[0]["lead_minutes"] == 30
 
 
 def test_missed_beyond_grace_stamps_silently():
@@ -336,6 +373,22 @@ def test_service_tick_notifies_when_hidden(tmp_path):
     _title, message, on_click = app.notifies[0]
     assert "站会" in message
     assert on_click == app.open_todo_panel
+
+
+def test_hidden_meeting_notification_shows_30_minute_lead(tmp_path):
+    _qapp()
+    app = _FakeApp(tmp_path, visible=False)
+    meeting = new_todo_item(
+        "项目会议", "once", "10:00", "2026-09-04", reminder_lead_minutes=30
+    )
+    TodoStore(todo_items_path(app.config.dir)).save([meeting])
+    service = TodoReminderService(app)
+    service.apply_config()
+
+    service._on_tick(now=datetime(2026, 9, 4, 9, 30))
+
+    assert len(app.notifies) == 1
+    assert app.notifies[0][1] == "项目会议（10:00，提前30分钟提醒）"
 
 
 def test_service_tick_notifies_when_settings_open(tmp_path):
