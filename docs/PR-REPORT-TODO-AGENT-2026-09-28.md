@@ -272,3 +272,23 @@
 | 差异 | `git diff --check` | 通过；工作区仅有 Git 的 LF/CRLF 转换提示。 |
 
 四个被忽略的 webm 时序测试族沿用仓库既有隔离门禁；本轮涉及配置、Qt 定时器、待办生命周期和跨语言文件协议，因此执行了上述全量主套件，而非只跑定向测试。
+
+## 第五轮 CI 跨平台回归修正（2026-09-28）
+
+推送 `0abf0cdc` 后的首轮 PR matrix 在 Windows 通过，Ubuntu/macOS 暴露两处测试夹具问题（[CI 运行记录](https://github.com/MerZlin/dsh-pet-indesktop/actions/runs/36420888586)）。读取失败日志后修正测试准备条件；本轮没有改动产品代码。
+
+### 修改文件说明
+
+| 文件 | 增删 | 改动意图 |
+|---|---:|---|
+| `tests/test_todo_agent.py` | +8 / −1 | 在待办面板自动学习按钮测试中，仅替换 `todo_panel` 模块的平台标记为 Windows；避免非 Windows CI 按产品设计禁用按钮，也避免改写全局 `sys.platform`。 |
+| `tests/test_agent_link_threads.py` | +13 / −1 | 为真实控制 worker 测试准备有效临时 HMAC 密钥，并以 `Event` 等待请求进入轮询；不再因缺密钥而立即 fail closed 后抢先移除 worker。 |
+| `docs/PR-REPORT-TODO-AGENT-2026-09-28.md` | +20 / −0 | 记录跨平台 CI 根因及修复后的定向验证。 |
+
+### 根因、运行影响与验证
+
+- Ubuntu/macOS 的习惯开关测试沿用了本机 Windows 假设；这些平台上按钮按预期禁用，测试点击无效。修正只模拟目标模块的平台条件，不改变产品支持平台或用户可见行为。
+- DSH 认证改为缺密钥时立即拒绝。线程生命周期测试原先创建空桥目录，worker 因而快速返回并从集合移除；在 CI 上测试读取集合前 worker 已结束。测试现生成只用于临时目录的有效 key，并等待真实请求线程进入阻塞轮询，再调用 shutdown 验证取消与文件清理。
+- 这是纯测试夹具修正：产品稳态开销、系统调用、网络/磁盘访问、线程数和内存均为零增量；产品性能数字沿用第四轮实测。
+- 本机 Windows 定向确认：`test_todo_panel_offers_automatic_learning_command_not_per_item_timers` 为 1 passed（1.35 s）；`test_shutdown_cancels_control_worker_promptly` 连续运行 3 次均为 1 passed（1.14–4.76 s）。线程测试通过真实 worker、临时文件队列和 Event 同步，没有固定 sleep。
+- 首轮 CI 完整套件结果为 Ubuntu 2 failed / 2,931 passed，macOS 1 failed / 2,932 passed，Windows passed；失败均已对应到上列测试准备问题。产品代码未变，本轮定向修正后尚未重跑完整本地主套件；推送后由 GitHub matrix 复验全部平台。

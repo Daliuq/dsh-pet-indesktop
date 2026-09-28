@@ -522,10 +522,22 @@ class TestManagerDeterministicTeardown:
 
         # 桥接目录指到空临时目录：真实走 request 的轮询循环（无人应答），
         # 不碰真实 %APPDATA% 桥接目录。
-        monkeypatch.setattr(dsh_control_mod, "_bridge_dir", lambda: str(tmp_path / "bridge"))
+        bridge_dir = tmp_path / "bridge"
+        bridge_dir.mkdir()
+        (bridge_dir / "watchdog-secret").write_text("a" * 64, encoding="ascii")
+        monkeypatch.setattr(dsh_control_mod, "_bridge_dir", lambda: str(bridge_dir))
+        request_started = threading.Event()
+        original_request = dsh_control_mod.request
+
+        def tracked_request(*args, **kwargs):
+            request_started.set()
+            return original_request(*args, **kwargs)
+
+        monkeypatch.setattr(dsh_control_mod, "request", tracked_request)
         mgr = AgentLinkManager(None, Config(base=tmp_path))
         payload = {"session_id": "sess-x", "goal": "", "reasons": [], "steps": []}
         mgr._request_exploration_control("replan", "sess-x", payload)
+        assert request_started.wait(5.0), "控制 worker 应进入签名请求轮询"
         with mgr._respond_threads_lock:
             workers = list(mgr._respond_threads)
         assert workers, "控制请求应已创建后台线程"

@@ -240,11 +240,18 @@ def test_todo_panel_reports_when_agent_cannot_accept_text():
         panel.close()
 
 
-def test_todo_panel_offers_automatic_learning_command_not_per_item_timers(tmp_path):
+def test_todo_panel_offers_automatic_learning_command_not_per_item_timers(
+    tmp_path, monkeypatch
+):
+    import pet.todo_panel as todo_panel_module
+
     from pet.todo_habits import TodoHabitStore
     from pet.todo_panel import TodoPanelDialog
     from pet.todo_reminder import new_todo_item
 
+    # This UI path is Windows-only; simulate that platform without mutating the
+    # shared sys module used by pytest and unrelated application modules.
+    monkeypatch.setattr(todo_panel_module, "sys", SimpleNamespace(platform="win32"))
     _qapp()
     app = _App(_TodoAgent())
     store = TodoHabitStore(tmp_path / "todo_habits.json")
