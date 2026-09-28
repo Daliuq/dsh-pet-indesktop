@@ -23,6 +23,12 @@ import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from .todo_habits import (
+    TODO_HABIT_DEFAULT_DURATION_MINUTES,
+    TODO_HABIT_MAX_SESSION_MINUTES,
+    classify_todo_category,
+)
+
 logger = logging.getLogger(__name__)
 
 TODO_ITEMS_VERSION = 1
@@ -53,15 +59,31 @@ def _normalize_iso_date(value) -> str:
         return ""
 
 
-def new_todo_item(title, kind, time_text, date_text: str = "") -> dict:
+def new_todo_item(
+    title,
+    kind,
+    time_text,
+    date_text: str = "",
+    *,
+    category: str | None = None,
+    duration_min: int = TODO_HABIT_DEFAULT_DURATION_MINUTES,
+) -> dict:
     """构造一条新待办（面板新建入口用）；非法字段按默认值钳制。"""
     kind = str(kind or "").strip()
+    try:
+        duration_min = int(duration_min)
+    except (TypeError, ValueError):
+        duration_min = TODO_HABIT_DEFAULT_DURATION_MINUTES
+    duration_min = max(15, min(TODO_HABIT_MAX_SESSION_MINUTES, duration_min))
+    title = str(title or "").strip()[:TODO_TITLE_LIMIT]
     item = {
         "id": uuid.uuid4().hex,
-        "title": str(title or "").strip()[:TODO_TITLE_LIMIT],
+        "title": title,
         "kind": kind if kind in TODO_KINDS else "once",
         "time": _normalize_hhmm(time_text) or DEFAULT_TODO_TIME,
         "date": "",
+        "category": classify_todo_category(title, category),
+        "duration_min": duration_min,
         "enabled": True,
         "fired_lead_slot": None,
         "fired_due_slot": None,
@@ -93,6 +115,17 @@ def clean_todo_items(value) -> list[dict]:
         for key in ("fired_lead_slot", "fired_due_slot"):
             slot = raw.get(key)
             item[key] = slot if isinstance(slot, str) and slot else None
+        if isinstance(raw.get("category"), str) and raw.get("category") in {
+            "study", "work", "leisure", "general"
+        }:
+            item["category"] = classify_todo_category(item["title"], raw.get("category"))
+        else:
+            item["category"] = classify_todo_category(item["title"])
+        try:
+            duration_min = int(raw.get("duration_min", TODO_HABIT_DEFAULT_DURATION_MINUTES))
+        except (TypeError, ValueError):
+            duration_min = TODO_HABIT_DEFAULT_DURATION_MINUTES
+        item["duration_min"] = max(15, min(TODO_HABIT_MAX_SESSION_MINUTES, duration_min))
         items.append(item)
     return items
 
@@ -277,7 +310,9 @@ class TodoReminderService:
             getattr(config, "instance_id", "") or "",
         ))
         self._items: list[dict] = []
-        self._prefs: dict = {"enabled": True, "lead_minutes": 0}
+        self._prefs: dict = {
+            "enabled": True, "lead_minutes": 0, "requires_confirmation": False
+        }
         self._notify_enabled = True
         self._timer = QTimer()
         self._timer.setInterval(self.TICK_INTERVAL_MS)
@@ -302,6 +337,9 @@ class TodoReminderService:
         self._prefs = {
             "enabled": bool(config.get("todo_reminder_enabled", True)) if config else True,
             "lead_minutes": max(0, min(60, lead)),
+            "requires_confirmation": bool(
+                config.get("todo_reminder_requires_confirmation", False)
+            ) if config else False,
         }
         # 桌面通知分支与既有调用方（chat 等）同规：受全局通知开关门控
         self._notify_enabled = (
@@ -336,8 +374,35 @@ class TodoReminderService:
         lead = int(fire.get("lead_minutes") or 0)
         suffix = f"，提前{lead}分钟提醒" if fire.get("phase") == "lead" and lead else ""
         text = f"⏰ 待办提醒：{fire['title']}（{fire['time']}{suffix}）"
+        requires_confirmation = bool(self._prefs.get("requires_confirmation", False))
         win = getattr(app, "win", None)
         if win is not None and win.isVisible() and not self._bubble_suppressed():
+            if requires_confirmation:
+                alert_id = (
+                    f"todo-reminder:{fire.get('id', '')}:"
+                    f"{fire.get('phase', 'due')}:{fire.get('time', '')}"
+                )
+                resolve = getattr(win, "resolve_alert", None)
+                dismiss = getattr(win, "hide_bubble", None)
+                acknowledge = (
+                    (lambda: resolve(alert_id)) if callable(resolve)
+                    else (lambda: dismiss()) if callable(dismiss)
+                    else (lambda: None)
+                )
+                buttons = [("确定", acknowledge)]
+                show_alert = getattr(win, "show_alert", None)
+                if callable(show_alert):
+                    show_alert(
+                        text,
+                        buttons=buttons,
+                        sticky=True,
+                        alert_id=alert_id,
+                        priority=2,
+                        alert_type="todo-reminder",
+                    )
+                else:
+                    win.show_bubble(text, sticky=True, buttons=buttons)
+                return
             win.show_bubble(text, duration_ms=self.BUBBLE_DURATION_MS)
             return
         if not self._notify_enabled:
@@ -345,7 +410,8 @@ class TodoReminderService:
         notify = getattr(app, "system_notify", None)
         if callable(notify):
             notify("待办提醒", f"{fire['title']}（{fire['time']}{suffix}）",
-                   on_click=getattr(app, "open_todo_panel", None))
+                   on_click=getattr(app, "open_todo_panel", None),
+                   require_confirmation=requires_confirmation)
 
     def _bubble_suppressed(self) -> bool:
         """设置窗口打开期间暂停气泡（与 PetInstance._update_bubble_suppression_for_settings

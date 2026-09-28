@@ -183,3 +183,92 @@
 **重新打包**：提醒规则更新时先将原目录和 ZIP 备份至 `dist-onedir/backup-webm-chat-20260928-131146-106`（1,220 个文件；旧 ZIP 362,397,241 bytes，备份哈希一致）。改成“LLM生成待办”后，又将前一版目录和 ZIP 备份至 `dist-onedir/backup-webm-chat-20260928-133036-743`（1,220 个文件；ZIP 355,843,433 bytes，SHA-256 为 `E8964F2C61CFCE67708EF1D44794FEF847A066E4665A6510B26FD7C1D4FEE23B`）。命令 `powershell -ExecutionPolicy Bypass -File scripts\build_onedir.ps1 -Variant webm-chat`；为通过桥接隔离探针，仅在构建进程中把 `TEMP/TMP/TMPDIR` 指向 `W:\dsh-pet-package-temp-20260928-1331`。Windows 10 `10.0.26200-SP0`、CPython 3.10.15、PyInstaller 6.22.2。最新真实输出：`lunar-python OK`、桥接零依赖冒烟通过、Qt Runtime validation OK、瘦身移除 118 个文件 / 44.92 MB、中文编码检查 PASS、DLL 链检查 ALL OK；应用窗口 3.7 秒就绪，`--settings` 窗口 2.4 秒就绪。新 onedir 目录 1,220 个文件、866,173,795 bytes；portable ZIP 355,844,657 bytes（339.4 MiB），`python -m zipfile -t dist-onedir\dsh-pet-standalone-webm-chat-portable.zip` 输出 `Done testing`，SHA-256 为 `1B3BA18765D03FD97CBB39A19FCB05E52F8DF3461EE7470122FEAA9059435E47`。
 
 **本次需求修正的产品测试套件未运行**；既有测试断言已随文案更新。`python -m ruff check pet tests scripts` 输出 `All checks passed!`；构建脚本的依赖、桥接、Qt DLL、应用启动、设置窗口、编码及 ZIP 检查均已实际通过，`git diff --check` 通过。新包保留原有提醒设置和人工新建流程，Agent 界面说明统一显示沿用桌宠提醒设置。
+
+## 第四轮重做（2026-09-28）：从 bd87d3a 重建习惯学习与确认提醒
+
+本轮以 `bd87d3a9453858c97e92d376e90b010f4355d75c` 为代码起点，新建本地分支 `codex/todo-habit-learning-repair`。PR #193 原分支末尾的 `4917a389` 排期提交不包含在新结果中；当前分支保留文本待办、现有手动表单和全局提醒行为，并加入经过回归验证的自动习惯学习与确认式提醒。发布时用新分支生成的提交替换 PR #193 的源分支内容。
+
+### 本轮修改文件说明
+
+增删行数来自本轮暂存差异的 `git diff --cached --numstat`；新增/删除文件单独标出。本轮没有删除文件。表中每项均写明具体改动及目的。
+
+#### 实现与工具
+
+| 文件 | 增删 | 改动意图 |
+|---|---:|---|
+| `integrations/dsh-pet-bridge/index.js` | +137 / −10 | 为本机文件控制队列加请求/响应 HMAC-SHA256、nonce 校验与常量时间比较，拒绝伪造控制消息；桥目录可由测试隔离指定。 |
+| `integrations/dsh-pet-bridge/package.json` | +2 / −1 | 桥包版本升至 0.3.0，并将认证协议入口纳入发布文件。 |
+| `integrations/dsh-pet-bridge/impl/0.3.0/index.js`（新增） | +4 / −0 | 提供版本化入口，复用桥根目录唯一实现，避免测试与 DSH 包加载两份不同协议。 |
+| `pet/dsh_control.py` | +80 / −0 | Python 端生成 256-bit 共享密钥、签署请求并验证带 nonce 的响应；缺密钥或签名不匹配时 fail closed。 |
+| `integrations/dsh-pet-bridge/test/response-signer.mjs`（新增） | +77 / −0 | 调用真实 Node 桥实现签发测试响应，供 Python/Node 跨语言联调，不复制一份算法冒充互通。 |
+| `pet/todo_habits.py`（新增） | +444 / −0 | 每分钟观察前台活动与闲置状态，将明确识别的工作、学习、休闲时段压缩为类别/星期/小时/时长样本；不保存窗口标题或进程名，样本最多 256 条，每 5 条更新画像。 |
+| `pet/app.py` | +114 / −2 | 增加默认关闭的 Windows 采样定时器、启动/停止与退出清理；待办模型结果使用本机习惯画像，无额外模型请求。 |
+| `pet/config.py` | +12 / −0 | 增加自动习惯学习和提醒确认两个默认关闭的配置项及布尔值清洗。 |
+| `pet/modern_settings_dialog.py` | +8 / −11 | 将习惯学习和“提醒需点确定”设置接入现代设置页。 |
+| `pet/settings_pet_controls.py` | +79 / −7 | 在待办设置组增加两个开关、说明和无障碍名称，供用户明确启用或关闭。 |
+| `pet/todo_agent.py` | +164 / −21 | 识别 work/study/leisure/general 类别；无明确时间时依类别采用冷启动时段，训练样本充分后按各类星期与小时习惯、现有待办冲突和预计时长挑选时段。 |
+| `pet/todo_panel.py` | +133 / −9 | 在面板提供自动学习开关/状态摘要，新增手动待办类别选择，并将本机画像传给现有 Agent 队列。 |
+| `pet/todo_reminder.py` | +70 / −4 | 在待办记录中清洗类别与预计时长，并根据全局确认开关发送必须确认的桌宠提醒或系统通知。 |
+| `pet/desktop_notify.py` | +44 / −8 | 系统通知处于确认模式时不启动自动关闭计时器，增加“确定”按钮；点击通知正文仍可打开待办但不会确认关闭。 |
+| `scripts/benchmark_todo_habits.py`（新增） | +151 / −0 | 提供可复跑的本地采样、排期、HMAC 与有界存储基准，测量不读取或打印当前窗口标题。 |
+
+#### 测试
+
+| 文件 | 增删 | 覆盖 |
+|---|---:|---|
+| `tests/test_config_schema.py` | +2 / −0 | 确认新的开关默认关闭并经过配置清洗。 |
+| `tests/test_dsh_control_client.py` | +11 / −2 | 覆盖密钥缺失、请求签名、响应 nonce/HMAC 验证及错误响应拒绝。 |
+| `tests/test_dsh_control_cross_language.py`（新增） | +123 / −0 | 使用真实 Node 桥实现验证 Python 客户端接受正确签名并拒绝错误密钥。 |
+| `tests/test_foreground_steal.py` | +10 / −7 | 使 Windows 原生前台窗口测试按运行时 Qt 后端判定，避免被先创建的离屏 QApplication 误跳过。 |
+| `tests/test_settings_and_resources.py` | +5 / −1 | 校验新增持久设置被归入待办设置组。 |
+| `tests/test_todo_agent.py` | +187 / −5 | 覆盖习惯画像排序、工作与休闲时段分流、类别提示以及面板自动学习入口。 |
+| `tests/test_todo_habits.py`（新增） | +218 / −0 | 覆盖本地类别识别、空闲切段、时长边界、批量训练、样本上限、开关生命周期和不存窗口标题。 |
+| `tests/test_todo_reminder.py` | +112 / −2 | 覆盖确认模式下的粘性桌宠提醒、系统通知按钮、默认/自定义开关与待办类别清洗。 |
+
+#### 文档
+
+| 文件 | 增删 | 改动意图 |
+|---|---:|---|
+| `docs/INDEX.md` | +1 / −1 | 更新报告索引摘要及适用范围。 |
+| `docs/PR-REPORT-TODO-AGENT-2026-09-28.md` | +89 / −0 | 追加本轮逐文件清单、实测性能、Windows 实机记录及验证结果。 |
+
+### 本轮实现与边界
+
+- 自动学习默认关闭；仅 Windows 支持。启用后每 60 秒查询一次前台窗口元数据和系统闲置时长，只识别明确的应用/标题信号；闲置超过 10 分钟即结束当前片段。只累计至少 2 分钟、最多 4 小时的活动片段。每类独立画像需要至少 5 条有效样本才影响自动排期；工作与学习/休闲的冷启动时段分别为 09:00–17:00、18:00–22:00。显式时间优先，自动分配只查本地待办，不查询日历。
+- 画像样本仅含类别、星期、开始小时与时长；不保存窗口标题、进程名、屏幕图像或原始活动日志，最多保留 256 条。采样和画像统计都在现有 GUI 线程中执行，不创建额外工作线程。档案按实例写入既有配置目录，单条合格活动结束时原子更新一次；冷启动时延用 60 分钟默认时长。
+- 习惯特征仅在本地待办解析与时段选择中使用，不追加到 LLM 提示词；一次待办识别仍最多调用原有模型接口一次，开关、观察窗口和排期都不额外调用模型或联网。
+- `todo_reminder_requires_confirmation` 默认 false。开启后，桌宠气泡为粘性提醒并带“确定”操作；桌宠隐藏时的系统通知不自动计时关闭，必须点通知内的“确定”。点击通知正文仍可打开待办面板，但不会代替确认。
+- DSH 桥接控制协议用 32-byte 随机密钥的 64 位十六进制表示，密钥首次初始化后保存在本地 `watchdog-secret`；请求与响应都包含 HMAC-SHA256 和 nonce。密钥只在初始化时写入一次，正常操作沿用既有本机文件队列，不增加网络连接。
+
+### 本轮性能分析
+
+**方法**：`python -m scripts.benchmark_todo_habits --samples 1000`；Windows 10 `10.0.26200-SP0`、CPython 3.10.15。脚本用 1,000 次本地分类/观察、200 次 100 条待办的排期计算、1,000 次 Python 请求/响应 HMAC、100 次真实 Windows 前台与闲置探针，并在临时目录写满 256 条样本。窗口元数据仅用于调用时长测量，没有打印或持久化。
+
+| 指标 | 实测 | 归属 |
+|---|---:|---|
+| 前台元数据分类 + 已开始片段观察 | 1,000 次；中位数 0.0147 ms，P95 0.0185 ms，最大 0.1698 ms | 本地常驻采样的纯 Python 路径；不含 Win32 查询 |
+| 100 条现有待办 + 学习画像的空档搜索 | 200 次；中位数 2.17395 ms，P95 2.6078 ms，最大 3.9144 ms | 新增本地排期路径；无模型或磁盘调用 |
+| 请求 + 响应 canonical HMAC | 1,000 次；中位数 0.0232 ms，P95 0.0247 ms，最大 0.6784 ms | 新增本地认证 CPU 成本；不含文件队列等待 |
+| Windows 前台窗口 + 闲置探针 | 100 次；中位数 0.07485 ms，P95 0.3048 ms，最大 1.4419 ms | 实际 Win32 探针；每分钟最多触发一次，即 1,440 次/日 |
+| 256 条有界画像 | JSON 文件 17,910 bytes；256 次原子写总计 0.661382 s | 新增本地存储上限；约 2.58 ms/次写入 |
+
+**结论**：自动学习关闭时没有新增采样定时器；打开后新增一个 60 秒 Qt 定时器，不新增线程或网络请求。实测单次前台/闲置探针约 0.075 ms 中位数，按 1,440 次/日约 108 ms 探针耗时；单次本地画像空档搜索对 100 条待办约 2.174 ms 中位数。画像最多 256 条、约 17.9 KB；每个合格活动片段至多写一个画像样本，不按定时器频率写磁盘。习惯画像不进入模型提示词，因此 token 数和请求频率无增量。HMAC 两端仅增加签名 CPU；初次桥接安装/启动写密钥并 fsync 一次，后续沿用已有请求与响应文件操作。
+
+### 本轮实机运行记录
+
+- **实机性能探针**：在 Windows 10 `10.0.26200-SP0`、CPython 3.10.15 运行 `python -m scripts.benchmark_todo_habits --samples 1000`，真实输出为 `windows_foreground_and_idle_probe: n=100, median_ms=0.074850, p95_ms=0.304800, max_ms=1.441900`；测试只记录耗时，不记录窗口标题。真实 `vision.foreground_window_info()` 与 `vision.get_system_idle_seconds()` 都能返回并完成 100 轮。
+- **打包及启动**：在本机 Windows 运行 `scripts/build_onedir.ps1 -Variant webm-chat`，构建隔离临时目录后通过依赖、桥接、Qt DLL 与中文编码检查；真实输出主窗口约 4.0 秒就绪、`--settings` 窗口约 3.1 秒就绪，portable ZIP 为 362,418,129 bytes，`dsh-pet-standalone-webm-chat.exe` 为 11,947,851 bytes。应用与设置窗口启动后均正常退出，未遗留进程或 PyInstaller `_MEI` 临时目录。
+- **可见行为与边界**：本轮 Qt 回归用例确认默认关闭、启停采样、分类保留、桌宠气泡须确认、桌宠隐藏时系统通知须点按钮。桌面自动化接口本轮没有可用的 native app 列表，未声称做过屏幕点击截图；应用包启动与设置窗口由真实 Windows 构建冒烟检查确认。没有提交真实文本到聊天服务，避免消耗当前 API 额度；模型网络请求数为 0。
+
+### 本轮测试与验证
+
+| 门 | 命令 | 结果 |
+|---|---|---|
+| 定向行为 | `python -m pytest -q tests/test_todo_habits.py tests/test_todo_agent.py tests/test_todo_reminder.py tests/test_dsh_control_client.py tests/test_dsh_control_cross_language.py` | 全量命令随后覆盖这些用例；跨语言 Node signer 使用真实桥实现。 |
+| 静态 | `python -m ruff check pet tests scripts` | All checks passed；已包含本轮新增 Python 基准脚本。 |
+| 性能 | `python -m scripts.benchmark_todo_habits --samples 1000` | 输出见性能表；0 网络请求；样本与磁盘写入均位于临时目录。 |
+| 全量主套件 | `$env:QT_QPA_PLATFORM='offscreen'; python -m pytest -q --ignore=tests/test_webm_reader_lifecycle.py --ignore=tests/test_webm_clip_lifecycle.py --ignore=tests/test_webm_first_frame_lock.py --ignore=tests/test_low_priority_warm_interaction_yield.py` | 2,943 passed，11 skipped，0 failed，186.56 s。 |
+| 跨语言/导入 | `node integrations/dsh-pet-bridge/verify_import.mjs`（隔离 `TEMP/TMP`） | 桥接导入验证通过；Python/Node 正确密钥互通及错误密钥拒绝包含在全量测试中。 |
+| 差异 | `git diff --check` | 通过；工作区仅有 Git 的 LF/CRLF 转换提示。 |
+
+四个被忽略的 webm 时序测试族沿用仓库既有隔离门禁；本轮涉及配置、Qt 定时器、待办生命周期和跨语言文件协议，因此执行了上述全量主套件，而非只跑定向测试。

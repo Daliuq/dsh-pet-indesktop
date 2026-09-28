@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import ctypes
-import os
 import subprocess
 import sys
 import time
@@ -31,14 +30,16 @@ from tests.test_window_pause import FakeLibrary
 # （GetWindowLongW 拿不到扩展样式），也没有真实前台窗口可判定。
 # headless CI / 本地 offscreen 套件自动跳过；Windows 桌面环境（含 CI runner）
 # 会真正执行。
-_WINDOWS_REAL_DISPLAY = (
-    sys.platform == 'win32'
-    and os.environ.get('QT_QPA_PLATFORM', '').lower() != 'offscreen'
-)
 pytestmark = pytest.mark.skipif(
-    not _WINDOWS_REAL_DISPLAY,
-    reason='需要真实窗口系统（原生扩展样式 + 真实前台窗口）',
+    sys.platform != 'win32',
+    reason='需要 Windows 原生窗口系统',
 )
+
+
+def _require_real_windows_platform(app) -> None:
+    """Check the initialized Qt backend, not an environment value captured at import."""
+    if str(app.platformName()).lower() != 'windows':
+        pytest.skip(f'需要 Windows Qt 窗口后端，当前为 {app.platformName()}')
 
 WS_EX_NOACTIVATE = 0x08000000
 WS_EX_TOOLWINDOW = 0x00000080
@@ -126,6 +127,7 @@ def _make_pet(tmp_path) -> PetWindow:
 def test_pet_window_has_noactivate_ex_style(tmp_path):
     """桌宠窗口必须带 WS_EX_NOACTIVATE，否则点击会夺走前台（issue #98）。"""
     app = QApplication.instance() or QApplication([])
+    _require_real_windows_platform(app)
     win = _make_pet(tmp_path)
     try:
         win.show()
@@ -148,6 +150,7 @@ def test_clicking_pet_does_not_steal_foreground(tmp_path):
     必须跨进程：同进程窗口共享前台队列，`GetForegroundWindow()` 分不清。
     """
     app = QApplication.instance() or QApplication([])
+    _require_real_windows_platform(app)
     holder = Path(__file__).resolve().parent / 'helpers' / 'foreground_holder.py'
     proc = subprocess.Popen(
         [sys.executable, str(holder)],

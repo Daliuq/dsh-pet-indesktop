@@ -60,6 +60,83 @@ from .settings_widgets import (
 )
 from .speech_bubble import BUBBLE_STYLE_PRESETS
 
+def build_todo_reminder_controls(host) -> None:
+    host.todo_reminder_check = ToggleSwitch(host)
+    host.todo_reminder_check.setChecked(bool(host.config.get("todo_reminder_enabled", True)))
+
+    host.todo_reminder_confirmation_check = ToggleSwitch(host)
+    host.todo_reminder_confirmation_check.setObjectName("todoReminderConfirmationSetting")
+    host.todo_reminder_confirmation_check.setAccessibleName("待办提醒需确认后关闭")
+    host.todo_reminder_confirmation_check.setAccessibleDescription(
+        "开启后，桌宠气泡和桌面通知不会自动消失；点击确定后关闭提醒。"
+    )
+    host.todo_reminder_confirmation_check.setChecked(
+        bool(host.config.get("todo_reminder_requires_confirmation", False))
+    )
+
+    host.todo_habit_learning_check = ToggleSwitch(host)
+    host.todo_habit_learning_check.setObjectName("todoHabitLearningSetting")
+    host.todo_habit_learning_check.setAccessibleName("习惯自动学习")
+    host.todo_habit_learning_check.setAccessibleDescription(
+        "在 Windows 本机定时读取前台应用、窗口标题和空闲时长，区分工作、学习、休闲时段；"
+        "不截屏、不调用模型，原始窗口标题不会保存。"
+    )
+    host.todo_habit_learning_check.setChecked(
+        bool(host.config.get("todo_habit_learning_enabled", False))
+    )
+
+    host.todo_reminder_lead_spin = BrowserSpinBox(host)
+    host.todo_reminder_lead_spin.setRange(0, 60)
+    host.todo_reminder_lead_spin.setSuffix(" 分钟")
+    host.todo_reminder_lead_spin.setValue(int(host.config.get("todo_reminder_lead_minutes", 5) or 0))
+
+
+def todo_reminder_setting_ids() -> tuple[str, ...]:
+    return (
+        "todo_reminder_enabled",
+        "todo_reminder_requires_confirmation",
+        "todo_reminder_lead_minutes",
+        "todo_habit_learning_enabled",
+    )
+
+
+def todo_reminder_rows(host) -> list[SettingRow]:
+    return [
+        SettingRow(
+            "todo_reminder_enabled", "待办提醒",
+            "到点通过气泡或桌面通知提醒；待办条目在右键菜单「待办提醒」面板中管理。",
+            host.todo_reminder_check,
+        ),
+        SettingRow(
+            "todo_reminder_requires_confirmation", "提醒需确认后关闭",
+            "开启后，桌宠气泡和桌面通知不会自动消失；点击“确定”后关闭提醒。",
+            host.todo_reminder_confirmation_check,
+        ),
+        SettingRow(
+            "todo_reminder_lead_minutes", "提前提醒",
+            "到点前提前提醒的分钟数（0~60，0 = 不提前，仅准点提醒一次）。",
+            host.todo_reminder_lead_spin,
+        ),
+        SettingRow(
+            "todo_habit_learning_enabled", "习惯自动学习",
+            "仅 Windows：每分钟在本机查看前台应用、窗口标题和空闲时长，区分工作、学习、休闲；不截屏、不调用模型，原始标题不会保存。待办面板也可开始或暂停。",
+            host.todo_habit_learning_check,
+        ),
+    ]
+
+
+def write_todo_reminder_settings(host) -> None:
+    host.config.set("todo_reminder_enabled", host.todo_reminder_check.isChecked())
+    host.config.set(
+        "todo_reminder_requires_confirmation",
+        host.todo_reminder_confirmation_check.isChecked(),
+    )
+    host.config.set("todo_reminder_lead_minutes", int(host.todo_reminder_lead_spin.value()))
+    host.config.set(
+        "todo_habit_learning_enabled", host.todo_habit_learning_check.isChecked()
+    )
+
+
 def build_pet_controls(host) -> None:
     from .modern_settings_dialog import dialogue_params_hint
     host.scale_combo = ModernSelect(host, width=132)
@@ -488,13 +565,8 @@ def build_pet_controls(host) -> None:
     host.agent_sound_done_check.toggled.connect(lambda: host._update_agent_sound_subcontrols())
     host.agent_sound_error_check.toggled.connect(lambda: host._update_agent_sound_subcontrols())
 
-    # 待办提醒：偏好两键（条目在右键菜单「待办提醒」面板中管理）
-    host.todo_reminder_check = ToggleSwitch(host)
-    host.todo_reminder_check.setChecked(bool(host.config.get("todo_reminder_enabled", True)))
-    host.todo_reminder_lead_spin = BrowserSpinBox(host)
-    host.todo_reminder_lead_spin.setRange(0, 60)
-    host.todo_reminder_lead_spin.setSuffix(" 分钟")
-    host.todo_reminder_lead_spin.setValue(int(host.config.get("todo_reminder_lead_minutes", 5) or 0))
+    # 待办提醒设置控件由提醒域集中创建，供行定义与配置写回复用。
+    build_todo_reminder_controls(host)
 
     appearance = host.config.get("context_menu_appearance", DEFAULT_CONTEXT_MENU_APPEARANCE)
     host.menu_theme_select = ModernSelect(host, width=132)

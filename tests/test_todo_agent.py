@@ -41,8 +41,8 @@ class _TodoAgent:
         self.accepted = accepted
         self.requests = []
 
-    def submit(self, session_id, text, *, existing_todos=None):
-        self.requests.append((session_id, text, existing_todos))
+    def submit(self, session_id, text, *, existing_todos=None, habit_profile=None):
+        self.requests.append((session_id, text, existing_todos, habit_profile))
         return self.accepted
 
 
@@ -55,13 +55,20 @@ class _App:
 
 class _Config:
     def __init__(self):
+        self.values = {}
         self.provider = SimpleNamespace(
             name="DeepSeek", model="deepseek-v4-flash", timeout=20,
             max_tokens=700, api_key="",
         )
 
     def get(self, key, default=None):
-        return default
+        return self.values.get(key, default)
+
+    def set(self, key, value):
+        self.values[key] = value
+
+    def save(self):
+        return True
 
     def chat_settings(self):
         return SimpleNamespace(active_config=self.provider)
@@ -184,10 +191,11 @@ def test_todo_panel_submits_freeform_text_to_agent_and_reports_result():
         assert "gpt-4.1-mini" in model_note.text()
 
         assert len(agent.requests) == 1
-        session_id, submitted_text, schedule = agent.requests[0]
+        session_id, submitted_text, schedule, profile = agent.requests[0]
         assert session_id.startswith("todo-panel:")
         assert submitted_text == message.toPlainText()
         assert schedule == existing
+        assert profile == {"categories": {}}
         assert not submit.isEnabled()
         assert not message.isEnabled()
         assert "正在识别" in status.text()
@@ -228,6 +236,37 @@ def test_todo_panel_reports_when_agent_cannot_accept_text():
         assert message.isEnabled()
         assert message.toPlainText() == "明天记得交材料"
         assert "暂时不可用" in status.text()
+    finally:
+        panel.close()
+
+
+def test_todo_panel_offers_automatic_learning_command_not_per_item_timers(tmp_path):
+    from pet.todo_habits import TodoHabitStore
+    from pet.todo_panel import TodoPanelDialog
+    from pet.todo_reminder import new_todo_item
+
+    _qapp()
+    app = _App(_TodoAgent())
+    store = TodoHabitStore(tmp_path / "todo_habits.json")
+    app._ensure_todo_habits = lambda: store
+    app.todo_service.set_items([new_todo_item("学英语", "daily", "20:00")])
+    app._set_todo_habit_learning_enabled = lambda enabled: (
+        app.config.set("todo_habit_learning_enabled", enabled) or app.config.save()
+    )
+    panel = TodoPanelDialog(app)
+    try:
+        toggle = panel.findChild(QPushButton, "todoHabitLearningToggle")
+        assert toggle is not None
+        assert toggle.text() == "开启自动学习"
+        assert not any(
+            child.objectName().startswith("todoTrack_")
+            for child in panel.findChildren(QPushButton)
+        )
+        toggle.click()
+
+        assert app.config.get("todo_habit_learning_enabled") is True
+        assert toggle.text() == "暂停自动学习"
+        assert store.sample_count("study") == 0
     finally:
         panel.close()
 
@@ -282,7 +321,144 @@ def test_dsh_message_passes_current_todo_snapshot_to_agent():
 
     AppShell._on_dsh_user_message(shell, "session-1", "明天有会议")
 
-    assert agent.requests == [("session-1", "明天有会议", schedule)]
+    assert agent.requests == [(
+        "session-1", "明天有会议", schedule, {"categories": {}}
+    )]
+
+
+def test_habit_profile_estimates_study_duration_and_prefers_learned_hour():
+    now = datetime(2026, 9, 7, 8, 0)  # Monday
+    profile = {"categories": {"study": {
+        "count": 5,
+        "duration_min": 45,
+        "weekday_counts": [5, 0, 0, 0, 0, 0, 0],
+        "hour_counts": [0] * 19 + [5] + [0] * 4,
+    }}}
+
+    result = parse_todo_response(
+        json.dumps({"todos": [{
+            "title": "学英语",
+            "kind": "once",
+            "time": "",
+            "time_is_explicit": False,
+        }]}),
+        now,
+        habit_profile=profile,
+    )
+
+    assert result == [{
+        "title": "学英语",
+        "kind": "once",
+        "date": "2026-09-07",
+        "time": "19:00",
+        "category": "study",
+        "duration_min": 45,
+    }]
+
+
+def test_habit_profile_prefers_learned_weekday_across_open_days():
+    now = datetime(2026, 9, 28, 23, 30)  # Monday night
+    weekdays = [0] * 7
+    weekdays[4] = 10  # Friday
+    hours = [0] * 24
+    hours[16] = 10
+    profile = {"categories": {"study": {
+        "count": 10,
+        "duration_min": 90,
+        "weekday_counts": weekdays,
+        "hour_counts": hours,
+    }}}
+
+    slot = find_available_todo_slot(
+        [], now, duration_min=90, category="study", habit_profile=profile
+    )
+
+    assert slot == ("2026-10-02", "16:00")
+
+
+def test_auto_schedule_separates_work_from_study_and_leisure_time():
+    now = datetime(2026, 9, 28, 8, 0)
+
+    assert find_available_todo_slot([], now, category="work")[1] == "09:00"
+    assert find_available_todo_slot([], now, category="study")[1] == "18:00"
+    assert find_available_todo_slot([], now, category="leisure")[1] == "18:00"
+
+
+def test_auto_schedule_uses_separate_work_and_leisure_habit_profiles():
+    now = datetime(2026, 9, 28, 8, 0)
+    work_hours = [0] * 24
+    work_hours[10] = 5
+    leisure_hours = [0] * 24
+    leisure_hours[20] = 5
+    monday_counts = [5, 0, 0, 0, 0, 0, 0]
+    profile = {"categories": {
+        "work": {
+            "count": 5, "duration_min": 60,
+            "weekday_counts": monday_counts, "hour_counts": work_hours,
+        },
+        "leisure": {
+            "count": 5, "duration_min": 60,
+            "weekday_counts": monday_counts, "hour_counts": leisure_hours,
+        },
+    }}
+
+    work = find_available_todo_slot([], now, category="work", habit_profile=profile)
+    leisure = find_available_todo_slot([], now, category="leisure", habit_profile=profile)
+
+    assert work == ("2026-09-28", "10:00")
+    assert leisure == ("2026-09-28", "20:00")
+
+
+def test_agent_category_routes_ambiguous_title_to_matching_habit_profile():
+    now = datetime(2026, 9, 28, 8, 0)
+    work_hours = [0] * 24
+    work_hours[10] = 5
+    leisure_hours = [0] * 24
+    leisure_hours[20] = 5
+    weekdays = [5, 0, 0, 0, 0, 0, 0]
+    profile = {"categories": {
+        "work": {
+            "count": 5, "duration_min": 60,
+            "weekday_counts": weekdays, "hour_counts": work_hours,
+        },
+        "leisure": {
+            "count": 5, "duration_min": 60,
+            "weekday_counts": weekdays, "hour_counts": leisure_hours,
+        },
+    }}
+
+    work = parse_todo_response(
+        json.dumps({"todos": [{
+            "title": "整理素材",
+            "category": "work",
+            "kind": "once",
+            "time_is_explicit": False,
+        }]}),
+        now,
+        habit_profile=profile,
+    )
+    leisure = parse_todo_response(
+        json.dumps({"todos": [{
+            "title": "整理素材",
+            "category": "leisure",
+            "kind": "once",
+            "time_is_explicit": False,
+        }]}),
+        now,
+        habit_profile=profile,
+    )
+
+    assert (work[0]["category"], work[0]["time"]) == ("work", "10:00")
+    assert (leisure[0]["category"], leisure[0]["time"]) == ("leisure", "20:00")
+
+
+def test_todo_agent_prompt_requires_a_category_for_each_todo():
+    from pet.todo_agent import _SYSTEM_PROMPT
+
+    assert '"category":"work"' in _SYSTEM_PROMPT
+    assert "category 只能为 work、study、leisure 或 general" in _SYSTEM_PROMPT
+    assert "课程、读书、备考、自我提升归 study" in _SYSTEM_PROMPT
+    assert "游戏、娱乐、休息、个人消遣归 leisure" in _SYSTEM_PROMPT
 
 
 def test_meeting_todo_uses_global_reminder_preference():
@@ -305,6 +481,8 @@ def test_meeting_todo_uses_global_reminder_preference():
         "kind": "once",
         "date": "2026-09-05",
         "time": "10:00",
+        "category": "work",
+        "duration_min": 60,
     }]
 
 
@@ -332,6 +510,8 @@ def test_missing_time_uses_a_free_slot_from_existing_todos():
         "kind": "once",
         "date": "2026-09-05",
         "time": "15:00",
+        "category": "work",
+        "duration_min": 60,
     }]
 
 
@@ -358,6 +538,8 @@ def test_missing_date_and_time_keep_the_scheduled_open_day():
         "kind": "once",
         "date": "2026-09-05",
         "time": "09:00",
+        "category": "work",
+        "duration_min": 60,
     }]
 
 

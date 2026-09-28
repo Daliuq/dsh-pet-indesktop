@@ -784,7 +784,9 @@ class Config:
             "chat_follow_pet": False,  # 聊天窗口是否跟随桌宠移动
             "system_notifications_enabled": True,  # 对话完成/失败/需要授权时弹桌面系统通知
             "todo_reminder_enabled": True,  # 待办提醒总开关
+            "todo_reminder_requires_confirmation": False,  # 待办提醒需用户确认后关闭
             "todo_reminder_lead_minutes": 5,  # 待办提前提醒分钟数（0~60，0=不提前）
+            "todo_habit_learning_enabled": False,  # 本地自动学习习惯（显式开启）
             # 语音报时（edge-tts 在线 TTS + 台词/歌词按 8 小时整体换批、批内轮换）
             "voice_chime_enabled": False,  # 语音报时总开关（默认关闭：主动打扰型功能，用户显式开启）
             "voice_chime_schedule": "hourly",  # hourly / every_30 / every_15 / every_5 / every_minute / custom
@@ -1034,7 +1036,9 @@ class Config:
             "chat_follow_pet",
             "system_notifications_enabled",
             "todo_reminder_enabled",
+            "todo_reminder_requires_confirmation",
             "todo_reminder_lead_minutes",
+            "todo_habit_learning_enabled",
             "voice_chime_enabled",
             "voice_chime_schedule",
             "voice_chime_custom_times",
@@ -1328,7 +1332,13 @@ class Config:
         self.data["system_notifications_enabled"] = _bool_or_default(self.data.get("system_notifications_enabled"), True)
         # 待办提醒：开关同规防字符串布尔误开；提前量钳到 [0, 60] 分钟（0=不提前）。
         self.data["todo_reminder_enabled"] = _bool_or_default(self.data.get("todo_reminder_enabled"), True)
+        self.data["todo_reminder_requires_confirmation"] = _bool_or_default(
+            self.data.get("todo_reminder_requires_confirmation"), False
+        )
         self.data["todo_reminder_lead_minutes"] = int(_float_or_default(self.data.get("todo_reminder_lead_minutes"), 5.0, 0.0, 60.0))
+        self.data["todo_habit_learning_enabled"] = _bool_or_default(
+            self.data.get("todo_habit_learning_enabled"), False
+        )
         # 黄金回旋 / 边缘探头：与其它布尔键同规，防手改字符串布尔误开。
         self.data["golden_spin_on_click"] = _bool_or_default(self.data.get("golden_spin_on_click"), False)
         self.data["golden_spin_direct"] = _bool_or_default(self.data.get("golden_spin_direct"), False)
@@ -1504,7 +1514,9 @@ class Config:
             "spawn_scale",
             "spawn_inherit_dynamic_island",
             "todo_reminder_enabled",
+            "todo_reminder_requires_confirmation",
             "todo_reminder_lead_minutes",
+            "todo_habit_learning_enabled",
             "music_sing_enabled",
             "music_sing_grace_seconds",
             "music_lyric_enabled",

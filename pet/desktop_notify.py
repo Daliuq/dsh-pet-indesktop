@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPen
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QPushButton, QWidget
 
 
 class DesktopNotification(QWidget):
@@ -18,14 +18,19 @@ class DesktopNotification(QWidget):
     clicked = Signal()
 
     _HEIGHT = 68
+    _CONFIRM_HEIGHT = 96
     _MARGIN = 16
     _GAP = 10
 
-    def __init__(self, title: str, message: str, *, on_click=None, duration_ms: int = 5000, parent=None):
+    def __init__(
+        self, title: str, message: str, *, on_click=None, duration_ms: int = 5000,
+        require_confirmation: bool = False, parent=None,
+    ):
         super().__init__(parent)
         self._title = str(title or "")
         self._message = str(message or "")
         self._on_click = on_click
+        self._require_confirmation = bool(require_confirmation)
         self.setObjectName("desktop-notification")
         flags = (
             Qt.WindowType.Tool
@@ -43,18 +48,43 @@ class DesktopNotification(QWidget):
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self.close)
-        self._timer.start(max(1500, int(duration_ms)))
+        if not self._require_confirmation:
+            self._timer.start(max(1500, int(duration_ms)))
+
+        self._confirm_button = None
+        if self._require_confirmation:
+            self._confirm_button = QPushButton("确定", self)
+            self._confirm_button.setObjectName("desktopNotificationConfirmButton")
+            self._confirm_button.setAccessibleName("确认并关闭待办提醒")
+            self._confirm_button.setAccessibleDescription(
+                "点击后确认已收到待办提醒并关闭此通知。"
+            )
+            self._confirm_button.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._confirm_button.setStyleSheet(
+                "QPushButton { background:#e7f0ff; color:#26364a;"
+                " border:1px solid #9ab9e0; border-radius:9px;"
+                " padding:2px 10px; font-weight:600; }"
+                "QPushButton:hover { background:#d6e7ff; }"
+                "QPushButton:pressed { background:#c4dcff; }"
+            )
+            self._confirm_button.clicked.connect(self.acknowledge)
 
         self._resize_for_text()
 
     # ------------------------------------------------------------ 对外
     def activate_click(self) -> None:
         self.clicked.emit()
-        if callable(self._on_click):
-            try:
+        try:
+            if callable(self._on_click):
                 self._on_click()
-            finally:
+        finally:
+            if not self._require_confirmation:
                 self.close()
+
+    def acknowledge(self) -> None:
+        """Close only after the dedicated confirmation action was clicked."""
+        if self._require_confirmation:
+            self.close()
 
     # ------------------------------------------------------------ 尺寸与绘制
     def _resize_for_text(self) -> None:
@@ -62,7 +92,10 @@ class DesktopNotification(QWidget):
         title_w = fm.horizontalAdvance(self._title) if self._title else 0
         message_w = fm.horizontalAdvance(self._message) if self._message else 0
         width = max(240, min(420, max(title_w, message_w) + 48))
-        self.setFixedSize(width, self._HEIGHT)
+        height = self._CONFIRM_HEIGHT if self._require_confirmation else self._HEIGHT
+        self.setFixedSize(width, height)
+        if self._confirm_button is not None:
+            self._confirm_button.setGeometry(width - 82, height - 31, 68, 24)
 
     def _style_colors(self):
         return QColor(30, 32, 38, 242), QColor(240, 244, 250), QColor(160, 170, 190)
@@ -98,7 +131,10 @@ class DesktopNotification(QWidget):
             fm = self.fontMetrics()
             painter.setPen(secondary)
             painter.drawText(
-                QRectF(x, y, self.width() - 32, fm.height() * 2),
+                QRectF(
+                    x, y, self.width() - 32,
+                    34 if self._require_confirmation else fm.height() * 2,
+                ),
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
                 self._message,
             )

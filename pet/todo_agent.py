@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import queue
 import re
 import threading
@@ -15,6 +16,12 @@ from datetime import date, datetime, timedelta
 
 from PySide6.QtCore import QObject, Qt, Signal
 
+from .todo_habits import (
+    TODO_HABIT_DEFAULT_DURATION_MINUTES,
+    TODO_HABIT_MAX_SESSION_MINUTES,
+    classify_todo_category,
+    estimate_duration_minutes,
+)
 from .todo_reminder import TODO_ITEMS_LIMIT, TODO_TITLE_LIMIT
 
 logger = logging.getLogger(__name__)
@@ -36,8 +43,11 @@ _SYSTEM_PROMPT = """你是待办事项抽取器。只分析用户消息中用户
 所有事项都沿用用户当前设置的全局提醒提前量，不根据事项类型单独调整。“中午”按 12:00 解析；“下午/下班前”按语境理解。
 “每周/每天”等明确重复安排只支持 daily（每天）；不支持的重复周期不要伪装成单次待办。
 忽略已经完成、纯假设、泛泛讨论、没有未来行动意图的内容。最多抽取 5 项，每项标题简短且以行动为中心。
+每项都必须给 category：工作安排、项目交付、职场沟通归 work；课程、读书、备考、自我提升归 study；
+游戏、娱乐、休息、个人消遣归 leisure；无法判断时归 general。不要只根据标题是否含“工作/学习”等字样判断，结合用户表达的用途。
 严格只返回 JSON，不要 Markdown 或解释，格式：
-{"todos":[{"title":"事项","kind":"once","date":"YYYY-MM-DD","date_is_explicit":true,"time":"HH:MM","time_is_explicit":true}]}
+{"todos":[{"title":"事项","category":"work","kind":"once","date":"YYYY-MM-DD","date_is_explicit":true,"time":"HH:MM","time_is_explicit":true}]}
+category 只能为 work、study、leisure 或 general；
 kind 只能为 once 或 daily；daily 的 date 留空。所有明确时间的 once 项必须给出有效 date；
 time_is_explicit=false 时 time 留空，date_is_explicit=false 时 date 留空。"""
 
@@ -76,6 +86,56 @@ def _normalise_schedule(existing_todos) -> tuple[tuple[str, str, str], ...]:
     return tuple(schedule)
 
 
+def _normalise_schedule_records(existing_todos) -> list[dict]:
+    """Keep local duration/category metadata for collision scoring, never for the prompt."""
+    if not isinstance(existing_todos, (list, tuple)):
+        return []
+    records = []
+    for raw in existing_todos[:TODO_ITEMS_LIMIT + _MAX_RESULTS]:
+        if isinstance(raw, dict):
+            if raw.get("enabled") is False:
+                continue
+            kind = str(raw.get("kind") or "").strip().lower()
+            date_text = str(raw.get("date") or "").strip()
+            time_text = str(raw.get("time") or "").strip()
+            category = classify_todo_category(raw.get("title"), raw.get("category"))
+            try:
+                duration = int(raw.get("duration_min", TODO_HABIT_DEFAULT_DURATION_MINUTES))
+            except (TypeError, ValueError):
+                duration = TODO_HABIT_DEFAULT_DURATION_MINUTES
+        elif isinstance(raw, (tuple, list)) and len(raw) in {3, 4}:
+            kind, date_text, time_text = (str(value or "").strip() for value in raw[:3])
+            try:
+                duration = int(raw[3]) if len(raw) == 4 else TODO_HABIT_DEFAULT_DURATION_MINUTES
+            except (TypeError, ValueError):
+                duration = TODO_HABIT_DEFAULT_DURATION_MINUTES
+            category = "general"
+        else:
+            continue
+        kind = kind.lower()
+        if kind not in {"once", "daily"} or not _HHMM.fullmatch(time_text):
+            continue
+        hour, minute = (int(part) for part in time_text.split(":"))
+        time_text = f"{hour:02d}:{minute:02d}"
+        if kind == "once":
+            if not _ISO_DATE.fullmatch(date_text):
+                continue
+            try:
+                date.fromisoformat(date_text)
+            except ValueError:
+                continue
+        else:
+            date_text = ""
+        records.append({
+            "kind": kind,
+            "date": date_text,
+            "time": time_text,
+            "duration_min": max(15, min(TODO_HABIT_MAX_SESSION_MINUTES, duration)),
+            "category": category,
+        })
+    return records
+
+
 def _format_schedule_context(existing_todos, now: datetime) -> str:
     schedule = list(_normalise_schedule(existing_todos))
     lines = []
@@ -90,11 +150,21 @@ def _format_schedule_context(existing_todos, now: datetime) -> str:
 
 
 def find_available_todo_slot(
-    existing_todos, now: datetime | None = None, *, requested_date: str = ""
+    existing_todos,
+    now: datetime | None = None,
+    *,
+    requested_date: str = "",
+    duration_min: int = TODO_HABIT_DEFAULT_DURATION_MINUTES,
+    category: str = "general",
+    habit_profile=None,
 ) -> tuple[str, str] | None:
-    """从启用待办中找相对空闲的一小时格；只看本地待办，不代表外部日历空闲。"""
+    """Find a local-todo-free slot, then use learned weekday/hour counts to rank it."""
     now = (now or datetime.now()).replace(tzinfo=None)
-    schedule = list(_normalise_schedule(existing_todos))
+    schedule = _normalise_schedule_records(existing_todos)
+    try:
+        duration_min = max(15, min(TODO_HABIT_MAX_SESSION_MINUTES, int(duration_min)))
+    except (TypeError, ValueError):
+        duration_min = TODO_HABIT_DEFAULT_DURATION_MINUTES
     if requested_date:
         if not _ISO_DATE.fullmatch(requested_date):
             return None
@@ -107,34 +177,78 @@ def find_available_todo_slot(
                           for offset in range(_AUTO_SCHEDULE_DAYS + 1)]
 
     day_set = set(candidate_days)
-    busy_by_day: dict[date, list[datetime]] = {day: [] for day in candidate_days}
-    for kind, date_text, time_text in schedule:
-        hour, minute = (int(part) for part in time_text.split(":"))
-        if kind == "daily":
+    busy_by_day: dict[date, list[tuple[datetime, int]]] = {day: [] for day in candidate_days}
+    for item in schedule:
+        hour, minute = (int(part) for part in item["time"].split(":"))
+        if item["kind"] == "daily":
             for day in candidate_days:
                 due = datetime(day.year, day.month, day.day, hour, minute)
                 if due > now:
-                    busy_by_day[day].append(due)
+                    busy_by_day[day].append((due, item["duration_min"]))
             continue
-        day = date.fromisoformat(date_text)
+        day = date.fromisoformat(item["date"])
         if day in day_set:
             due = datetime(day.year, day.month, day.day, hour, minute)
             if due > now:
-                busy_by_day[day].append(due)
+                busy_by_day[day].append((due, item["duration_min"]))
 
     candidates = []
     buffer = timedelta(minutes=_AUTO_SCHEDULE_BUFFER_MINUTES)
+    category_stats = {}
+    if isinstance(habit_profile, dict):
+        category_stats = habit_profile.get("categories", {})
+    stats = category_stats.get(classify_todo_category("", category)) if isinstance(category_stats, dict) else None
+    try:
+        trained = (
+            isinstance(stats, dict)
+            and int(stats.get("count", 0) or 0) >= 5
+            and len(stats.get("hour_counts", [])) == 24
+            and len(stats.get("weekday_counts", [])) == 7
+        )
+    except (TypeError, ValueError):
+        trained = False
+    if trained:
+        # Learned distributions are category-specific, so night workers and
+        # evening learners are not forced into a generic daytime window.
+        hours = range(7, 23)
+    else:
+        # Safe cold-start defaults keep work tasks in daytime and personal
+        # study/leisure tasks in the evening until enough local samples exist.
+        task_category = classify_todo_category("", category)
+        hours = (
+            range(18, 23)
+            if task_category in {"study", "leisure"}
+            else range(9, 18)
+        )
     for day in candidate_days:
         busy = busy_by_day[day]
-        for hour in range(9, 18):
+        for hour in hours:
             slot = datetime(day.year, day.month, day.day, hour)
             if slot <= now:
                 continue
-            nearby = sum(abs(slot - due) <= buffer for due in busy)
-            candidates.append((nearby, len(busy), day, slot))
+            candidate_start = slot - buffer
+            candidate_end = slot + timedelta(minutes=duration_min) + buffer
+            nearby = sum(
+                candidate_start < due + timedelta(minutes=busy_duration)
+                and candidate_end > due
+                for due, busy_duration in busy
+            )
+            habit_cost = 0.0
+            if trained:
+                try:
+                    count = max(1, int(stats["count"]))
+                    hour_counts = stats["hour_counts"]
+                    weekday_counts = stats["weekday_counts"]
+                    if len(hour_counts) == 24 and len(weekday_counts) == 7:
+                        hour_probability = (int(hour_counts[hour]) + 1) / (count + 24)
+                        day_probability = (int(weekday_counts[day.weekday()]) + 1) / (count + 7)
+                        habit_cost = -math.log(hour_probability) - 0.35 * math.log(day_probability)
+                except (KeyError, TypeError, ValueError, IndexError):
+                    habit_cost = 0.0
+            candidates.append((nearby, len(busy), habit_cost, day, slot))
     if not candidates:
         return None
-    _, _, day, slot = min(candidates)
+    _, _, _, day, slot = min(candidates)
     return day.isoformat(), slot.strftime("%H:%M")
 
 
@@ -166,6 +280,7 @@ def parse_todo_response(
     now: datetime | None = None,
     *,
     existing_todos=None,
+    habit_profile=None,
 ) -> list[dict]:
     """校验模型输出，并用现有待办为未标时间的事项选择本地空档。"""
     payload = _decode_json(text)
@@ -173,6 +288,7 @@ def parse_todo_response(
         return []
     now = (now or datetime.now()).replace(tzinfo=None)
     schedule = list(_normalise_schedule(existing_todos))
+    schedule_records = _normalise_schedule_records(existing_todos)
     result: list[dict] = []
     for raw in payload["todos"][:_MAX_RESULTS]:
         if not isinstance(raw, dict):
@@ -180,6 +296,8 @@ def parse_todo_response(
         title = str(raw.get("title") or "").strip()[:TODO_TITLE_LIMIT]
         if not title:
             continue
+        category = classify_todo_category(title, raw.get("category"))
+        duration_min = estimate_duration_minutes(habit_profile, category)
         kind = str(raw.get("kind") or "once").strip().lower()
         if kind not in {"once", "daily"}:
             continue
@@ -208,9 +326,12 @@ def parse_todo_response(
 
         if not time_is_explicit:
             slot = find_available_todo_slot(
-                schedule,
+                schedule_records,
                 now,
                 requested_date=date_text if date_is_explicit else "",
+                duration_min=duration_min,
+                category=category,
+                habit_profile=habit_profile,
             )
             if slot is None:
                 continue
@@ -233,8 +354,22 @@ def parse_todo_response(
                 continue
             date_text = day.isoformat()
 
-        result.append({"title": title, "kind": kind, "date": date_text, "time": time_text})
+        result.append({
+            "title": title,
+            "kind": kind,
+            "date": date_text,
+            "time": time_text,
+            "category": category,
+            "duration_min": duration_min,
+        })
         schedule.append((kind, date_text, time_text))
+        schedule_records.append({
+            "kind": kind,
+            "date": date_text,
+            "time": time_text,
+            "category": category,
+            "duration_min": duration_min,
+        })
     return result
 
 
@@ -256,7 +391,7 @@ class TodoAgent(QObject):
         self._closed = False
         self.todos_extracted.connect(self._deliver, Qt.ConnectionType.QueuedConnection)
 
-    def submit(self, session_id: str, text: str, *, existing_todos=None) -> bool:
+    def submit(self, session_id: str, text: str, *, existing_todos=None, habit_profile=None) -> bool:
         """接收一条待分析文本；返回是否已进入后台队列。"""
         if self._closed or self._stop.is_set():
             return False
@@ -275,8 +410,13 @@ class TodoAgent(QObject):
             logger.debug("待办 Agent 缺少可用聊天模型配置", exc_info=True)
             return False
         schedule = _normalise_schedule(existing_todos)
+        schedule_records = _normalise_schedule_records(existing_todos)
+        profile = habit_profile if isinstance(habit_profile, dict) else {"categories": {}}
         try:
-            self._queue.put_nowait((str(session_id or ""), message, provider, schedule))
+            self._queue.put_nowait((
+                str(session_id or ""), message, provider, schedule,
+                schedule_records, profile,
+            ))
         except queue.Full:
             logger.info("待办 Agent 队列已满，跳过一条消息")
             return False
@@ -307,7 +447,7 @@ class TodoAgent(QObject):
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                session_id, message, provider, schedule = self._queue.get(timeout=0.2)
+                session_id, message, provider, schedule, schedule_records, habit_profile = self._queue.get(timeout=0.2)
             except queue.Empty:
                 continue
             if self._stop.is_set():
@@ -344,7 +484,10 @@ class TodoAgent(QObject):
                             self._active_cancel = None
                             self._active_responses = []
                 todos = parse_todo_response(
-                    response, local_now, existing_todos=schedule
+                    response,
+                    local_now,
+                    existing_todos=schedule_records,
+                    habit_profile=habit_profile,
                 )
                 if not self._stop.is_set():
                     self.todos_extracted.emit(session_id, todos)

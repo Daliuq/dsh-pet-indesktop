@@ -3,13 +3,14 @@
 
 视觉上沿用 Shared UX Contract 令牌（references/visual-system.md）：卡片
 12px 圆角 1px 边框、字段/按钮 7px 圆角、13px 正文 / 12px 提示、强调色
-#0a84ff，明暗跟随系统调色板亮度。面板只管理待办条目（CRUD 即时落盘，
-经 TodoReminderService.set_items）；提醒开关与提前量单一归属在设置页
-「自动化与联动」，面板仅以提示文案深链，不复制偏好控件。
+#0a84ff，明暗跟随系统调色板亮度。面板管理待办条目（CRUD 即时落盘，
+经 TodoReminderService.set_items），并提供本机自动习惯学习的开始/暂停命令。
+学习偏好本身仍由设置页「自动化与联动」单一保存，面板不复制偏好控件。
 """
 from __future__ import annotations
 
 from datetime import date, datetime
+import sys
 import uuid
 
 from PySide6.QtCore import QDate, Qt, QTime
@@ -33,6 +34,14 @@ from PySide6.QtWidgets import (
 )
 
 from .todo_reminder import new_todo_item, summarize_next
+from .todo_habits import (
+    TODO_HABIT_CATEGORY_GENERAL,
+    TODO_HABIT_CATEGORY_LEISURE,
+    TODO_HABIT_CATEGORY_STUDY,
+    TODO_HABIT_CATEGORY_WORK,
+    classify_todo_category,
+    estimate_duration_minutes,
+)
 
 
 def _stylesheet(widget: QWidget) -> str:
@@ -56,7 +65,7 @@ def _stylesheet(widget: QWidget) -> str:
         color: {text};
         background: transparent;
     }}
-    QLabel#todoNextLabel, QLabel#todoHintLabel, QLabel#todoEmptyLabel {{
+    QLabel#todoNextLabel, QLabel#todoHabitLabel, QLabel#todoHintLabel, QLabel#todoEmptyLabel {{
         color: {hint};
         font-size: 12px;
         background: transparent;
@@ -146,7 +155,7 @@ def _divider() -> QFrame:
 
 
 class TodoPanelDialog(QDialog):
-    """待办条目列表 + 内嵌新建/编辑表单；偏好不在本面板（深链设置页）。"""
+    """待办管理面板；自动学习只提供开始/暂停命令，偏好归属在设置页。"""
 
     def __init__(self, app, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -173,6 +182,21 @@ class TodoPanelDialog(QDialog):
         self._next_label.setObjectName("todoNextLabel")
         self._next_label.setWordWrap(True)
         header.addWidget(self._next_label)
+        self._habit_label = QLabel("")
+        self._habit_label.setObjectName("todoHabitLabel")
+        self._habit_label.setWordWrap(True)
+        header.addWidget(self._habit_label)
+        habit_actions = QHBoxLayout()
+        self._habit_toggle_btn = QPushButton()
+        self._habit_toggle_btn.setObjectName("todoHabitLearningToggle")
+        self._habit_toggle_btn.setAccessibleName("习惯自动学习")
+        self._habit_toggle_btn.setAccessibleDescription(
+            "开始或暂停本机自动学习时段记录。自动采样不截屏、不调用模型。"
+        )
+        self._habit_toggle_btn.clicked.connect(self._toggle_todo_habit_learning)
+        habit_actions.addWidget(self._habit_toggle_btn)
+        habit_actions.addStretch(1)
+        header.addLayout(habit_actions)
         root.addLayout(header)
 
         self._agent_dialog = self._build_agent_entry()
@@ -309,6 +333,18 @@ class TodoPanelDialog(QDialog):
         self._date_edit.setCalendarPopup(True)
         self._date_edit.setDate(QDate.currentDate())
 
+        self._category_combo = QComboBox()
+        self._category_combo.setObjectName("todoHabitCategory")
+        self._category_combo.addItem("自动识别", "auto")
+        self._category_combo.addItem("工作", TODO_HABIT_CATEGORY_WORK)
+        self._category_combo.addItem("学习", TODO_HABIT_CATEGORY_STUDY)
+        self._category_combo.addItem("休闲", TODO_HABIT_CATEGORY_LEISURE)
+        self._category_combo.addItem("其他", TODO_HABIT_CATEGORY_GENERAL)
+        self._category_combo.setAccessibleName("待办类型")
+        self._category_combo.setAccessibleDescription(
+            "选择工作、学习、休闲或其他，用于从对应的本机活动时段习惯中安排时间。"
+        )
+
         self._cancel_btn = QPushButton("取消")
         self._cancel_btn.clicked.connect(self.close_editor)
         self._save_btn = QPushButton("保存")
@@ -321,13 +357,15 @@ class TodoPanelDialog(QDialog):
         form.addWidget(self._kind_combo, 1, 1)
         form.addWidget(self._time_edit, 1, 2)
         form.addWidget(self._date_edit, 1, 3)
+        form.addWidget(QLabel("习惯"), 2, 0)
+        form.addWidget(self._category_combo, 2, 1)
         # 操作按钮独占一行右对齐：与重复/时间/日期同行时窄宽度会互相挤压截断
         actions = QHBoxLayout()
         actions.setSpacing(8)
         actions.addStretch(1)
         actions.addWidget(self._cancel_btn)
         actions.addWidget(self._save_btn)
-        form.addLayout(actions, 2, 0, 1, 4)
+        form.addLayout(actions, 3, 0, 1, 4)
 
         form.setColumnStretch(1, 1)
         form.setColumnStretch(2, 1)
@@ -421,6 +459,7 @@ class TodoPanelDialog(QDialog):
                 self._rows_layout.addWidget(self._build_row(item))
         self._rows_layout.addStretch(1)
         self._refresh_next_label(items)
+        self._refresh_habit_label()
 
     def _build_row(self, item: dict) -> QFrame:
         row = QFrame()
@@ -481,7 +520,16 @@ class TodoPanelDialog(QDialog):
                     badge = time_text
                 else:
                     badge = f"{day.month}月{day.day}日 {time_text}"
-        return badge
+        category = {
+            TODO_HABIT_CATEGORY_WORK: "工作",
+            TODO_HABIT_CATEGORY_STUDY: "学习",
+            TODO_HABIT_CATEGORY_LEISURE: "休闲",
+        }.get(item.get("category"), "其他")
+        try:
+            duration = max(15, min(240, int(item.get("duration_min", 60) or 60)))
+        except (TypeError, ValueError):
+            duration = 60
+        return f"{badge} · {category} · 预计 {duration} 分钟"
 
     def _refresh_next_label(self, items: list[dict]) -> None:
         config = getattr(self._app, "config", None)
@@ -491,6 +539,57 @@ class TodoPanelDialog(QDialog):
             return
         summary = summarize_next(items, datetime.now())
         self._next_label.setText(f"下一条：{summary}" if summary else "")
+
+    def _habit_store(self):
+        getter = getattr(self._app, "_ensure_todo_habits", None)
+        return getter() if callable(getter) else None
+
+    def _refresh_habit_label(self) -> None:
+        config = getattr(self._app, "config", None)
+        enabled = bool(config.get("todo_habit_learning_enabled", False)) if config else False
+        supported = sys.platform == "win32"
+        self._habit_toggle_btn.setEnabled(supported)
+        self._habit_toggle_btn.setText(
+            "暂停自动学习" if enabled else "开启自动学习"
+        )
+        if not supported:
+            self._habit_label.setText("习惯自动学习目前仅支持 Windows。")
+            return
+        store = self._habit_store()
+        learned = store.summary() if store is not None else "本机习惯记录暂时不可用。"
+        if enabled:
+            observer = getattr(self._app, "todo_habit_observer", None)
+            activity = (
+                "正在累计学习时段。"
+                if getattr(observer, "is_active", False)
+                else "已开启，等待识别到学习活动。"
+            )
+            self._habit_label.setText(f"自动学习{activity} {learned}")
+        else:
+            self._habit_label.setText(
+                "自动学习已关闭。开启后区分工作、学习、休闲活动；模糊项忽略，不截屏、不调用模型。 "
+                + learned
+            )
+
+    def _toggle_todo_habit_learning(self) -> None:
+        config = getattr(self._app, "config", None)
+        if config is None or sys.platform != "win32":
+            return
+        enabled = not bool(config.get("todo_habit_learning_enabled", False))
+        setter = getattr(self._app, "_set_todo_habit_learning_enabled", None)
+        if callable(setter):
+            saved = setter(enabled)
+        else:
+            config.set("todo_habit_learning_enabled", enabled)
+            save = getattr(config, "save", None)
+            saved = bool(save()) if callable(save) else True
+            sync = getattr(self._app, "_sync_todo_habit_learning", None)
+            if callable(sync):
+                sync()
+        if saved is False:
+            self._habit_label.setText("设置保存失败；自动学习状态未能更新。")
+            return
+        self._refresh_habit_label()
 
     # ------------------------------------------------------------ 行为
 
@@ -552,7 +651,14 @@ class TodoPanelDialog(QDialog):
         self._agent_status.setText("正在识别并添加…")
         self._agent_text.setEnabled(False)
         self._sync_agent_submit_enabled()
-        if not agent.submit(session_id, text, existing_todos=self._items()):
+        profile_getter = getattr(self._app, "_todo_habit_profile", None)
+        habit_profile = profile_getter() if callable(profile_getter) else {"categories": {}}
+        if not agent.submit(
+            session_id,
+            text,
+            existing_todos=self._items(),
+            habit_profile=habit_profile,
+        ):
             self._agent_session_id = None
             self._agent_text.setEnabled(True)
             self._agent_status.setText("Agent 暂时不可用，请检查 AI 模型配置后重试。")
@@ -600,6 +706,7 @@ class TodoPanelDialog(QDialog):
         self._kind_combo.setCurrentIndex(0)
         self._time_edit.setTime(QTime(9, 0))
         self._date_edit.setDate(QDate.currentDate())
+        self._category_combo.setCurrentIndex(0)
         self._sync_date_visibility()
         self._editor_card.setVisible(True)
         self._add_btn.setEnabled(False)
@@ -613,6 +720,10 @@ class TodoPanelDialog(QDialog):
             return
         self._editing_id = item_id
         self._title_edit.setText(str(target["title"]))
+        category_index = self._category_combo.findData(
+            target.get("category", TODO_HABIT_CATEGORY_GENERAL)
+        )
+        self._category_combo.setCurrentIndex(max(0, category_index))
         self._kind_combo.setCurrentIndex(1 if target["kind"] == "daily" else 0)
         hour, minute = (int(part) for part in str(target["time"]).split(":"))
         self._time_edit.setTime(QTime(hour, minute))
@@ -639,10 +750,14 @@ class TodoPanelDialog(QDialog):
         if not title:
             return
         kind = self._kind_combo.currentData()
+        category = classify_todo_category(title, self._category_combo.currentData())
         time_text = self._time_edit.time().toString("HH:mm")
         date_text = (
             self._date_edit.date().toString("yyyy-MM-dd") if kind == "once" else ""
         )
+        store = self._habit_store()
+        profile = store.profile() if store is not None else {"categories": {}}
+        duration_min = estimate_duration_minutes(profile, category)
         items = self._items()
         if self._editing_id is not None:
             merged = []
@@ -656,6 +771,8 @@ class TodoPanelDialog(QDialog):
                     "kind": kind,
                     "time": time_text,
                     "date": date_text,
+                    "category": category,
+                    "duration_min": duration_min,
                     # 内容/时间变更后重新武装，避免沿用旧触发戳漏提醒
                     "fired_lead_slot": None,
                     "fired_due_slot": None,
@@ -663,7 +780,14 @@ class TodoPanelDialog(QDialog):
                 merged.append(item)
             self._save_items(merged)
         else:
-            self._save_items(items + [new_todo_item(title, kind, time_text, date_text)])
+            self._save_items(items + [new_todo_item(
+                title,
+                kind,
+                time_text,
+                date_text,
+                category=category,
+                duration_min=duration_min,
+            )])
         self.close_editor()
         self.reload_items()
 

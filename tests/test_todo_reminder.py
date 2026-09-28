@@ -53,7 +53,32 @@ def test_new_todo_item_shape():
     assert item["enabled"] is True
     assert item["fired_lead_slot"] is None
     assert item["fired_due_slot"] is None
+    assert item["category"] == "general"
+    assert item["duration_min"] == 60
     assert item["id"]
+
+
+def test_todo_category_and_duration_are_cleaned_and_bounded():
+    item = new_todo_item("学英语", "once", "10:00", "2026-09-05")
+    assert item["category"] == "study"
+    items = clean_todo_items([{
+        **item,
+        "category": "study",
+        "duration_min": 999,
+    }])
+
+    assert items[0]["category"] == "study"
+    assert items[0]["duration_min"] == 240
+
+
+def test_todo_work_and_leisure_categories_survive_storage_cleaning():
+    work = new_todo_item("给客户写项目周报", "once", "10:00", "2026-09-05")
+    leisure = new_todo_item("看电影", "once", "20:00", "2026-09-05")
+
+    assert work["category"] == "work"
+    assert leisure["category"] == "leisure"
+    cleaned = clean_todo_items([work, leisure])
+    assert [item["category"] for item in cleaned] == ["work", "leisure"]
 
 
 def test_new_once_item_keeps_date():
@@ -314,6 +339,7 @@ class _FakeWin:
     def __init__(self, visible: bool = True) -> None:
         self.visible = visible
         self.bubbles: list[str] = []
+        self.alerts: list[dict] = []
 
     def isVisible(self) -> bool:
         return self.visible
@@ -321,18 +347,26 @@ class _FakeWin:
     def show_bubble(self, text, duration_ms=3200, subtitle=None):
         self.bubbles.append(text)
 
+    def show_alert(self, text, **kwargs):
+        self.alerts.append({"text": text, **kwargs})
+
 
 class _FakeApp:
     def __init__(self, tmp_path, visible: bool = True) -> None:
         self.config = Config(base=tmp_path)
         self.win = _FakeWin(visible)
         self.notifies: list[tuple] = []
+        self.notify_confirmation: list[bool] = []
         self.modern_settings_dialog = None
         self.chat_settings_dialog = None
         self.panel_opens = 0
 
-    def system_notify(self, title, message, *, on_click=None, duration_ms=5000):
+    def system_notify(
+        self, title, message, *, on_click=None, duration_ms=5000,
+        require_confirmation=False,
+    ):
         self.notifies.append((title, message, on_click))
+        self.notify_confirmation.append(require_confirmation)
 
     def open_todo_panel(self):
         self.panel_opens += 1
@@ -404,6 +438,67 @@ def test_service_tick_notifies_when_settings_open(tmp_path):
     service._on_tick(now=datetime(2026, 9, 4, 10, 6))
     assert app.win.bubbles == []
     assert len(app.notifies) == 1
+
+
+def test_confirmed_reminder_requires_acknowledgment_on_visible_pet(tmp_path):
+    _qapp()
+    app = _FakeApp(tmp_path, visible=True)
+    _due_item_in_store(app.config.dir)
+    app.config.set("todo_reminder_requires_confirmation", True)
+    service = TodoReminderService(app)
+    service.apply_config()
+
+    service._on_tick(now=datetime(2026, 9, 4, 10, 6))
+
+    assert app.win.bubbles == []
+    assert len(app.win.alerts) == 1
+    alert = app.win.alerts[0]
+    assert alert["text"].startswith("⏰ 待办提醒：站会")
+    assert alert["sticky"] is True
+    assert alert["alert_type"] == "todo-reminder"
+    assert [label for label, _callback in alert["buttons"]] == ["确定"]
+
+
+def test_confirmed_desktop_reminder_passes_acknowledgment_mode(tmp_path):
+    _qapp()
+    app = _FakeApp(tmp_path, visible=False)
+    _due_item_in_store(app.config.dir)
+    app.config.set("todo_reminder_requires_confirmation", True)
+    service = TodoReminderService(app)
+    service.apply_config()
+
+    service._on_tick(now=datetime(2026, 9, 4, 10, 6))
+
+    assert len(app.notifies) == 1
+    assert app.notify_confirmation == [True]
+
+
+def test_desktop_notification_waits_for_confirm_button_when_required():
+    from PySide6.QtWidgets import QPushButton
+
+    from pet.desktop_notify import DesktopNotification
+
+    _qapp()
+    opened = []
+    notification = DesktopNotification(
+        "待办提醒", "站会（10:00）", on_click=lambda: opened.append(True),
+        require_confirmation=True,
+    )
+    try:
+        confirm = notification.findChild(QPushButton, "desktopNotificationConfirmButton")
+        assert confirm is not None
+        assert confirm.text() == "确定"
+        assert confirm.accessibleName() == "确认并关闭待办提醒"
+        assert not notification._timer.isActive()
+
+        notification.activate_click()
+        assert opened == [True]
+        assert not notification.is_closed()
+
+        confirm.click()
+        assert notification.is_closed()
+    finally:
+        notification.close()
 
 
 def test_service_notify_gated_by_system_notifications(tmp_path):
@@ -579,7 +674,7 @@ def test_panel_edit_updates_item_and_clears_slots(tmp_path):
 # ------------------------------------------------------------ 设置页偏好
 
 def test_settings_roundtrip_todo_prefs(tmp_path):
-    """设置对话框读写 todo_reminder 两键，且两行归入「待办提醒」section。"""
+    """设置对话框保存提醒和自动习惯学习，并将它们归入待办设置组。"""
     from PySide6.QtWidgets import QLabel
 
     from pet.modern_settings_dialog import ModernSettingsDialog, SettingRow, SettingsSection
@@ -591,8 +686,12 @@ def test_settings_roundtrip_todo_prefs(tmp_path):
     try:
         assert dialog.todo_reminder_check.isChecked() is True
         assert dialog.todo_reminder_lead_spin.value() == 5
+        assert dialog.todo_habit_learning_check.isChecked() is False
+        assert dialog.todo_reminder_confirmation_check.isChecked() is False
 
         dialog.todo_reminder_check.setChecked(False)
+        dialog.todo_habit_learning_check.setChecked(True)
+        dialog.todo_reminder_confirmation_check.setChecked(True)
         dialog.todo_reminder_lead_spin.setValue(88)  # 超 60 → spin 钳制
         assert dialog._write_config() is True
 
@@ -608,10 +707,21 @@ def test_settings_roundtrip_todo_prefs(tmp_path):
 
         row = dialog.findChild(SettingRow, "settingRow_todo_reminder_enabled")
         assert row is not None
+        confirmation_row = dialog.findChild(
+            SettingRow, "settingRow_todo_reminder_requires_confirmation"
+        )
+        assert confirmation_row is not None
         assert section_title(row) == "待办提醒"  # 显式 claim，不落「待分类」
+        learning_row = dialog.findChild(
+            SettingRow, "settingRow_todo_habit_learning_enabled"
+        )
+        assert learning_row is not None
+        assert section_title(learning_row) == "待办提醒"
     finally:
         dialog.deleteLater()
 
     reloaded = Config(cfg_root)
     assert reloaded.get("todo_reminder_enabled") is False
     assert reloaded.get("todo_reminder_lead_minutes") == 60
+    assert reloaded.get("todo_reminder_requires_confirmation") is True
+    assert reloaded.get("todo_habit_learning_enabled") is True

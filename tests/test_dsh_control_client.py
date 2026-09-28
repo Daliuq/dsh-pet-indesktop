@@ -28,8 +28,16 @@ def _fake_bridge(tmp_path, response):
                 request = json.loads(files[0].read_text(encoding="utf-8"))
                 captured.update(request)
                 response_path = tmp_path / f"watchdog-response-{request['id']}.json"
+                signed_response = {
+                    "id": request["id"],
+                    "nonce": request["nonce"],
+                    **response,
+                }
+                signed_response["sig"] = dsh_control._compute_response_signature(
+                    dsh_control._read_secret(), signed_response
+                )
                 response_path.write_text(
-                    json.dumps({"id": request["id"], **response}), encoding="utf-8")
+                    json.dumps(signed_response), encoding="utf-8")
                 return
             time.sleep(0.02)
 
@@ -41,6 +49,7 @@ def _fake_bridge(tmp_path, response):
 @pytest.fixture
 def bridge_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(dsh_control, "_bridge_dir", lambda: str(tmp_path))
+    (tmp_path / "watchdog-secret").write_text("a" * 64, encoding="ascii")
     return tmp_path
 
 
@@ -84,7 +93,7 @@ def test_request_timeout_cleans_up_request_file(bridge_dir):
 def test_request_rejects_bad_session_without_touching_disk(bridge_dir, session_id, expected):
     ok, detail = dsh_control.request("interrupt", session_id, timeout=1.0)
     assert (ok, detail) == (False, expected)
-    assert not list(bridge_dir.iterdir()), "非法请求不得写盘"
+    assert not list(bridge_dir.glob("watchdog-request-*.json")), "非法请求不得写请求文件"
 
 
 def test_request_rejects_unknown_operation(bridge_dir):

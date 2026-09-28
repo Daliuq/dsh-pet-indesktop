@@ -5,8 +5,9 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createHash } from "node:crypto";
-import { randomUUID } from "node:crypto";
+import {
+  createHash, createHmac, randomBytes, randomUUID, timingSafeEqual,
+} from "node:crypto";
 
 // ===== 零依赖红线 =====
 // 本插件必须保持零外部依赖：profile 经 pnpm 的 link: 协议链接到本目录，
@@ -39,6 +40,109 @@ const inject = ["llm", "agentDefaultModel"];
 const CONTROL_POLL_MS = 150;
 const CONTROL_MAX_CONTEXT = 12000;
 const CONTROL_MAX_REQUEST_AGE_MS = 10 * 60 * 1000;
+const CONTROL_SECRET_NAME = "watchdog-secret";
+const CONTROL_REQUEST_FIELDS = [
+  ["id", "str"], ["nonce", "str"], ["ts", "int"],
+  ["operation", "str"], ["sessionId", "str"], ["text", "str"],
+  ["goal", "str"], ["context", "str"], ["provider", "str"],
+  ["model", "str"], ["timeoutMs", "int"],
+];
+const CONTROL_RESPONSE_FIELDS = [
+  ["id", "str"], ["nonce", "str"], ["ok", "bool"],
+  ["phase", "str"], ["error", "str"], ["alreadyIdle", "bool"],
+  ["foundAgent", "bool"], ["cancelInvoked", "bool"],
+  ["wasSubagent", "bool"], ["appliedToRoot", "bool"],
+  ["rootSessionId", "str"], ["plan", "str"],
+];
+
+function canonicalControlFields(value, fields) {
+  return JSON.stringify(fields.map(([name, kind]) => {
+    const field = value?.[name];
+    if (kind === "bool") return field === true;
+    if (kind === "int") {
+      const number = Number(field);
+      return Number.isSafeInteger(number) ? number : 0;
+    }
+    return typeof field === "string" ? field : "";
+  }));
+}
+
+function _controlKey(secret) {
+  if (typeof secret !== "string" || !/^[0-9a-f]{64}$/.test(secret)) {
+    throw new Error("invalid-control-secret");
+  }
+  return Buffer.from(secret, "hex");
+}
+
+function _controlSignature(secret, payload, fields) {
+  return createHmac("sha256", _controlKey(secret))
+    .update(canonicalControlFields(payload, fields), "utf8")
+    .digest("hex");
+}
+
+function canonicalRequest(request) {
+  return canonicalControlFields(request, CONTROL_REQUEST_FIELDS);
+}
+
+function computeRequestSignature(secret, request) {
+  return _controlSignature(secret, request, CONTROL_REQUEST_FIELDS);
+}
+
+function canonicalResponse(response) {
+  return canonicalControlFields(response, CONTROL_RESPONSE_FIELDS);
+}
+
+function computeResponseSignature(secret, response) {
+  return _controlSignature(secret, response, CONTROL_RESPONSE_FIELDS);
+}
+
+function ensureSecret() {
+  const directory = bridgeDir();
+  fs.mkdirSync(directory, { recursive: true });
+  const secretPath = path.join(directory, CONTROL_SECRET_NAME);
+  try {
+    const existing = fs.readFileSync(secretPath, "ascii").trim();
+    if (/^[0-9a-f]{64}$/.test(existing)) return existing;
+    throw new Error("invalid-control-secret-file");
+  } catch (err) {
+    if (err?.code !== "ENOENT") throw err;
+  }
+
+  const secret = randomBytes(32).toString("hex");
+  let fd;
+  try {
+    fd = fs.openSync(secretPath, "wx", 0o600);
+  } catch (err) {
+    if (err?.code !== "EEXIST") throw err;
+    const existing = fs.readFileSync(secretPath, "ascii").trim();
+    if (/^[0-9a-f]{64}$/.test(existing)) return existing;
+    throw new Error("invalid-control-secret-file");
+  }
+  try {
+    fs.writeFileSync(fd, secret, "ascii");
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  return secret;
+}
+
+function verifyControlSignature(secret, payload, fields) {
+  const signature = payload?.sig;
+  if (typeof signature !== "string" || !/^[0-9a-f]{64}$/.test(signature)) return false;
+  try {
+    return timingSafeEqual(
+      Buffer.from(signature, "hex"),
+      Buffer.from(_controlSignature(secret, payload, fields), "hex"),
+    );
+  } catch {
+    return false;
+  }
+}
+
+function verifyRequestSignature(request, secret = ensureSecret()) {
+  return verifyControlSignature(secret, request, CONTROL_REQUEST_FIELDS);
+}
 
 // 进程内状态去重 + 多 Agent 聚合：
 // 1) dsh 在 agent 创建/状态切换瞬间会抖动出重复 idle（实测 idle→working 仅隔
@@ -87,6 +191,9 @@ function isModelAccessError(code, message) {
 
 // 桥目录必须与桌宠端一致：win32=%APPDATA%，darwin=~/Library/Application Support，其他=~/.config
 function bridgeDir() {
+  if (process.env.DSH_PET_BRIDGE_DIR) {
+    return path.resolve(process.env.DSH_PET_BRIDGE_DIR);
+  }
   if (process.platform === "win32") {
     return path.join(process.env.APPDATA || os.homedir(), "dsh-pet-bridge");
   }
@@ -104,12 +211,16 @@ function controlResponsePath(id) {
   return path.join(bridgeDir(), `watchdog-response-${id}.json`);
 }
 
-function writeControlResponse(id, result) {
+function writeControlResponse(id, request, result) {
   try {
-    fs.mkdirSync(bridgeDir(), { recursive: true });
-    fs.writeFileSync(controlResponsePath(id), JSON.stringify({
-      id, ts: Date.now(), ...result,
-    }), "utf8");
+    const response = {
+      ...result,
+      id: String(id || ""),
+      nonce: String(request?.nonce || ""),
+      ts: Date.now(),
+    };
+    response.sig = computeResponseSignature(ensureSecret(), response);
+    fs.writeFileSync(controlResponsePath(id), JSON.stringify(response), "utf8");
   } catch (err) {
     // The response file is a convenience for the pet.  Never affect the Agent.
   }
@@ -341,12 +452,17 @@ function writeControlOutcome(id, request, result) {
     foundAgent: !!result.foundAgent, cancelInvoked: !!result.cancelInvoked,
     wasSubagent: !!result.wasSubagent, appliedToRoot: !!result.appliedToRoot,
     rootSessionId: String(result.rootSessionId || "") };
-  writeControlResponse(id, result);
+  writeControlResponse(id, request, result);
   writeRecord({ event: "bridge/control-result", ...controlResult });
   writeRecord({ event: "watchdog/control-result", ...controlResult });
 }
 
 function startControlQueue(ctx) {
+  try {
+    ensureSecret();
+  } catch (err) {
+    console.warn(`[${PLUGIN_ID}] control secret unavailable: ${String(err?.message || err)}`);
+  }
   let busy = false;
   const timer = setInterval(async () => {
     if (busy) return;
@@ -364,7 +480,14 @@ function startControlQueue(ctx) {
         let request;
         try { request = JSON.parse(fs.readFileSync(claimed, "utf8")); }
         catch { request = { id, operation: "", sessionId: "" }; }
-        const result = await handleControlRequest(ctx, request);
+        const secret = ensureSecret();
+        const result = verifyRequestSignature(request, secret)
+          ? await handleControlRequest(ctx, request)
+          : {
+            ok: false, operation: request.operation, sessionId: request.sessionId,
+            phase: "untrusted", error: "bridge-control-untrusted",
+            foundAgent: false, cancelInvoked: false,
+          };
         writeControlOutcome(id, request, result);
       } catch (err) {
         console.warn(`[${PLUGIN_ID}] control internal error: ${String(err?.message || err)}`);
@@ -1767,7 +1890,11 @@ export function apply(ctx) {
 export { inject };
 // Kept private-by-convention: package tests use this surface to exercise the
 // control boundary without starting a DSH host or touching the real queue.
-export const __controlTest = { controlAgent, handleControlRequest, liveAgents, knownSessions };
+export const __controlTest = {
+  controlAgent, handleControlRequest, liveAgents, knownSessions,
+  canonicalRequest, computeRequestSignature, verifyRequestSignature,
+  canonicalResponse, computeResponseSignature, ensureSecret,
+};
 export const __messageTest = { createUserMessage };
 export const __retryTest = {
   threshold: RETRY_EVENT_THRESHOLD,

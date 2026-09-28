@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import weakref
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -59,6 +60,13 @@ from .decode_fanout import DecodeFanoutHub
 from .festival_service import FestivalReminderService
 from .todo_reminder import TODO_ITEMS_LIMIT, TodoReminderService, new_todo_item
 from .todo_agent import TodoAgent
+from .todo_habits import (
+    TODO_HABIT_POLL_INTERVAL_SECONDS,
+    TodoHabitObserver,
+    TodoHabitStore,
+    estimate_duration_minutes,
+    todo_habits_path,
+)
 from .voice_chime_service import VoiceChimeService
 from .dsh_state import DshStateTracker
 from .persona_phrases import PhrasePicker
@@ -895,6 +903,7 @@ class PetInstance:
             shell._apply_balance_timer()
             # Phase 1/2：设置保存后按配置同步可选服务（todo 懒启停）与动画预热
             shell._sync_todo_service()
+            shell._sync_todo_habit_learning()
             shell._sync_chime_service()
             shell._sync_festival_service()
             self._sync_animation_prewarm()
@@ -1095,6 +1104,9 @@ class AppShell:
         # 无面板打开时释放。win 引用在服务 tick 时经本类 win 属性动态读主窗，
         # 角色热切换重建窗口后无需重绑（PR72 上游版挂 PetApp；本分支归 AppShell）。
         self.todo_service = None
+        self.todo_habits = None
+        self.todo_habit_observer = None
+        self._todo_habit_timer = None
         self.todo_panel = None
         if self._todo_wanted():
             self._ensure_todo_service()
@@ -1228,6 +1240,76 @@ class AppShell:
             # 面板持有 app 引用并动态读取 todo_service；面板还开着时保留对象。
             if getattr(self, "todo_panel", None) is None:
                 self.todo_service = None
+
+    def _ensure_todo_habit_observer(self):
+        if getattr(self, "todo_habit_observer", None) is None:
+            store = self._ensure_todo_habits()
+            if store is not None:
+                self.todo_habit_observer = TodoHabitObserver(store)
+        return getattr(self, "todo_habit_observer", None)
+
+    def _todo_habit_learning_wanted(self) -> bool:
+        config = getattr(self, "config", None)
+        return bool(config.get("todo_habit_learning_enabled", False)) if config else False
+
+    def _sync_todo_habit_learning(self) -> None:
+        """Run low-rate foreground sampling only after explicit opt-in on Windows."""
+        supported = sys.platform == "win32"
+        should_run = supported and self._todo_habit_learning_wanted()
+        timer = getattr(self, "_todo_habit_timer", None)
+        observer = getattr(self, "todo_habit_observer", None)
+        if should_run:
+            observer = self._ensure_todo_habit_observer()
+            if observer is None:
+                return
+            if timer is None:
+                timer = QTimer()
+                timer.setInterval(TODO_HABIT_POLL_INTERVAL_SECONDS * 1000)
+                timer.timeout.connect(self._todo_habit_tick)
+                self._todo_habit_timer = timer
+            if not timer.isActive():
+                self._todo_habit_tick()
+                timer.start()
+            return
+        if timer is not None and timer.isActive():
+            timer.stop()
+        if observer is not None:
+            observer.stop()
+
+    def _todo_habit_tick(self) -> None:
+        """Probe foreground metadata locally; never capture pixels or call a model."""
+        if sys.platform != "win32" or not self._todo_habit_learning_wanted():
+            return
+        observer = self._ensure_todo_habit_observer()
+        if observer is None:
+            return
+        try:
+            from . import vision
+
+            window_info = vision.foreground_window_info()
+            idle_seconds = vision.get_system_idle_seconds()
+            observer.observe(window_info, idle_seconds, now=datetime.now())
+        except Exception:
+            logging.exception("自动习惯采样失败")
+
+    def _set_todo_habit_learning_enabled(self, enabled: bool) -> bool:
+        """Persist the user command and apply it immediately; roll back on write failure."""
+        previous = self._todo_habit_learning_wanted()
+        self.config.set("todo_habit_learning_enabled", bool(enabled))
+        if not self.config.save():
+            self.config.set("todo_habit_learning_enabled", previous)
+            self._sync_todo_habit_learning()
+            return False
+        self._sync_todo_habit_learning()
+        return True
+
+    def _stop_todo_habit_learning(self) -> None:
+        timer = getattr(self, "_todo_habit_timer", None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+        observer = getattr(self, "todo_habit_observer", None)
+        if observer is not None:
+            observer.stop()
 
     # ------------------------------------------------------------ 功能门控（语音报时）
     def _festival_speak_wanted(self) -> bool:
@@ -1426,6 +1508,7 @@ class AppShell:
         self._apply_balance_timer()
         # Phase 1/2：设置保存后按配置同步可选服务（todo 懒启停）与动画预热
         self._sync_todo_service()
+        self._sync_todo_habit_learning()
         self._sync_chime_service()
         self._sync_festival_service()
         for inst in getattr(self, "_instances", []):
@@ -1696,6 +1779,7 @@ class AppShell:
         self.instance._apply_spawn_offset()
         self._apply_balance_timer()
         self._sync_todo_service()
+        self._sync_todo_habit_learning()
         # 先同步节日服务：报时服务在 start() 里会立刻 tick 一次，那一刻就需要能问到
         # "本分钟是否让位"。顺序反了会出现"报时先响、节日后响"从而两者都出声。
         self._sync_festival_service()
@@ -1757,6 +1841,7 @@ class AppShell:
             return
         self._session_end_done = True
         self._mark_session_ending()
+        self._stop_todo_habit_learning()
         stopped = 0
         for inst in self._instances:
             win = getattr(inst, "win", None)
@@ -1864,7 +1949,10 @@ class AppShell:
         if alm is not None:
             alm.notify_dsh_state("thinking")
         self.todo_agent.submit(
-            session_id, text, existing_todos=self._todo_items_for_agent()
+            session_id,
+            text,
+            existing_todos=self._todo_items_for_agent(),
+            habit_profile=self._todo_habit_profile(),
         )
 
     def _todo_items_for_agent(self):
@@ -1874,6 +1962,21 @@ class AppShell:
             service = self._ensure_todo_service()
             service.apply_config()
         return service.items()
+
+    def _ensure_todo_habits(self):
+        """懒创建纯本地习惯记录，不启动线程或定时器。"""
+        if getattr(self, "todo_habits", None) is None:
+            config = getattr(self, "config", None)
+            if config is None:
+                return None
+            self.todo_habits = TodoHabitStore(todo_habits_path(
+                config.dir, getattr(config, "instance_id", "") or ""
+            ))
+        return self.todo_habits
+
+    def _todo_habit_profile(self):
+        store = self._ensure_todo_habits()
+        return store.profile() if store is not None else {"categories": {}}
 
     def _finish_todo_panel_agent_request(
         self, session_id: str, status: str, *, added_count: int = 0
@@ -1923,6 +2026,10 @@ class AppShell:
                 kind,
                 time_text,
                 date_text,
+                category=candidate.get("category"),
+                duration_min=candidate.get("duration_min") or estimate_duration_minutes(
+                    self._todo_habit_profile(), candidate.get("category", "general")
+                ),
             )
             added.append(item)
             keys.add(key)
@@ -2100,6 +2207,7 @@ class AppShell:
         """
         for shell in tuple(_LIVE_SHELLS):
             try:
+                shell._stop_todo_habit_learning()
                 todo_agent = getattr(shell, "todo_agent", None)
                 if todo_agent is not None:
                     try:
@@ -3200,7 +3308,10 @@ class AppShell:
         """「启用/关闭节日提醒」开关（默认隐藏、菜单编辑器可加回）：翻转配置并同步服务启停。"""
         self._toggle_flag("festival_reminder_enabled", self._sync_festival_service)
 
-    def system_notify(self, title: str, message: str, *, on_click=None, duration_ms: int = 5000) -> None:
+    def system_notify(
+        self, title: str, message: str, *, on_click=None, duration_ms: int = 5000,
+        require_confirmation: bool = False,
+    ) -> None:
         """Show a bottom-right desktop notification (self-drawn, tray-independent)."""
         self._prune_toasts()
         toast = DesktopNotification(
@@ -3208,6 +3319,7 @@ class AppShell:
             str(message),
             on_click=on_click,
             duration_ms=int(duration_ms),
+            require_confirmation=bool(require_confirmation),
         )
         self._toast_windows.append(toast)
         toast.destroyed.connect(lambda _obj=None: self._prune_toasts())
