@@ -1923,7 +1923,6 @@ class AppShell:
                 kind,
                 time_text,
                 date_text,
-                reminder_lead_minutes=candidate.get("reminder_lead_minutes"),
             )
             added.append(item)
             keys.add(key)

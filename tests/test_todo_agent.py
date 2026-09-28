@@ -98,13 +98,14 @@ def test_new_todo_button_keeps_manual_flow_and_agent_button_opens_popup():
         hint = panel.findChild(QLabel, "todoAgentHint")
 
         assert popup is not None
-        assert popup.accessibleName() == "用文字生成待办"
+        assert popup.accessibleName() == "LLM生成待办"
         assert popup.windowModality() == Qt.WindowModality.WindowModal
         assert popup.minimumSize().width() == 440
         assert popup.findChild(QFrame, "todoAgentCard") is None
         assert hint is not None
         assert "已有待办安排空档" in hint.text()
-        assert "提前30分钟" in hint.text()
+        assert "桌宠设置" in hint.text()
+        assert "会议类提前" not in hint.text()
         assert new_todo is not None
         assert generate is not None
         assert generate.property("accent") is True
@@ -231,7 +232,7 @@ def test_todo_panel_reports_when_agent_cannot_accept_text():
         panel.close()
 
 
-def test_app_stores_agent_results_and_completes_the_matching_panel_request():
+def test_app_ignores_model_per_item_reminder_and_completes_panel_request():
     from pet.app import AppShell
 
     service = _TodoService()
@@ -251,7 +252,7 @@ def test_app_stores_agent_results_and_completes_the_matching_panel_request():
 
     assert len(service.items()) == 1
     assert service.items()[0]["title"] == "项目会议"
-    assert service.items()[0]["reminder_lead_minutes"] == 30
+    assert "reminder_lead_minutes" not in service.items()[0]
     assert panel.reloaded
     assert panel.completed == [(session_id, "success", 1)]
 
@@ -284,7 +285,7 @@ def test_dsh_message_passes_current_todo_snapshot_to_agent():
     assert agent.requests == [("session-1", "明天有会议", schedule)]
 
 
-def test_meeting_response_gets_per_item_30_minute_reminder():
+def test_meeting_todo_uses_global_reminder_preference():
     now = datetime(2026, 9, 4, 8, 0)
     result = parse_todo_response(
         json.dumps({"todos": [{
@@ -304,7 +305,6 @@ def test_meeting_response_gets_per_item_30_minute_reminder():
         "kind": "once",
         "date": "2026-09-05",
         "time": "10:00",
-        "reminder_lead_minutes": 30,
     }]
 
 
@@ -322,7 +322,6 @@ def test_missing_time_uses_a_free_slot_from_existing_todos():
             "date_is_explicit": True,
             "time": "",
             "time_is_explicit": False,
-            "is_meeting": True,
         }]}),
         now,
         existing_todos=existing,
@@ -333,7 +332,6 @@ def test_missing_time_uses_a_free_slot_from_existing_todos():
         "kind": "once",
         "date": "2026-09-05",
         "time": "15:00",
-        "reminder_lead_minutes": 30,
     }]
 
 

@@ -186,10 +186,10 @@ class TodoPanelDialog(QDialog):
     def _build_agent_entry(self) -> QDialog:
         dialog = QDialog(self)
         dialog.setObjectName("todoAgentDialog")
-        dialog.setWindowTitle("文字生成待办")
-        dialog.setAccessibleName("用文字生成待办")
+        dialog.setWindowTitle("LLM生成待办")
+        dialog.setAccessibleName("LLM生成待办")
         dialog.setAccessibleDescription(
-            "根据消息识别待办；缺少时间时参考现有待办安排空档，会议提前30分钟提醒。"
+            "根据消息识别待办；缺少时间时参考现有待办安排空档，并沿用全局提醒设置。"
         )
         dialog.setWindowModality(Qt.WindowModality.WindowModal)
         dialog.resize(560, 480)
@@ -199,13 +199,13 @@ class TodoPanelDialog(QDialog):
         dialog_layout.setContentsMargins(22, 20, 22, 18)
         dialog_layout.setSpacing(10)
 
-        title = QLabel("用文字生成待办")
+        title = QLabel("LLM生成待办")
         title.setObjectName("todoAgentTitle")
         dialog_layout.addWidget(title)
 
         hint = QLabel(
             "粘贴包含事情和时间的消息，识别后直接加入待办；未标时间时会参考已有待办安排空档，"
-            "会议类提前30分钟提醒。"
+            "提醒提前量沿用桌宠设置。"
         )
         hint.setObjectName("todoAgentHint")
         hint.setProperty("muted", True)
@@ -255,7 +255,7 @@ class TodoPanelDialog(QDialog):
         manual = QPushButton("手动填写")
         manual.setObjectName("todoManualAddButton")
         manual.setAccessibleName("手动填写待办")
-        manual.setAccessibleDescription("关闭文字生成窗口并打开手动待办表单。")
+        manual.setAccessibleDescription("关闭 LLM 生成待办窗口并打开手动待办表单。")
         manual.clicked.connect(self._switch_to_manual_editor)
         actions.addWidget(manual)
 
@@ -355,7 +355,7 @@ class TodoPanelDialog(QDialog):
         card_layout.addWidget(self._scroll, stretch=1)
 
         self._empty_label = QLabel(
-            "还没有待办，可点「新建待办」手动添加，或用「文本生成」识别。"
+            "还没有待办，可点「新建待办」手动添加，或用「LLM生成待办」自动添加。"
         )
         self._empty_label.setObjectName("todoEmptyLabel")
         self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -375,11 +375,11 @@ class TodoPanelDialog(QDialog):
         self._add_btn.clicked.connect(self.begin_add)
         footer.addWidget(self._add_btn)
 
-        self._agent_open_btn = QPushButton("文本生成")
+        self._agent_open_btn = QPushButton("LLM生成待办")
         self._agent_open_btn.setObjectName("todoAgentOpenButton")
         self._agent_open_btn.setProperty("accent", True)
-        self._agent_open_btn.setToolTip("粘贴包含事情和时间的文本，自动识别并添加待办")
-        self._agent_open_btn.setAccessibleName("从文字生成待办")
+        self._agent_open_btn.setToolTip("粘贴包含事情和时间的消息，调用 LLM 识别并添加待办")
+        self._agent_open_btn.setAccessibleName("LLM生成待办")
         self._agent_open_btn.setAccessibleDescription(
             "打开独立窗口，使用当前内置 AI 对话模型识别并添加待办。"
         )
@@ -481,9 +481,6 @@ class TodoPanelDialog(QDialog):
                     badge = time_text
                 else:
                     badge = f"{day.month}月{day.day}日 {time_text}"
-        lead = item.get("reminder_lead_minutes")
-        if isinstance(lead, int) and not isinstance(lead, bool) and lead > 0:
-            badge += f" · 提前{lead}分钟提醒"
         return badge
 
     def _refresh_next_label(self, items: list[dict]) -> None:

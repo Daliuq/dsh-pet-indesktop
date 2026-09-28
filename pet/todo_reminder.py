@@ -31,7 +31,6 @@ TODO_TITLE_LIMIT = 80
 TODO_KINDS = ("once", "daily")
 DEFAULT_GRACE_MINUTES = 10
 DEFAULT_TODO_TIME = "09:00"
-TODO_ITEM_LEAD_MINUTES_MAX = 60
 
 _HHMM_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
@@ -54,13 +53,7 @@ def _normalize_iso_date(value) -> str:
         return ""
 
 
-def new_todo_item(
-    title,
-    kind,
-    time_text,
-    date_text: str = "",
-    reminder_lead_minutes: int | None = None,
-) -> dict:
+def new_todo_item(title, kind, time_text, date_text: str = "") -> dict:
     """构造一条新待办（面板新建入口用）；非法字段按默认值钳制。"""
     kind = str(kind or "").strip()
     item = {
@@ -75,10 +68,6 @@ def new_todo_item(
     }
     if item["kind"] == "once":
         item["date"] = _normalize_iso_date(date_text) or date.today().isoformat()
-    if (isinstance(reminder_lead_minutes, int)
-            and not isinstance(reminder_lead_minutes, bool)
-            and 0 <= reminder_lead_minutes <= TODO_ITEM_LEAD_MINUTES_MAX):
-        item["reminder_lead_minutes"] = reminder_lead_minutes
     return item
 
 
@@ -104,10 +93,6 @@ def clean_todo_items(value) -> list[dict]:
         for key in ("fired_lead_slot", "fired_due_slot"):
             slot = raw.get(key)
             item[key] = slot if isinstance(slot, str) and slot else None
-        lead = raw.get("reminder_lead_minutes")
-        if (isinstance(lead, int) and not isinstance(lead, bool)
-                and 0 <= lead <= TODO_ITEM_LEAD_MINUTES_MAX):
-            item["reminder_lead_minutes"] = lead
         items.append(item)
     return items
 
@@ -127,10 +112,6 @@ def _fire_datetimes(item: dict, lead_minutes: int, now: datetime):
         day = date.fromisoformat(day_text)
     hour, minute = (int(part) for part in time_text.split(":"))
     due = datetime(day.year, day.month, day.day, hour, minute)
-    item_lead = item.get("reminder_lead_minutes")
-    if (isinstance(item_lead, int) and not isinstance(item_lead, bool)
-            and 0 <= item_lead <= TODO_ITEM_LEAD_MINUTES_MAX):
-        lead_minutes = item_lead
     lead = due - timedelta(minutes=lead_minutes) if lead_minutes > 0 else None
     return lead, due
 
@@ -159,14 +140,7 @@ def advance_todo_state(items, prefs, now: datetime, *,
         if not isinstance(item, dict) or not item.get("enabled"):
             new_items.append(item)
             continue
-        item_lead = item.get("reminder_lead_minutes")
-        effective_lead = (
-            item_lead
-            if (isinstance(item_lead, int) and not isinstance(item_lead, bool)
-                and 0 <= item_lead <= TODO_ITEM_LEAD_MINUTES_MAX)
-            else lead_minutes
-        )
-        lead_dt, due_dt = _fire_datetimes(item, effective_lead, now)
+        lead_dt, due_dt = _fire_datetimes(item, lead_minutes, now)
         time_text = _normalize_hhmm(item.get("time")) or str(item.get("time") or "")
         for phase, fire_dt, slot_key in (
             ("lead", lead_dt, "fired_lead_slot"),
@@ -184,7 +158,7 @@ def advance_todo_state(items, prefs, now: datetime, *,
                     "title": item["title"],
                     "time": item["time"],
                     "phase": phase,
-                    "lead_minutes": effective_lead if phase == "lead" else 0,
+                    "lead_minutes": lead_minutes if phase == "lead" else 0,
                 })
         if (item.get("kind") == "once" and due_dt is not None
                 and now > due_dt + grace):

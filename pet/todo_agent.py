@@ -33,12 +33,11 @@ _SYSTEM_PROMPT = """你是待办事项抽取器。只分析用户消息中用户
 用用户给出的当前本地时间解析相对日期。把用户明确说出的日期标为 date_is_explicit=true，
 明确说出的钟点标为 time_is_explicit=true；没有明确日期/钟点时，date/time 留空并标为 false，
 由本地待办调度器查询现有待办后选择空档，不要擅自填 09:00 或伪称查过外部日历。
-识别会议、面试、预约等会议类事项时设置 is_meeting=true；这类事项提醒提前量固定为 30 分钟，
-其他事项设置 is_meeting=false，不得修改用户的全局提醒偏好。“中午”按 12:00 解析；“下午/下班前”按语境理解。
+所有事项都沿用用户当前设置的全局提醒提前量，不根据事项类型单独调整。“中午”按 12:00 解析；“下午/下班前”按语境理解。
 “每周/每天”等明确重复安排只支持 daily（每天）；不支持的重复周期不要伪装成单次待办。
 忽略已经完成、纯假设、泛泛讨论、没有未来行动意图的内容。最多抽取 5 项，每项标题简短且以行动为中心。
 严格只返回 JSON，不要 Markdown 或解释，格式：
-{"todos":[{"title":"事项","kind":"once","date":"YYYY-MM-DD","date_is_explicit":true,"time":"HH:MM","time_is_explicit":true,"is_meeting":false}]}
+{"todos":[{"title":"事项","kind":"once","date":"YYYY-MM-DD","date_is_explicit":true,"time":"HH:MM","time_is_explicit":true}]}
 kind 只能为 once 或 daily；daily 的 date 留空。所有明确时间的 once 项必须给出有效 date；
 time_is_explicit=false 时 time 留空，date_is_explicit=false 时 date 留空。"""
 
@@ -234,10 +233,7 @@ def parse_todo_response(
                 continue
             date_text = day.isoformat()
 
-        todo = {"title": title, "kind": kind, "date": date_text, "time": time_text}
-        if raw.get("is_meeting") is True:
-            todo["reminder_lead_minutes"] = 30
-        result.append(todo)
+        result.append({"title": title, "kind": kind, "date": date_text, "time": time_text})
         schedule.append((kind, date_text, time_text))
     return result
 

@@ -62,7 +62,7 @@ def test_new_once_item_keeps_date():
     assert item["date"] == "2026-09-05"
 
 
-def test_clean_preserves_valid_per_item_reminder_lead():
+def test_clean_drops_legacy_per_item_reminder_lead():
     items = clean_todo_items([
         {"title": "项目会议", "kind": "once", "time": "10:00",
          "date": "2026-09-05", "reminder_lead_minutes": 30},
@@ -70,18 +70,19 @@ def test_clean_preserves_valid_per_item_reminder_lead():
          "date": "2026-09-05", "reminder_lead_minutes": 999},
     ])
 
-    assert items[0]["reminder_lead_minutes"] == 30
+    assert "reminder_lead_minutes" not in items[0]
     assert "reminder_lead_minutes" not in items[1]
 
 
-def test_store_roundtrip_preserves_per_item_reminder_lead(tmp_path):
+def test_store_roundtrip_drops_legacy_per_item_reminder_lead(tmp_path):
     store = TodoStore(todo_items_path(tmp_path))
-    meeting = new_todo_item(
-        "项目会议", "once", "10:00", "2026-09-05", reminder_lead_minutes=30
-    )
+    legacy_item = {
+        "title": "项目会议", "kind": "once", "time": "10:00",
+        "date": "2026-09-05", "reminder_lead_minutes": 30,
+    }
 
-    assert store.save([meeting]) is True
-    assert store.load()[0]["reminder_lead_minutes"] == 30
+    assert store.save([legacy_item]) is True
+    assert "reminder_lead_minutes" not in store.load()[0]
 
 
 def test_clean_drops_garbage_and_clamps():
@@ -162,19 +163,19 @@ def test_no_lead_fire_when_lead_zero():
     assert fires == []
 
 
-def test_per_item_lead_overrides_global_reminder_preference():
-    meeting = _once(time="10:00", reminder_lead_minutes=30)
+def test_legacy_item_lead_does_not_override_global_reminder_preference():
+    legacy_meeting = _once(time="10:00", reminder_lead_minutes=30)
 
     fires_before, _ = advance_todo_state(
-        [meeting], _prefs(lead=5), datetime(2026, 9, 4, 9, 29)
+        [legacy_meeting], _prefs(lead=5), datetime(2026, 9, 4, 9, 54)
     )
-    fires_at_meeting_lead, _ = advance_todo_state(
-        [meeting], _prefs(lead=5), datetime(2026, 9, 4, 9, 30)
+    fires_at_global_lead, _ = advance_todo_state(
+        [legacy_meeting], _prefs(lead=5), datetime(2026, 9, 4, 9, 55)
     )
 
     assert fires_before == []
-    assert [fire["phase"] for fire in fires_at_meeting_lead] == ["lead"]
-    assert fires_at_meeting_lead[0]["lead_minutes"] == 30
+    assert [fire["phase"] for fire in fires_at_global_lead] == ["lead"]
+    assert fires_at_global_lead[0]["lead_minutes"] == 5
 
 
 def test_missed_beyond_grace_stamps_silently():
@@ -375,11 +376,12 @@ def test_service_tick_notifies_when_hidden(tmp_path):
     assert on_click == app.open_todo_panel
 
 
-def test_hidden_meeting_notification_shows_30_minute_lead(tmp_path):
+def test_hidden_todo_notification_shows_global_lead(tmp_path):
     _qapp()
     app = _FakeApp(tmp_path, visible=False)
+    app.config.set("todo_reminder_lead_minutes", 30)
     meeting = new_todo_item(
-        "项目会议", "once", "10:00", "2026-09-04", reminder_lead_minutes=30
+        "项目会议", "once", "10:00", "2026-09-04"
     )
     TodoStore(todo_items_path(app.config.dir)).save([meeting])
     service = TodoReminderService(app)
