@@ -183,3 +183,65 @@
 **重新打包**：提醒规则更新时先将原目录和 ZIP 备份至 `dist-onedir/backup-webm-chat-20260928-131146-106`（1,220 个文件；旧 ZIP 362,397,241 bytes，备份哈希一致）。改成“LLM生成待办”后，又将前一版目录和 ZIP 备份至 `dist-onedir/backup-webm-chat-20260928-133036-743`（1,220 个文件；ZIP 355,843,433 bytes，SHA-256 为 `E8964F2C61CFCE67708EF1D44794FEF847A066E4665A6510B26FD7C1D4FEE23B`）。命令 `powershell -ExecutionPolicy Bypass -File scripts\build_onedir.ps1 -Variant webm-chat`；为通过桥接隔离探针，仅在构建进程中把 `TEMP/TMP/TMPDIR` 指向 `W:\dsh-pet-package-temp-20260928-1331`。Windows 10 `10.0.26200-SP0`、CPython 3.10.15、PyInstaller 6.22.2。最新真实输出：`lunar-python OK`、桥接零依赖冒烟通过、Qt Runtime validation OK、瘦身移除 118 个文件 / 44.92 MB、中文编码检查 PASS、DLL 链检查 ALL OK；应用窗口 3.7 秒就绪，`--settings` 窗口 2.4 秒就绪。新 onedir 目录 1,220 个文件、866,173,795 bytes；portable ZIP 355,844,657 bytes（339.4 MiB），`python -m zipfile -t dist-onedir\dsh-pet-standalone-webm-chat-portable.zip` 输出 `Done testing`，SHA-256 为 `1B3BA18765D03FD97CBB39A19FCB05E52F8DF3461EE7470122FEAA9059435E47`。
 
 **本次需求修正的产品测试套件未运行**；既有测试断言已随文案更新。`python -m ruff check pet tests scripts` 输出 `All checks passed!`；构建脚本的依赖、桥接、Qt DLL、应用启动、设置窗口、编码及 ZIP 检查均已实际通过，`git diff --check` 通过。新包保留原有提醒设置和人工新建流程，Agent 界面说明统一显示沿用桌宠提醒设置。
+
+## 第四轮（2026-09-29）：待办提醒确认与推迟
+
+为可见桌宠的待办提醒增加可选确认模式。开启后，提醒一直显示，用户可点「确定」关闭提醒，或点「推迟」将当前事项安排到本地待办中相对空闲的下一时段。一次性待办直接移动日期和时间；每日待办只为当前触发保存一次性推迟，不改变每天的固定时间。桌宠隐藏时仍沿用系统通知。默认关闭，旧配置和旧待办均可直接读取。
+
+### 本轮修改文件说明
+
+增删行数来自本轮工作区相对 `bd87d3a` 的 `git diff --numstat`；本轮没有新增或删除文件。
+
+| 文件 | 增删 | 改动意图 |
+|---|---:|---|
+| `pet/config.py` | +4 / −0 | 加入默认关闭的 `todo_reminder_require_ack` 配置，并登记到 reload 白名单和布尔值清洗。 |
+| `pet/modern_settings_dialog.py` | +12 / −1 | 在唯一归属的「待办提醒」设置组中展示并保存确认选项。 |
+| `pet/settings_pet_controls.py` | +4 / −0 | 创建设置页开关并从配置恢复当前状态。 |
+| `pet/todo_agent.py` | +13 / −0 | 把每日待办的一次性推迟时段加入本地排期快照，避免其他事项误占该时段。 |
+| `pet/todo_panel.py` | +12 / −1 | 列表行显示每日待办的推迟日期；用户编辑条目时清除旧推迟状态。 |
+| `pet/todo_reminder.py` | +197 / −30 | 加入推迟字段清洗、单次/每日触发、下一空档选择、原条目标记、存储及面板刷新；相同事项的提前/准点提醒复用弹窗 ID，避免重复排队。 |
+| `pet/window_alerts.py` | +1 / −0 | 允许待办确认提醒在设置窗口抑制期间继续入队。 |
+| `tests/test_alert_queue.py` | +14 / −0 | 验证待办的确认/推迟提醒在设置抑制期间保留。 |
+| `tests/test_architecture.py` | +2 / −1 | 按设置页新增控件的实际行数校准行数预算，并记录日期和原因。 |
+| `tests/test_config_schema.py` | +1 / −0 | 将新配置键登记进 reload 白名单显式快照。 |
+| `tests/test_todo_agent.py` | +18 / −1 | 验证每日待办推迟时段进入空档选择的日程快照。 |
+| `tests/test_todo_reminder.py` | +162 / −0 | 验证字段清洗、每日仅推迟一次、一次性待办改期、提醒按钮、旧弹窗防覆盖、设置往返与列表显示。 |
+| `docs/INDEX.md` | +1 / −1 | 更新本报告索引，包含确认和推迟行为。 |
+| `docs/PR-REPORT-TODO-AGENT-2026-09-28.md` | +62 / −0 | 追加本轮文件、性能、实机与验证记录，保留前三轮历史。 |
+
+### 本轮实现要点
+
+- 「提醒需点击确定」默认关闭。开启后，桌宠可见时走现有交互气泡队列，提供「确定」和「推迟」；确认仅关闭当前提醒，不标记待办完成。桌宠隐藏时保持既有系统通知分支。
+- 推迟按钮调用现有本地空档选择函数，先排除当前待办，再从当前时刻与原定时刻中较晚的一方开始找空位。选择依据只看已启用的本地待办；日程扫描 09:00–17:00、搜索未来 7 天，返回相对空闲的整点时段，不查询外部日历。
+- 一次性待办直接更新自身日期/时间并重新武装触发戳。每日待办保留固定时间，单独存一个日期/时间推迟覆盖；触发并过宽限后清除覆盖。原日期的 lead/due 都盖戳，因此提前提醒推迟后不会又在原准点重复提醒。
+- 提醒 ID 按待办、触发日期和时间稳定生成，lead 与 due 会更新同一条提醒；条目编辑后旧提醒的推迟回调不会覆盖新时间。存盘失败或找不到候选时不关闭提醒；成功存盘后刷新已打开的待办面板。
+- 待办 JSON 格式仍为版本 1；新增字段是可选项，旧文件清洗后自动补空值。没有新配置迁移、网络请求、后台线程或定时器。
+
+### 本轮性能分析
+
+**环境与方法**：Windows 10 `10.0.26200-SP0`、CPython 3.10.15（conda）。用内联 Python 调用真实 `find_available_todo_slot` 和 `TodoReminderService.snooze_fire`，不替换排期或文件写入逻辑；临时 TodoStore 位于系统临时目录，网络请求为 0。
+
+| 指标 | 实测 | 触发路径 |
+|---|---:|---|
+| 99 条已启用日程的空档选择，1,000 次，中位数 / P95 / 最大值 | 0.9043 / 1.0346 / 1.5659 ms | 每次用户点击「推迟」调用一次 |
+| 含 100 条待办与原子 JSON 保存的完整推迟，500 次，中位数 / P95 / 最大值 | 7.2126 / 8.3051 / 34.7836 ms | 成功点击一次写盘一次；临时磁盘测试 |
+| 每条待办 Python 字典大小，变更前后 | 360 → 640 bytes，增加 280 bytes；100 条上限约增加 28,000 bytes | 四个可选推迟状态键，无缓存 |
+
+**结论**：既有 30 秒提醒扫描和 GUI 线程模型不变；只有每日条目存在推迟覆盖时，多处理一组 lead/due 触发档。推迟路径只在用户点击时运行，单次最多扫描 100 项、写入一次既有待办 JSON 并刷新打开的列表。没有新增网络调用、系统通知种类、线程、计时器或常驻缓存。测得的 34.7836 ms 最大值来自 500 次临时文件写入样本，不代表任意磁盘设备的硬上限。
+
+### 本轮实机运行记录
+
+- **实现前回归**：新增的三个聚焦回归先运行时为 `3 failed`：提醒只有「确定」按钮、待办清洗丢弃推迟字段、触发引擎没有一次性每日推迟档。实现后这些用例转绿。
+- **本机 Qt 呈现**：Windows 本机 Python/Qt 事件循环创建真实 `PetSpeechBubble`（无假按钮控件），调用正式 `show_text` 渲染「确定 / 推迟」。离屏实测气泡 `268×98`，两个按钮都可见、各宽 48 px；截图在 `%TEMP%\todo-snooze-alert-20260929.png`。测试通过实际按钮回调验证一次性待办改期、每日待办保持原时间、弹窗关闭和旧弹窗不覆盖已编辑条目。
+- **最终便携包**：命令 `powershell -ExecutionPolicy Bypass -File scripts\build_onedir.ps1 -Variant webm-chat`；构建期间将 `TEMP/TMP/TMPDIR` 指向 `W:\dsh-pet-package-temp-20260929-todo-confirm`。Windows 10 `10.0.26200-SP0`、CPython 3.10.15、PyInstaller 6.22.2。输出含 `lunar-python OK`、桥接零依赖导入通过、Qt runtime 验证通过、编码检查 PASS、Shiboken/Qt DLL 链 ALL OK；真实打包程序主窗口 3.5 秒就绪，`--settings` 窗口 2.6 秒就绪。onedir 共 1,219 个文件 / 866,173,452 bytes；便携 ZIP 为 355,844,420 bytes（339.4 MiB），SHA-256 `E63CED5765C1E4296FD11835646C643328AC3A9C2EB9CE6A1622937DB9FE6468`。
+- **边界**：UI 截图通过本机 Qt offscreen 渲染，不声称是桌面截屏；打包冒烟实际启动了本机新构建的主程序和设置窗。推迟逻辑不访问模型或外部日历；500 次性能探针输出 `network_calls=0 disk_saves=500`。该路径的按钮动作、持久化和日期逻辑由本机 Qt 回归验证，真实屏幕上的人工点击未单独执行。
+
+### 本轮测试与验证
+
+| 门 | 命令 | 结果 |
+|---|---|---|
+| 聚焦回归 | `python -m pytest -q tests/test_todo_reminder.py tests/test_todo_agent.py tests/test_alert_queue.py tests/test_config_schema.py tests/test_architecture.py::test_modern_settings_dialog_py_line_budget`（`QT_QPA_PLATFORM=offscreen`） | 100 passed, 7.74 s |
+| 全量 | `$env:QT_QPA_PLATFORM='offscreen'; python -m pytest -q` | 2,984 passed, 11 skipped, 3 warnings（244.69 s） |
+| 静态 | `python -m ruff check pet tests scripts` | All checks passed |
+| 补丁空白 | `git diff --check` | 通过 |
+| 打包与 CRC | `scripts/build_onedir.ps1 -Variant webm-chat`；`python -m zipfile -t dist-onedir\dsh-pet-standalone-webm-chat-portable.zip` | 启动冒烟通过；`Done testing` |

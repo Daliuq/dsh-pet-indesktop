@@ -469,7 +469,14 @@ class TodoPanelDialog(QDialog):
     def _badge_text(self, item: dict) -> str:
         time_text = str(item.get("time") or "")
         if item.get("kind") == "daily":
-            badge = f"每天 {time_text}"
+            snooze_date = str(item.get("snooze_date") or "")
+            snooze_time = str(item.get("snooze_time") or "")
+            try:
+                snooze_day = date.fromisoformat(snooze_date)
+            except ValueError:
+                badge = f"每天 {time_text}"
+            else:
+                badge = f"推迟至 {snooze_day.month}月{snooze_day.day}日 {snooze_time}"
         else:
             expired = str(item.get("date") or "") < date.today().isoformat()
             if expired:
@@ -659,6 +666,10 @@ class TodoPanelDialog(QDialog):
                     # 内容/时间变更后重新武装，避免沿用旧触发戳漏提醒
                     "fired_lead_slot": None,
                     "fired_due_slot": None,
+                    "snooze_date": None,
+                    "snooze_time": None,
+                    "snooze_fired_lead_slot": None,
+                    "snooze_fired_due_slot": None,
                 })
                 merged.append(item)
             self._save_items(merged)

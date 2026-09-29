@@ -73,6 +73,19 @@ def _normalise_schedule(existing_todos) -> tuple[tuple[str, str, str], ...]:
         else:
             date_text = ""
         schedule.append((kind, date_text, time_text))
+        if isinstance(raw, dict):
+            snooze_date = str(raw.get("snooze_date") or "").strip()
+            snooze_time = str(raw.get("snooze_time") or "").strip()
+            if (_ISO_DATE.fullmatch(snooze_date) and _HHMM.fullmatch(snooze_time)):
+                try:
+                    date.fromisoformat(snooze_date)
+                except ValueError:
+                    pass
+                else:
+                    hour, minute = (int(part) for part in snooze_time.split(":"))
+                    schedule.append((
+                        "once", snooze_date, f"{hour:02d}:{minute:02d}"
+                    ))
     return tuple(schedule)
 
 

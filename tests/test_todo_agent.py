@@ -19,7 +19,12 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt
 
-from pet.todo_agent import TodoAgent, find_available_todo_slot, parse_todo_response
+from pet.todo_agent import (
+    TodoAgent,
+    _normalise_schedule,
+    find_available_todo_slot,
+    parse_todo_response,
+)
 
 
 class _TodoService:
@@ -395,6 +400,18 @@ def test_available_slot_prefers_a_less_busy_day_and_ignores_disabled_items():
     ]
 
     assert find_available_todo_slot(existing, now) == ("2026-09-05", "09:00")
+
+
+def test_schedule_snapshot_includes_daily_snooze_occurrence():
+    item = {
+        "kind": "daily", "date": "", "time": "10:00", "enabled": True,
+        "snooze_date": "2026-09-05", "snooze_time": "11:00",
+    }
+
+    assert _normalise_schedule([item]) == (
+        ("daily", "", "10:00"),
+        ("once", "2026-09-05", "11:00"),
+    )
 
 
 def test_agent_includes_existing_schedule_in_model_prompt(monkeypatch):

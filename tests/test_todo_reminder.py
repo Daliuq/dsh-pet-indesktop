@@ -128,6 +128,18 @@ def test_clean_preserves_slots_and_enabled():
     assert items2[0]["enabled"] is True
 
 
+def test_clean_preserves_valid_daily_snooze():
+    item = clean_todo_items([{
+        "title": "站会", "kind": "daily", "time": "10:00",
+        "snooze_date": "2026-09-05", "snooze_time": "11:00",
+        "snooze_fired_lead_slot": "2026-09-05T11:00#lead",
+    }])[0]
+
+    assert item["snooze_date"] == "2026-09-05"
+    assert item["snooze_time"] == "11:00"
+    assert item["snooze_fired_lead_slot"] == "2026-09-05T11:00#lead"
+
+
 # ------------------------------------------------------------ advance
 
 def test_no_fire_before_lead():
@@ -198,6 +210,39 @@ def test_daily_rolls_over_next_day():
     fires, stamped2 = advance_todo_state(stamped, _prefs(lead=0), datetime(2026, 9, 5, 10, 0))
     assert [f["phase"] for f in fires] == ["due"]
     assert stamped2[0]["fired_due_slot"] == "2026-09-05T10:00#due"
+
+
+def test_daily_snooze_is_one_shot_and_keeps_regular_schedule():
+    item = _daily(
+        snooze_date="2026-09-05",
+        snooze_time="11:00",
+        snooze_fired_lead_slot=None,
+        snooze_fired_due_slot=None,
+    )
+    item["fired_lead_slot"] = "2026-09-05T10:00#lead"
+    item["fired_due_slot"] = "2026-09-04T10:00#due"
+
+    fires, stamped = advance_todo_state(
+        [item], _prefs(lead=5), datetime(2026, 9, 5, 10, 0)
+    )
+    assert [(fire["phase"], fire["deferred"], fire["time"]) for fire in fires] == [
+        ("due", False, "10:00"),
+    ]
+
+    fires, stamped = advance_todo_state(
+        stamped, _prefs(lead=5), datetime(2026, 9, 5, 10, 55)
+    )
+    assert [(fire["phase"], fire["deferred"], fire["time"]) for fire in fires] == [
+        ("lead", True, "11:00"),
+    ]
+    assert stamped[0]["snooze_fired_lead_slot"] == "2026-09-05T11:00#lead"
+
+    _, finished = advance_todo_state(
+        stamped, _prefs(lead=5), datetime(2026, 9, 5, 11, 11)
+    )
+    assert finished[0]["snooze_date"] is None
+    assert finished[0]["snooze_time"] is None
+    assert finished[0]["fired_due_slot"] == "2026-09-05T10:00#due"
 
 
 def test_once_archives_after_due_plus_grace():
@@ -289,16 +334,19 @@ def test_todo_prefs_defaults(tmp_path):
     cfg = Config(base=tmp_path)
     assert cfg.get("todo_reminder_enabled") is True
     assert cfg.get("todo_reminder_lead_minutes") == 5
+    assert cfg.get("todo_reminder_require_ack") is False
 
 
 def test_todo_prefs_roundtrip_and_clamp(tmp_path):
     cfg = Config(base=tmp_path)
     cfg.set("todo_reminder_enabled", "false")  # 字符串布尔防误开
     cfg.set("todo_reminder_lead_minutes", 999)
+    cfg.set("todo_reminder_require_ack", True)
     cfg.save()
     cfg2 = Config(base=tmp_path)
     assert cfg2.get("todo_reminder_enabled") is False
     assert cfg2.get("todo_reminder_lead_minutes") == 60
+    assert cfg2.get("todo_reminder_require_ack") is True
     cfg2.set("todo_reminder_lead_minutes", -3)
     assert cfg2.get("todo_reminder_lead_minutes") == 0
 
@@ -314,12 +362,20 @@ class _FakeWin:
     def __init__(self, visible: bool = True) -> None:
         self.visible = visible
         self.bubbles: list[str] = []
+        self.alerts: list[dict] = []
+        self.resolved_alerts: list[str] = []
 
     def isVisible(self) -> bool:
         return self.visible
 
     def show_bubble(self, text, duration_ms=3200, subtitle=None):
         self.bubbles.append(text)
+
+    def show_alert(self, text, **kwargs):
+        self.alerts.append({"text": text, **kwargs})
+
+    def resolve_alert(self, alert_id):
+        self.resolved_alerts.append(alert_id)
 
 
 class _FakeApp:
@@ -359,6 +415,96 @@ def test_service_tick_bubbles_when_visible(tmp_path):
     # 盖戳落盘后不重复提醒
     service._on_tick(now=datetime(2026, 9, 4, 10, 6, 30))
     assert len(app.win.bubbles) == 1
+
+
+def test_acknowledgement_alert_snoozes_once_todo_to_next_free_slot(tmp_path, monkeypatch):
+    _qapp()
+    app = _FakeApp(tmp_path)
+    app.config.set("todo_reminder_require_ack", True)
+    item = new_todo_item("发版", "once", "10:00", "2026-09-04")
+    TodoStore(todo_items_path(app.config.dir)).save([item])
+    panel_refreshes = []
+    app.todo_panel = type("Panel", (), {"reload_items": lambda _self: panel_refreshes.append(True)})()
+    service = TodoReminderService(app)
+    service.apply_config()
+    original_snooze = service.snooze_fire
+    monkeypatch.setattr(
+        service, "snooze_fire",
+        lambda fire: original_snooze(fire, now=datetime(2026, 9, 4, 10, 0)),
+    )
+
+    service._on_tick(now=datetime(2026, 9, 4, 9, 55))
+
+    assert len(app.win.alerts) == 1
+    alert = app.win.alerts[0]
+    buttons = dict(alert["buttons"])
+    assert set(buttons) == {"确定", "推迟"}
+    buttons["推迟"]()
+
+    stored = TodoStore(todo_items_path(app.config.dir)).load()[0]
+    assert (stored["date"], stored["time"]) == ("2026-09-04", "11:00")
+    assert stored["fired_lead_slot"] is None
+    assert stored["fired_due_slot"] is None
+    assert app.win.resolved_alerts == [alert["alert_id"]]
+    assert panel_refreshes == [True]
+
+
+def test_repeated_phases_share_alert_id_and_old_action_cannot_move_edited_todo(
+    tmp_path, monkeypatch
+):
+    _qapp()
+    app = _FakeApp(tmp_path)
+    app.config.set("todo_reminder_require_ack", True)
+    item = new_todo_item("发版", "once", "10:00", "2026-09-04")
+    TodoStore(todo_items_path(app.config.dir)).save([item])
+    service = TodoReminderService(app)
+    service.apply_config()
+    original_snooze = service.snooze_fire
+    monkeypatch.setattr(
+        service, "snooze_fire",
+        lambda fire: original_snooze(fire, now=datetime(2026, 9, 4, 10, 0)),
+    )
+
+    service._on_tick(now=datetime(2026, 9, 4, 9, 55))
+    first = app.win.alerts[0]
+    service._on_tick(now=datetime(2026, 9, 4, 10, 0))
+    second = app.win.alerts[1]
+    assert first["alert_id"] == second["alert_id"]
+
+    edited = service.items()[0]
+    edited["time"] = "12:00"
+    service.set_items([edited])
+    dict(first["buttons"])["推迟"]()
+
+    stored = TodoStore(todo_items_path(app.config.dir)).load()[0]
+    assert stored["time"] == "12:00"
+    assert app.win.resolved_alerts == []
+
+
+def test_acknowledgement_alert_snoozes_daily_item_without_changing_recurrence(
+    tmp_path, monkeypatch
+):
+    _qapp()
+    app = _FakeApp(tmp_path)
+    app.config.set("todo_reminder_require_ack", True)
+    item = new_todo_item("站会", "daily", "10:00")
+    TodoStore(todo_items_path(app.config.dir)).save([item])
+    service = TodoReminderService(app)
+    service.apply_config()
+    original_snooze = service.snooze_fire
+    monkeypatch.setattr(
+        service, "snooze_fire",
+        lambda fire: original_snooze(fire, now=datetime(2026, 9, 4, 10, 0)),
+    )
+
+    service._on_tick(now=datetime(2026, 9, 4, 9, 55))
+    dict(app.win.alerts[0]["buttons"])["推迟"]()
+
+    stored = TodoStore(todo_items_path(app.config.dir)).load()[0]
+    assert (stored["kind"], stored["time"]) == ("daily", "10:00")
+    assert (stored["snooze_date"], stored["snooze_time"]) == ("2026-09-04", "11:00")
+    assert stored["fired_due_slot"] == "2026-09-04T10:00#due"
+    assert len(app.win.resolved_alerts) == 1
 
 
 def test_service_tick_notifies_when_hidden(tmp_path):
@@ -576,6 +722,16 @@ def test_panel_edit_updates_item_and_clears_slots(tmp_path):
     assert TodoStore(todo_items_path(app.config.dir)).load()[0]["time"] == "11:00"
 
 
+def test_panel_badge_shows_one_time_daily_snooze(tmp_path):
+    app, panel = _make_panel(tmp_path)
+    item = _daily(
+        snooze_date="2026-09-05",
+        snooze_time="11:00",
+    )
+
+    assert panel._badge_text(item) == "推迟至 9月5日 11:00"
+
+
 # ------------------------------------------------------------ 设置页偏好
 
 def test_settings_roundtrip_todo_prefs(tmp_path):
@@ -591,9 +747,11 @@ def test_settings_roundtrip_todo_prefs(tmp_path):
     try:
         assert dialog.todo_reminder_check.isChecked() is True
         assert dialog.todo_reminder_lead_spin.value() == 5
+        assert dialog.todo_reminder_require_ack_check.isChecked() is False
 
         dialog.todo_reminder_check.setChecked(False)
         dialog.todo_reminder_lead_spin.setValue(88)  # 超 60 → spin 钳制
+        dialog.todo_reminder_require_ack_check.setChecked(True)
         assert dialog._write_config() is True
 
         def section_title(row):
@@ -609,9 +767,13 @@ def test_settings_roundtrip_todo_prefs(tmp_path):
         row = dialog.findChild(SettingRow, "settingRow_todo_reminder_enabled")
         assert row is not None
         assert section_title(row) == "待办提醒"  # 显式 claim，不落「待分类」
+        ack_row = dialog.findChild(SettingRow, "settingRow_todo_reminder_require_ack")
+        assert ack_row is not None
+        assert section_title(ack_row) == "待办提醒"
     finally:
         dialog.deleteLater()
 
     reloaded = Config(cfg_root)
     assert reloaded.get("todo_reminder_enabled") is False
     assert reloaded.get("todo_reminder_lead_minutes") == 60
+    assert reloaded.get("todo_reminder_require_ack") is True
